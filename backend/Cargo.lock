@@ -1482,12 +1482,14 @@ dependencies = [
  "bytes",
  "futures",
  "futures-timer",
+ "percent-encoding",
  "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
  "tracing",
+ "url",
  "uuid",
 ]
 

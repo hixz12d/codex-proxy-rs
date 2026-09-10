@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { AccountGroup } from '@/api'
-import { Download, Pencil, Search, Trash2, Upload } from '@lucide/vue'
+import { Download, Network, Pencil, Search, Trash2, Upload } from '@lucide/vue'
 import { computed } from 'vue'
 
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -22,6 +22,8 @@ const emit = defineEmits<{
   exportSelected: []
   create: []
   editSelected: []
+  manageProxies: []
+  bindEgress: []
 }>()
 
 const search = defineModel<string>('search', { required: true })
@@ -111,6 +113,12 @@ const groupOptions = computed(() => [
           <Download class="size-4" />
         </template>
         导出选中 ({{ selectedCount }})
+      </BaseButton>
+      <BaseButton variant="secondary" class="whitespace-nowrap" @click="emit('manageProxies')">
+        <Network class="size-4" />出口代理
+      </BaseButton>
+      <BaseButton v-if="selectedCount > 0" variant="secondary" class="whitespace-nowrap" @click="emit('bindEgress')">
+        <Network class="size-4" />绑定出口
       </BaseButton>
       <BaseButton
         variant="primary"

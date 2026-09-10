@@ -43,12 +43,20 @@ struct StoredAccount {
 
 #[derive(Default)]
 pub(crate) struct MemoryAccountStore {
+    proxies: Mutex<BTreeMap<ProviderAccountId, gateway_core::egress::AccountProxyRoute>>,
     accounts: Mutex<BTreeMap<ProviderAccountId, StoredAccount>>,
     quota_reads: AtomicUsize,
     fail_provider_listing: AtomicBool,
 }
 
 impl MemoryAccountStore {
+    pub(crate) fn bind_proxy(
+        &self,
+        account: ProviderAccountId,
+        route: gateway_core::egress::AccountProxyRoute,
+    ) {
+        self.proxies.lock().unwrap().insert(account, route);
+    }
     pub(crate) fn repository(self: &Arc<Self>) -> CodexCredentialRepository {
         CodexCredentialRepository::new(self.clone())
     }
@@ -120,6 +128,12 @@ impl MemoryAccountStore {
 
 #[async_trait]
 impl ProviderAccountStore for MemoryAccountStore {
+    async fn account_proxy(
+        &self,
+        account: &ProviderAccountId,
+    ) -> Result<Option<gateway_core::egress::AccountProxyRoute>, StoreError> {
+        Ok(self.proxies.lock().unwrap().get(account).cloned())
+    }
     async fn create_account(&self, input: NewProviderAccount) -> Result<(), StoreError> {
         let mut accounts = self.accounts.lock().expect("account store lock");
         if accounts.contains_key(input.account.id()) {

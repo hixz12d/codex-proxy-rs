@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod diagnostics;
+pub mod egress;
 pub mod engine;
 pub mod error;
 pub mod event;

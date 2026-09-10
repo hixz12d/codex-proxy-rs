@@ -87,6 +87,25 @@ pub type AdminStoreResult<T> = Result<T, AdminStoreError>;
 /// 账号目录与公共账号写操作。
 #[async_trait]
 pub trait AccountStore: Send + Sync {
+    async fn egress_directory(&self) -> AdminStoreResult<crate::model::egress::EgressDirectory> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "egress",
+            "unsupported",
+        ))
+    }
+
+    async fn mutate_egress(
+        &self,
+        _command: crate::model::egress::EgressMutation,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<crate::model::egress::EgressMutationResult> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "egress",
+            "unsupported",
+        ))
+    }
     async fn list_accounts(
         &self,
         query: AccountListQuery,

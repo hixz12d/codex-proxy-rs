@@ -676,10 +676,13 @@ impl CodexOAuthAdminService {
         }
         let tokens = self
             .exchanger
-            .exchange_authorization_code(AuthorizationCodeGrant {
-                code,
-                code_verifier: pending.code_verifier.clone(),
-            })
+            .exchange_authorization_code_for_account(
+                pending.reauthorization(),
+                AuthorizationCodeGrant {
+                    code,
+                    code_verifier: pending.code_verifier.clone(),
+                },
+            )
             .await
             .map_err(map_exchange_error)?;
         let mut secret = tokens.secret;

@@ -1,5 +1,6 @@
 mod account;
 mod diagnostics;
+mod egress;
 mod engine;
 mod error;
 mod event;

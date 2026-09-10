@@ -15,6 +15,7 @@ mod admin_security_audit;
 mod admission_recovery;
 mod backup;
 mod client_keys;
+mod egress;
 mod execution;
 mod execution_buffer;
 mod health;
@@ -222,6 +223,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
         first_tables,
         [
             "_sqlx_migrations",
+            "account_egress_bindings",
             "account_group_accounts",
             "account_groups",
             "admin_audit_events",
@@ -230,6 +232,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "backup_settings",
             "client_api_key_groups",
             "client_api_keys",
+            "egress_proxies",
             "model_requests",
             "ops_events",
             "provider_accounts",

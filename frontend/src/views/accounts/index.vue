@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { ChevronDown } from '@lucide/vue'
-import { ref } from 'vue'
-
+import type { EgressDirectory } from '@/api/modules/egress'
+import { ChevronDown, Network } from '@lucide/vue'
+import { onMounted, ref } from 'vue'
+import { getEgress } from '@/api/modules/egress'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
+
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
+import { toast } from '@/components/base/BaseToast'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
@@ -16,6 +19,7 @@ import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
 import AccountConnectionTestModal from './components/AccountConnectionTestModal.vue'
 import AccountCreateModal from './components/AccountCreateModal/index.vue'
 import AccountEditModal from './components/AccountEditModal.vue'
+import AccountEgressModal from './components/AccountEgressModal.vue'
 import AccountFilters from './components/AccountFilters.vue'
 import AccountIdentityCell from './components/AccountIdentityCell.vue'
 import AccountOverviewCards from './components/AccountOverviewCards.vue'
@@ -154,6 +158,40 @@ const {
   reloadAccounts: loadAccounts,
   reloadGroups: loadGroups,
 })
+const showEgressModal = ref(false)
+const egressAccountIds = ref<string[]>([])
+const egressDirectory = ref<EgressDirectory | null>(null)
+let egressLoadGeneration = 0
+async function reloadEgress() {
+  const current = ++egressLoadGeneration
+  try {
+    const result = await getEgress()
+    if (current === egressLoadGeneration)
+      egressDirectory.value = result
+  }
+  catch {
+    if (current === egressLoadGeneration)
+      egressDirectory.value = null
+  }
+}
+function openEgress(ids: string[] = []) {
+  if (accounts.value.some(account => ids.includes(account.id) && account.provider !== 'openai')) {
+    toast.warning('当前出口绑定仅支持 OpenAI 账号')
+    return
+  }
+  egressAccountIds.value = [...ids]
+  showEgressModal.value = true
+}
+function egressLabel(id: string) {
+  if (!egressDirectory.value)
+    return '未加载'
+  const proxyId = egressDirectory.value.bindings[id]
+  if (!proxyId)
+    return '直连'
+  const proxy = egressDirectory.value.proxies.find(p => p.id === proxyId)
+  return proxy ? `${proxy.name}${proxy.enabled ? '' : '（已停用）'}` : '节点不可用'
+}
+onMounted(reloadEgress)
 </script>
 
 <template>
@@ -184,6 +222,8 @@ const {
           @export-selected="handleExportAccounts"
           @create="openCreateAccount"
           @edit-selected="openBatchEdit"
+          @manage-proxies="openEgress()"
+          @bind-egress="openEgress([...selectedIds])"
         />
       </template>
 
@@ -266,6 +306,13 @@ const {
               </div>
             </template>
 
+            <template #egress="{ row }">
+              <button v-if="row.provider === 'openai'" type="button" class="inline-flex w-full min-w-0 items-center gap-1.5 border-0 bg-transparent text-left text-xs text-cp-link" :title="egressLabel(row.id)" :aria-label="`绑定 ${row.name} 出口`" @click.stop="openEgress([row.id])">
+                <Network class="size-3.5 shrink-0" /><span class="truncate">{{ egressLabel(row.id) }}</span>
+              </button>
+              <span v-else class="text-cp-text-tertiary">不适用</span>
+            </template>
+
             <template #lastUsedAt="{ row }">
               <LastUsedAtCell :value="row.usage.lastUsedAt" />
             </template>
@@ -278,6 +325,7 @@ const {
                 :refreshing="refreshingAccountIds.has(row.id)"
                 :testing="testingConnectionIds.has(row.id)"
                 @edit="openAccountEdit"
+                @egress="account => openEgress([account.id])"
                 @delete="requestDeleteAccount"
                 @recover="handleRecover"
                 @refresh="handleRefresh"
@@ -307,6 +355,8 @@ const {
         </div>
       </template>
     </BaseCard>
+
+    <AccountEgressModal v-model="showEgressModal" :account-ids="egressAccountIds" @changed="reloadEgress" />
 
     <AccountConnectionTestModal
       v-model="showConnectionTestModal"

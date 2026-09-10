@@ -519,7 +519,9 @@ impl Provider for CodexProvider {
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
         let events = cold_response_stream(ColdResponse {
-            client: self.client.clone(),
+            client: self.client.with_proxy(lease.proxy()).map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?,
             response_origin: self.responses_url.clone(),
             request: upstream_request,
             upstream_model: upstream_model.clone(),

@@ -163,7 +163,9 @@ impl CodexCredentialRepository {
         if loaded.account != *account {
             return Err(CredentialRepositoryError::RevisionConflict);
         }
-        self.decode_runtime_credential(&loaded)
+        let mut credential = self.decode_runtime_credential(&loaded)?;
+        credential.proxy = self.store.account_proxy(account.id()).await?;
+        Ok(credential)
     }
 
     pub async fn load_complete_data(

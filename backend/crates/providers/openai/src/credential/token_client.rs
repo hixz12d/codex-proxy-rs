@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
+fn proxy_refresh_failure() -> RefreshFailure {
+    RefreshFailure::RetryableTransport {
+        message: "account proxy is unavailable".to_owned(),
+    }
+}
+
 const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
 const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -177,6 +183,21 @@ impl fmt::Debug for RefreshUpstreamFailure {
 /// Codex token 刷新端口。
 #[async_trait]
 pub trait TokenRefresher: Send + Sync + 'static {
+    async fn refresh_for_account(
+        &self,
+        _account: &gateway_core::account::ProviderAccountId,
+        refresh_token: &str,
+    ) -> Result<TokenPair, RefreshFailure> {
+        self.refresh(refresh_token).await
+    }
+
+    async fn refresh_for_import(
+        &self,
+        _account: &gateway_core::account::ProviderAccountId,
+        refresh_token: &str,
+    ) -> Result<TokenPair, RefreshFailure> {
+        self.refresh(refresh_token).await
+    }
     async fn refresh(&self, refresh_token: &str) -> Result<TokenPair, RefreshFailure>;
 }
 
@@ -228,6 +249,14 @@ pub enum AuthorizationCodeExchangeError {
 
 #[async_trait]
 pub trait AuthorizationCodeExchanger: Send + Sync + 'static {
+    async fn exchange_authorization_code_for_account(
+        &self,
+        _account: Option<&gateway_core::account::ProviderAccountId>,
+        grant: AuthorizationCodeGrant,
+    ) -> Result<AuthorizationTokenSet, AuthorizationCodeExchangeError> {
+        self.exchange_authorization_code(grant).await
+    }
+
     async fn exchange_authorization_code(
         &self,
         grant: AuthorizationCodeGrant,
@@ -246,6 +275,7 @@ pub struct TokenClientConfig {
 /// OpenAI token 续期客户端。
 #[derive(Clone)]
 pub struct OpenAiTokenClient {
+    accounts: Option<std::sync::Arc<dyn gateway_core::account::ProviderAccountStore>>,
     client: Client,
     config: TokenClientConfig,
     profile: CodexWireProfileState,
@@ -257,10 +287,36 @@ pub struct OpenAiTokenClient {
 pub struct TokenClientBuildError;
 
 impl OpenAiTokenClient {
+    pub fn with_accounts(
+        mut self,
+        accounts: std::sync::Arc<dyn gateway_core::account::ProviderAccountStore>,
+    ) -> Self {
+        self.accounts = Some(accounts);
+        self
+    }
+
+    async fn for_account(
+        &self,
+        account: &gateway_core::account::ProviderAccountId,
+    ) -> Result<Self, RefreshFailure> {
+        let mut scoped = self.clone();
+        if let Some(accounts) = &self.accounts {
+            let route = accounts
+                .account_proxy(account)
+                .await
+                .map_err(|_| proxy_refresh_failure())?;
+            if let Some(route) = route {
+                scoped.client = crate::transport::egress::proxy_http_client(&route)
+                    .map_err(|_| proxy_refresh_failure())?;
+            }
+        }
+        Ok(scoped)
+    }
     /// 共享运行时画像；刷新时取快照，授权码交换仍使用 raw auth 请求。
     pub fn new(client: Client, config: TokenClientConfig, profile: CodexWireProfileState) -> Self {
         Self {
             client,
+            accounts: None,
             config,
             profile,
         }
@@ -357,6 +413,33 @@ struct AuthorizationCodeResponse {
 
 #[async_trait]
 impl TokenRefresher for OpenAiTokenClient {
+    async fn refresh_for_account(
+        &self,
+        account: &gateway_core::account::ProviderAccountId,
+        refresh_token: &str,
+    ) -> Result<TokenPair, RefreshFailure> {
+        self.for_account(account)
+            .await?
+            .refresh(refresh_token)
+            .await
+    }
+
+    async fn refresh_for_import(
+        &self,
+        account: &gateway_core::account::ProviderAccountId,
+        refresh_token: &str,
+    ) -> Result<TokenPair, RefreshFailure> {
+        if let Some(accounts) = &self.accounts
+            && accounts
+                .get_account(account)
+                .await
+                .map_err(|_| proxy_refresh_failure())?
+                .is_some()
+        {
+            return self.refresh_for_account(account, refresh_token).await;
+        }
+        self.refresh(refresh_token).await
+    }
     async fn refresh(&self, refresh_token: &str) -> Result<TokenPair, RefreshFailure> {
         let headers = build_codex_profile_headers(&self.profile.snapshot()).map_err(|_| {
             RefreshFailure::Transport {
@@ -367,6 +450,7 @@ impl TokenRefresher for OpenAiTokenClient {
         let response = self
             .client
             .post(&self.config.token_endpoint)
+            .timeout(TOKEN_REQUEST_TIMEOUT)
             .headers(headers)
             .json(&RefreshTokenRequest {
                 client_id: self.config.client_id.as_str(),
@@ -389,6 +473,21 @@ impl TokenRefresher for OpenAiTokenClient {
 
 #[async_trait]
 impl AuthorizationCodeExchanger for OpenAiTokenClient {
+    async fn exchange_authorization_code_for_account(
+        &self,
+        account: Option<&gateway_core::account::ProviderAccountId>,
+        grant: AuthorizationCodeGrant,
+    ) -> Result<AuthorizationTokenSet, AuthorizationCodeExchangeError> {
+        let scoped = match account {
+            Some(account) => self
+                .for_account(account)
+                .await
+                .map_err(|_| AuthorizationCodeExchangeError::Unavailable)?,
+            None => self.clone(),
+        };
+        scoped.exchange_authorization_code(grant).await
+    }
+
     async fn exchange_authorization_code(
         &self,
         grant: AuthorizationCodeGrant,
@@ -396,6 +495,7 @@ impl AuthorizationCodeExchanger for OpenAiTokenClient {
         let response = self
             .client
             .post(&self.config.token_endpoint)
+            .timeout(TOKEN_REQUEST_TIMEOUT)
             .form(&[
                 ("grant_type", "authorization_code"),
                 ("client_id", self.config.client_id.as_str()),

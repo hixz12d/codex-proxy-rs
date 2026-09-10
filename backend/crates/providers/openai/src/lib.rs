@@ -150,7 +150,8 @@ pub async fn initialize(
             config.token_client_config(),
             profile.clone(),
         )
-        .map_err(|_| OpenAiInitializeError::TokenClient)?,
+        .map_err(|_| OpenAiInitializeError::TokenClient)?
+        .with_accounts(Arc::clone(&accounts)),
     );
     let refresher: Arc<dyn TokenRefresher> = token_client.clone();
     let exchanger: Arc<dyn AuthorizationCodeExchanger> = token_client;

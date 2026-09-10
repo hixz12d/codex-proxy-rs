@@ -140,6 +140,15 @@ impl CodexCredentialProfileService {
             self.base_url.clone(),
             self.profile.clone(),
         )
+        .with_proxy(
+            self.repository
+                .store()
+                .account_proxy(account_id)
+                .await
+                .map_err(|_| CodexProfileStatisticsError::InvalidCredentialData)?
+                .as_ref(),
+        )
+        .map_err(map_client_error)?
         .fetch_profile_statistics(CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             upstream_account_id.as_deref(),
@@ -203,8 +212,19 @@ impl CodexCredentialProfileService {
                 .ok_or(CodexProfileAvatarError::Missing)?,
         };
         let (authorization, upstream_account_id) = self.account_authentication(account_id).await?;
+        let route = self
+            .repository
+            .store()
+            .account_proxy(account_id)
+            .await
+            .map_err(|_| CodexProfileAvatarError::TransportUnavailable)?;
+        let http = match route {
+            Some(route) => crate::transport::egress::proxy_http_client(&route)
+                .map_err(|_| CodexProfileAvatarError::TransportUnavailable)?,
+            None => self.http.clone(),
+        };
         fetch_profile_avatar(
-            &self.http,
+            &http,
             &self.base_url,
             &self.profile.snapshot(),
             &source,

@@ -16,6 +16,7 @@ const MAX_COOKIES: usize = 128;
 
 /// 已解析且只在 Provider 内可见的认证材料。
 pub struct CodexRuntimeCredential {
+    pub proxy: Option<gateway_core::egress::AccountProxyRoute>,
     pub authentication: CodexRuntimeAuthentication,
     pub principal: Option<CodexCredentialPrincipal>,
     pub installation_id: String,
@@ -180,6 +181,7 @@ impl CodexCredentialCodec {
                 ),
             };
         Ok(CodexRuntimeCredential {
+            proxy: None,
             authentication,
             principal,
             installation_id,

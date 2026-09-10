@@ -15,6 +15,14 @@ use super::{
 /// `provider_accounts` 的数据库中立端口。
 #[async_trait]
 pub trait ProviderAccountStore: Send + Sync {
+    /// Unconfigured stores are direct-only. Production resolves bindings on every attempt.
+    async fn account_proxy(
+        &self,
+        _account: &ProviderAccountId,
+    ) -> Result<Option<crate::egress::AccountProxyRoute>, StoreError> {
+        Ok(None)
+    }
+
     async fn create_account(&self, account: NewProviderAccount) -> Result<(), StoreError>;
 
     async fn get_account(

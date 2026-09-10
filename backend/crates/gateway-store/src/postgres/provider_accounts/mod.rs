@@ -60,6 +60,7 @@ use super::{
 mod admin_adapter;
 mod admin_queries;
 mod core_adapter;
+mod egress;
 mod mapping;
 mod repository;
 mod rows;

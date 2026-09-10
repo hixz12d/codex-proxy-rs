@@ -356,6 +356,19 @@ impl PgAdminAccountStore {
 
 #[async_trait]
 impl AccountStore for PgAdminAccountStore {
+    async fn egress_directory(
+        &self,
+    ) -> AdminStoreResult<gateway_admin::model::egress::EgressDirectory> {
+        super::egress::directory(&self.pool).await
+    }
+
+    async fn mutate_egress(
+        &self,
+        command: gateway_admin::model::egress::EgressMutation,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::egress::EgressMutationResult> {
+        super::egress::mutate(&self.pool, command, context).await
+    }
     async fn list_accounts(
         &self,
         query: AdminAccountListQuery,

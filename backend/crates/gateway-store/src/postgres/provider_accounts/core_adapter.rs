@@ -13,6 +13,12 @@ fn loaded_credential_from_record(
 
 #[async_trait]
 impl ProviderAccountStore for PgProviderAccountRepository {
+    async fn account_proxy(
+        &self,
+        account: &CoreProviderAccountId,
+    ) -> Result<Option<gateway_core::egress::AccountProxyRoute>, CoreStoreError> {
+        super::egress::resolve(&self.pool, account).await
+    }
     async fn create_account(&self, account: CoreNewProviderAccount) -> Result<(), CoreStoreError> {
         if account.account.revision().get() != 1 {
             return Err(CoreStoreError::new(CoreStoreErrorKind::InvalidData));

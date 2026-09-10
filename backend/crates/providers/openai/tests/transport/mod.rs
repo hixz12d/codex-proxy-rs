@@ -49,6 +49,7 @@ mod canonical;
 mod catalog;
 mod client;
 mod diagnostics;
+mod egress;
 mod endpoints;
 mod headers;
 mod http_client;

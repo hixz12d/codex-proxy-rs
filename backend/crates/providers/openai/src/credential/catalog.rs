@@ -436,6 +436,10 @@ impl CodexCredentialCatalogService {
             .authorization_header()
             .map_err(|_| CodexCredentialCatalogError::InvalidCredentialData)?;
         let result = client
+            .with_proxy(credential.proxy.as_ref())
+            .map_err(|_| CodexCredentialCatalogError::Upstream {
+                detail: "account proxy unavailable".to_owned(),
+            })?
             .fetch_models_with_context(CodexRequestContext::auxiliary(
                 authorization.expose_secret(),
                 account.upstream_account_id(),

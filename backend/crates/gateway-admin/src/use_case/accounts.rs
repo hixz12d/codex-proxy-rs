@@ -45,6 +45,17 @@ const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
 /// 统一账号页消费的服务。
 #[async_trait]
 pub trait AccountsService: Send + Sync {
+    async fn egress_directory(&self) -> Result<crate::model::egress::EgressDirectory, AdminError> {
+        Err(AdminError::invalid("Account egress is unavailable"))
+    }
+
+    async fn mutate_egress(
+        &self,
+        _context: &MutationContext,
+        _command: crate::model::egress::EgressMutation,
+    ) -> Result<crate::model::egress::EgressMutationResult, AdminError> {
+        Err(AdminError::invalid("Account egress is unavailable"))
+    }
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError>;
 
     async fn export(
@@ -291,6 +302,26 @@ impl DefaultAccountsService {
 
 #[async_trait]
 impl AccountsService for DefaultAccountsService {
+    async fn egress_directory(&self) -> Result<crate::model::egress::EgressDirectory, AdminError> {
+        self.accounts
+            .egress_directory()
+            .await
+            .map_err(|e| map_store_error(e, "egress"))
+    }
+
+    async fn mutate_egress(
+        &self,
+        context: &MutationContext,
+        command: crate::model::egress::EgressMutation,
+    ) -> Result<crate::model::egress::EgressMutationResult, AdminError> {
+        let result = self
+            .accounts
+            .mutate_egress(command, context)
+            .await
+            .map_err(|e| map_store_error(e, "egress"))?;
+        publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
+        Ok(result)
+    }
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError> {
         let runtime = self
             .account_runtime

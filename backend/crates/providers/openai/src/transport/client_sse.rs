@@ -57,6 +57,8 @@ impl CodexBackendClient {
             base_url,
             profile,
             websocket_pool: None,
+            proxy: None,
+            egress_key: String::new(),
             websocket_origin_breaker: WebSocketOriginBreaker::default(),
         }
     }
@@ -234,7 +236,7 @@ impl CodexBackendClient {
 
         let websocket_request = websocket_upstream_request(request);
         let headers = self.request_headers_for_websocket_response(&websocket_request, context)?;
-        let websocket_create = CodexWebSocketConnection::responses_create_request(
+        let mut websocket_create = CodexWebSocketConnection::responses_create_request(
             &self.base_url,
             &generate_key(),
             websocket_header_pairs(&headers),
@@ -262,6 +264,7 @@ impl CodexBackendClient {
                 tracing::warn!(error = %error, "Failed to write Codex WebSocket audit artifact");
             }
         }
+        websocket_create.set_proxy(self.proxy.clone());
         let connection_profile = websocket_connection_profile(&headers);
         let pool_key =
             self.websocket_pool_key(request, context, pool_account_id, &connection_profile);
@@ -469,7 +472,8 @@ impl CodexBackendClient {
             .as_deref()
             .or(request.previous_response_id())?;
         let mut key = CodexWebSocketPoolKey::new(&self.base_url, account_id, conversation_id)
-            .with_connection_profile(connection_profile);
+            .with_connection_profile(connection_profile)
+            .with_egress_key(&self.egress_key);
         if let Some(connection_id) = request.downstream_websocket_connection_id.as_deref() {
             key = key.with_downstream_connection_id(connection_id);
         }

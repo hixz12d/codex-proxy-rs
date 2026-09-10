@@ -159,6 +159,8 @@ impl fmt::Debug for CodexClientVisibleUpstreamResponse {
 /// Codex 上游 HTTP 客户端错误。
 #[derive(Error)]
 pub enum CodexClientError {
+    #[error("account proxy is unavailable")]
+    EgressUnavailable,
     /// Reqwest 传输失败。
     #[error("http transport error: {0}")]
     Http(#[from] reqwest::Error),
@@ -227,6 +229,7 @@ pub enum CodexClientError {
 impl fmt::Debug for CodexClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EgressUnavailable => formatter.write_str("CodexClientError::EgressUnavailable"),
             Self::Http(_) => formatter.write_str("CodexClientError::Http([REDACTED])"),
             Self::HttpJson(_) => formatter.write_str("CodexClientError::HttpJson([REDACTED])"),
             Self::CustomCa(_) => formatter.write_str("CodexClientError::CustomCa([REDACTED])"),
@@ -284,7 +287,8 @@ impl CodexClientError {
             Self::HttpJson(_) => Some(CodexBackendTransport::HttpJson),
             Self::WebSocket(_) => Some(CodexBackendTransport::WebSocket),
             Self::Upstream { transport, .. } => Some(*transport),
-            Self::CustomCa(_)
+            Self::EgressUnavailable
+            | Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
             | Self::InvalidHeaderValue(_)
             | Self::WebSocketEncode(_)
@@ -598,6 +602,8 @@ pub struct CodexBackendJsonResponse {
 /// Codex HTTP/SSE 上游客户端。
 #[derive(Clone)]
 pub struct CodexBackendClient {
+    pub(super) proxy: Option<gateway_core::egress::ProxyEndpoint>,
+    pub(super) egress_key: String,
     pub(super) client: Client,
     pub(super) base_url: String,
     pub(super) profile: CodexWireProfileState,

@@ -9,6 +9,7 @@ use crate::transport::protocol::responses::{
 /// WebSocket opening 描述。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexWebSocketConnection {
+    pub(super) proxy: Option<gateway_core::egress::ProxyEndpoint>,
     pub(super) endpoint: String,
     pub(super) headers: Vec<(String, String)>,
 }
@@ -91,6 +92,9 @@ impl fmt::Display for PreviousResponseUnavailableReason {
 }
 
 impl CodexWebSocketRequest {
+    pub(crate) fn set_proxy(&mut self, proxy: Option<gateway_core::egress::ProxyEndpoint>) {
+        self.connection.proxy = proxy;
+    }
     /// 返回连接描述。
     pub fn connection(&self) -> &CodexWebSocketConnection {
         &self.connection
@@ -112,6 +116,7 @@ impl CodexWebSocketConnection {
     pub fn new(endpoint: impl Into<String>, headers: Vec<(String, String)>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            proxy: None,
             headers,
         }
     }

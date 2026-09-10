@@ -640,6 +640,7 @@ impl CodexCredentialSelector {
                             .await;
                     }
                     return Ok(CodexCredentialLease {
+                        proxy: runtime.proxy,
                         installation_id: runtime.installation_id,
                         account,
                         authentication: runtime.authentication,
@@ -1271,6 +1272,7 @@ impl fmt::Debug for CodexCredentialSelector {
 }
 
 pub struct CodexCredentialLease {
+    proxy: Option<gateway_core::egress::AccountProxyRoute>,
     account: ProviderAccount,
     authentication: CodexRuntimeAuthentication,
     cookies: Vec<RuntimeCodexCookie>,
@@ -1284,6 +1286,9 @@ pub struct CodexCredentialLease {
 }
 
 impl CodexCredentialLease {
+    pub fn proxy(&self) -> Option<&gateway_core::egress::AccountProxyRoute> {
+        self.proxy.as_ref()
+    }
     #[must_use]
     pub const fn account(&self) -> &ProviderAccount {
         &self.account

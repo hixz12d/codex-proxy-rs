@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
-import { KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
+import { KeyRound, MoreHorizontal, Network, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
 
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
@@ -21,6 +21,7 @@ const emit = defineEmits<{
   test: [account: AccountRow]
   refresh: [accountId: string]
   reauthorize: [account: AccountRow]
+  egress: [account: AccountRow]
 }>()
 </script>
 
@@ -54,6 +55,12 @@ const emit = defineEmits<{
 
       <template #default="{ close }">
         <div class="w-40 p-1.5">
+          <BaseMenuItem v-if="account.provider === 'openai'" @click.stop="(close(), emit('egress', account))">
+            <template #icon>
+              <Network class="size-3.5" />
+            </template>
+            绑定出口
+          </BaseMenuItem>
           <BaseMenuItem
             :loading="testing"
             :disabled="testing"

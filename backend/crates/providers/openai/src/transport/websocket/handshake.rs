@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use gateway_protocol::openai::events;
 use tokio::time::timeout;
-use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+use tokio_tungstenite::{Connector, client_async_tls_with_config};
 use tungstenite::{
     self, Message,
     extensions::{ExtensionsConfig, compression::deflate::DeflateConfig},
@@ -60,7 +60,11 @@ impl CodexWebSocketConnection {
             "sec-websocket-extensions".to_string(),
             WEBSOCKET_EXTENSIONS.to_string(),
         ));
-        Self { endpoint, headers }
+        Self {
+            endpoint,
+            headers,
+            proxy: None,
+        }
     }
 
     /// 构造 Responses WebSocket opening 与首个 `response.create` 文本帧。
@@ -140,10 +144,42 @@ async fn connect_websocket(
             )))
         })?
         .map(Connector::Rustls);
-    let result = timeout(
-        WEBSOCKET_CONNECT_TIMEOUT,
-        connect_async_tls_with_config(request, Some(websocket_config()), false, connector),
-    )
+    let result = timeout(WEBSOCKET_CONNECT_TIMEOUT, async {
+        let url = url::Url::parse(connection.endpoint()).map_err(|_| proxy_io_error())?;
+        let host = url
+            .host_str()
+            .ok_or_else(proxy_io_error)?
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = url.port_or_known_default().ok_or_else(proxy_io_error)?;
+        let socket = if let Some(endpoint) = &connection.proxy {
+            let proxy = tungstenite::proxy::ProxyConfig::parse(endpoint.expose())
+                .map_err(|_| proxy_io_error())?;
+            let proxy_host = proxy.host.trim_start_matches('[').trim_end_matches(']');
+            let socket = connect_host(proxy_host, proxy.port)
+                .await
+                .map_err(|_| proxy_io_error())?;
+            let target = if endpoint.expose().starts_with("socks5://") {
+                tokio::net::lookup_host((host, port))
+                    .await
+                    .map_err(|_| proxy_io_error())?
+                    .next()
+                    .ok_or_else(proxy_io_error)?
+                    .ip()
+                    .to_string()
+            } else {
+                host.to_owned()
+            };
+            tokio_tungstenite::proxy::connect_via_proxy(socket, &proxy, &target, port)
+                .await
+                .map_err(|_| proxy_io_error())?
+        } else {
+            connect_host(host, port)
+                .await
+                .map_err(tungstenite::Error::Io)?
+        };
+        client_async_tls_with_config(request, socket, Some(websocket_config()), connector).await
+    })
     .await
     .map_err(|_| CodexWebSocketExchangeError::ConnectTimeout {
         timeout: WEBSOCKET_CONNECT_TIMEOUT,
@@ -153,6 +189,34 @@ async fn connect_websocket(
         Err(tungstenite::Error::Http(response)) => Err(websocket_opening_error(response.as_ref())),
         Err(error) => Err(CodexWebSocketExchangeError::Connect(error)),
     }
+}
+
+async fn connect_host(host: &str, port: u16) -> std::io::Result<tokio::net::TcpStream> {
+    use futures::StreamExt;
+    let addresses = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+        Err(_) => tokio::net::lookup_host((host, port))
+            .await?
+            .take(16)
+            .collect(),
+    };
+    // Race resolved addresses and cancel losing connects when a socket is ready.
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    for address in addresses {
+        attempts.push(tokio::net::TcpStream::connect(address));
+    }
+    let mut last_error = std::io::Error::other("no connection address");
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn proxy_io_error() -> tungstenite::Error {
+    tungstenite::Error::Io(std::io::Error::other("account proxy connection failed"))
 }
 
 fn websocket_handshake_request(

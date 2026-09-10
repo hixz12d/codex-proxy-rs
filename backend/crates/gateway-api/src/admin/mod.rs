@@ -13,6 +13,7 @@ pub mod accounts;
 pub mod auth;
 pub mod backups;
 pub mod client_keys;
+pub mod egress;
 mod extract;
 pub mod observability;
 pub mod presenter;
@@ -34,6 +35,7 @@ where
 {
     Router::new()
         .merge(account_groups::router::<S>())
+        .merge(egress::router::<S>())
         .merge(accounts::router::<S>())
         .merge(auth::router::<S>())
         .merge(backups::router::<S>())

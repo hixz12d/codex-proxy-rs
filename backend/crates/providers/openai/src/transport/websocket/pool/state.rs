@@ -23,10 +23,16 @@ pub struct CodexWebSocketPoolKey {
     account_id: String,
     conversation_id: String,
     connection_profile: String,
+    egress_key: String,
     downstream_connection_id: String,
 }
 
 impl CodexWebSocketPoolKey {
+    pub(crate) fn with_egress_key(mut self, egress_key: &str) -> Self {
+        self.egress_key = egress_key.to_owned();
+        self
+    }
+
     /// 构造连接池 key。
     pub fn new(
         base_url: impl Into<String>,
@@ -38,6 +44,7 @@ impl CodexWebSocketPoolKey {
             account_id: account_id.into(),
             conversation_id: conversation_id.into(),
             connection_profile: String::new(),
+            egress_key: String::new(),
             downstream_connection_id: String::new(),
         }
     }
@@ -71,6 +78,7 @@ impl CodexWebSocketPoolKey {
             self.account_id.as_str(),
             self.conversation_id.as_str(),
             self.connection_profile.as_str(),
+            self.egress_key.as_str(),
             self.downstream_connection_id.as_str(),
         ])
     }
@@ -78,6 +86,7 @@ impl CodexWebSocketPoolKey {
     pub(super) fn same_logical_connection(&self, other: &Self) -> bool {
         self.base_url == other.base_url
             && self.account_id == other.account_id
+            && self.egress_key == other.egress_key
             && self.conversation_id == other.conversation_id
     }
 }

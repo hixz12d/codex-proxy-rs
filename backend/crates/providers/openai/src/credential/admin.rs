@@ -743,7 +743,7 @@ impl CodexCredentialAdminService {
         };
         let tokens = self
             .refresher
-            .refresh(refresh_token.expose_secret())
+            .refresh_for_account(&account_id, refresh_token.expose_secret())
             .await
             .inspect_err(|error| log_manual_refresh_failure(&account_id, error))
             .map_err(map_refresh_failure)?;
@@ -889,7 +889,7 @@ impl CodexCredentialAdminService {
         let refresh_token = refresh_token.ok_or(CodexCredentialAdminError::InvalidCredential)?;
         let tokens = self
             .refresher
-            .refresh(&refresh_token)
+            .refresh_for_import(account_id, &refresh_token)
             .await
             .map_err(map_refresh_failure)?;
         let access_token = tokens

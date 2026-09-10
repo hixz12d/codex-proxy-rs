@@ -39,6 +39,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
   { key: 'planType', label: '套餐', kind: 'status', sortable: true },
   { key: 'usage', label: '用量', kind: 'custom', size: '2xl', sortable: true },
   { key: 'groups', label: '账号分组', kind: 'status' },
+  { key: 'egress', label: '出口', kind: 'custom', size: 'md' },
   {
     key: 'lastUsedAt',
     label: '最后使用',
