@@ -186,6 +186,7 @@ Responses wire 之间的协议转换层，转换只在 xAI Provider 内完成。
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
+| `POST` | `/api/admin/accounts/connection-test` | `{ accountId, modelId, inputText?, reasoningEffort? }` | 人工问答与 OpenAI 思考强度，返回相同 SSE 事件 |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl }` | 消费 OAuth callback；新账号保持未分组，重新授权保留所属分组 |
 
@@ -199,8 +200,25 @@ Responses wire 之间的协议转换层，转换只在 xAI Provider 内完成。
 
 ### 账号连接测试 SSE
 
-`GET /api/admin/accounts/connection-test` 固定探测请求指定的账号，不参与普通账号轮换。成功流沿用
-`test_start`、`request`、`content`、`test_complete` 事件；失败事件为：
+`GET /api/admin/accounts/connection-test` 保留固定问题 `Reply with exactly OK.`。
+`POST` 接受 JSON 请求体，两者都固定探测请求指定的账号，不参与普通账号轮换：
+
+```json
+{
+  "accountId": "acct_example",
+  "modelId": "gpt-5.4",
+  "inputText": "不要联网，请回答我的问题。",
+  "reasoningEffort": "high"
+}
+```
+
+- `inputText` 省略或为 `null` 时使用连通测试固定问题；提供时必须非空白，最多 8000 个 Unicode 字符，允许换行与制表符。原文不做 trim 或改写。
+- `reasoningEffort` 省略或为 `null` 时不写入上游 `reasoning`，由上游决定默认值。OpenAI 支持提交 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`；具体模型是否接受由上游校验，不静默重试或降档。本次不扩展 xAI 思考强度测试。
+- 自定义问题只允许放在 POST body，不接受 URL query，也不会写入业务 Responses 用量记录。真实探测仍可能消耗上游额度；`store: false` 不代表免费调用。
+- 响应设置 `Cache-Control: no-store`，沿用管理员鉴权。`request.payload` 包含实际问题及所选 `reasoning.effort`（默认档位省略），不是固定展示 `hi`。
+- 当前 Core 探测会收齐上游响应后发出 `content` 事件，并非逐 token 实时推送。前端最多等待 5 分钟；停止或关闭弹窗会中断测试连接，不承诺撤销已发送请求的上游用量。
+
+成功流沿用 `test_start`、`request`、`content`、`test_complete` 事件；失败事件为：
 
 ```json
 {

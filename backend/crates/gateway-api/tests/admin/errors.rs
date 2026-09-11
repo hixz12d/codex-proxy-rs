@@ -318,3 +318,56 @@ async fn admin_auth_failures_should_use_stable_chinese_contracts() {
         ]
     );
 }
+
+#[tokio::test]
+async fn manual_connection_test_requires_auth_and_rejects_invalid_options_without_echo() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let private_question = "private-question-must-not-leak";
+    for authenticated in [false, true] {
+        let mut request = request(
+            Method::POST,
+            "/api/admin/accounts/connection-test",
+            Body::from(
+                json!({
+                    "accountId": "acct_1",
+                    "modelId": "gpt-5.4",
+                    "inputText": private_question,
+                    "reasoningEffort": "invalid-effort"
+                })
+                .to_string(),
+            ),
+        );
+        request
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        if authenticated {
+            request
+                .headers_mut()
+                .insert(header::COOKIE, SESSION_COOKIE.parse().unwrap());
+        }
+        let response = app(fixture.state())
+            .oneshot(request)
+            .await
+            .expect("question response");
+        let (status, _, body) = response_json(response).await;
+        assert_eq!(
+            status,
+            if authenticated {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        );
+        assert_eq!(
+            body["code"],
+            if authenticated {
+                json!(40001)
+            } else {
+                json!(40101)
+            }
+        );
+        assert!(!body.to_string().contains(private_question));
+        assert!(!body.to_string().contains("invalid-effort"));
+    }
+}

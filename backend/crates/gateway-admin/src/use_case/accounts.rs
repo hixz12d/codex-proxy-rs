@@ -16,9 +16,9 @@ use crate::{
     model::{
         AdminError, MutationContext,
         accounts::{
-            AccountConnectionTestEvent, AccountConnectionTestEventStream, AccountListQuery,
-            AccountPageItem, AccountUpdateResult, AccountUsageWindowQuery, AccountsUpdateResult,
-            BatchUpdateAccounts, UpdateAccount,
+            AccountConnectionTestEvent, AccountConnectionTestEventStream,
+            AccountConnectionTestOptions, AccountListQuery, AccountPageItem, AccountUpdateResult,
+            AccountUsageWindowQuery, AccountsUpdateResult, BatchUpdateAccounts, UpdateAccount,
         },
         observability::TimeRange,
         provider_credentials::{
@@ -134,6 +134,7 @@ pub trait AccountsService: Send + Sync {
         &self,
         account_id: ProviderAccountId,
         upstream_model: UpstreamModelId,
+        options: AccountConnectionTestOptions,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
 }
 
@@ -687,12 +688,24 @@ impl AccountsService for DefaultAccountsService {
         &self,
         account_id: ProviderAccountId,
         upstream_model: UpstreamModelId,
+        options: AccountConnectionTestOptions,
     ) -> Result<AccountConnectionTestEventStream, AdminError> {
+        options
+            .validate()
+            .map_err(|field| AdminError::invalid(format!("invalid {field}")))?;
+        let input_text = options
+            .input_text
+            .as_deref()
+            .unwrap_or(CONNECTION_TEST_INPUT);
         let (stored, provider) = self.provider_for_account(&account_id).await?;
         let account = stored.account;
         let model = upstream_model.as_str().to_owned();
         let operation = provider
-            .connection_test_operation(&upstream_model, CONNECTION_TEST_INPUT)
+            .connection_test_operation(
+                &upstream_model,
+                input_text,
+                options.reasoning_effort.as_deref(),
+            )
             .map_err(|error| map_provider_error(error, "provider connection test"))?;
         let initial = vec![
             AccountConnectionTestEvent::Started {
@@ -700,9 +713,10 @@ impl AccountsService for DefaultAccountsService {
             },
             AccountConnectionTestEvent::Request {
                 model,
-                input_text: CONNECTION_TEST_INPUT.to_owned(),
+                input_text: input_text.to_owned(),
                 stream: true,
                 store: false,
+                reasoning_effort: options.reasoning_effort,
             },
         ];
         let probe = Arc::clone(&self.probe);

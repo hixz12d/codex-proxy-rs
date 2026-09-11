@@ -577,10 +577,33 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
     .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
 
+    for effort in [None, Some("high"), Some("xhigh")] {
+        let operation = admin
+            .connection_test_operation(
+                &UpstreamModelId::new("gpt-5.4").expect("model"),
+                "Custom question\nwithout web search.",
+                effort,
+            )
+            .expect("manual operation");
+        let Operation::Generate(request) = operation else {
+            panic!("generate operation")
+        };
+        let encoded = provider_openai::encode_generate_request(&request, "gpt-5.4")
+            .expect("encoded manual request");
+        let body = serde_json::to_value(encoded.body()).expect("body");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "Custom question\nwithout web search."
+        );
+        assert_eq!(body["reasoning"]["effort"].as_str(), effort);
+        assert_eq!(body["store"], false);
+    }
+
     let operation = admin
         .connection_test_operation(
             &UpstreamModelId::new("gpt-5.4").expect("upstream model"),
             "Reply with exactly OK.",
+            None,
         )
         .expect("connection test operation");
     let Operation::Generate(request) = operation else {

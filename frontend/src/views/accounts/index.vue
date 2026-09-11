@@ -100,6 +100,11 @@ const {
   testingAccount,
   connectionTestStatus,
   connectionTestModel,
+  connectionTestContent,
+  connectionTestMode,
+  connectionTestQuestion,
+  connectionTestReasoningEffort,
+  abortConnectionTest,
   connectionTestLogs,
   connectionTestError,
   connectionTestStartedAt,
@@ -361,6 +366,10 @@ onMounted(reloadEgress)
     <AccountConnectionTestModal
       v-model="showConnectionTestModal"
       v-model:selected-model="connectionTestSelectedModel"
+      v-model:mode="connectionTestMode"
+      v-model:question="connectionTestQuestion"
+      v-model:reasoning-effort="connectionTestReasoningEffort"
+      :content="connectionTestContent"
       :account="testingAccount"
       :duration-ms="connectionTestDurationMs"
       :error="connectionTestError"
@@ -375,6 +384,7 @@ onMounted(reloadEgress)
       :status-view="connectionTestStatusView"
       @refresh-models="handleRefreshConnectionTestModels()"
       @test="handleTestConnection()"
+      @stop="abortConnectionTest"
     />
 
     <AccountCreateModal

@@ -679,6 +679,92 @@ mod actions {
     }
 
     #[test]
+    fn manual_connection_test_validates_questions_and_reasoning_effort() {
+        use gateway_api::admin::accounts::AccountTestRequest;
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+            let request: AccountTestRequest = serde_json::from_value(json!({
+                "accountId": "acct_1", "modelId": "gpt-5.4",
+                "inputText": "  Explain this\nwithout searching.\t  ", "reasoningEffort": effort
+            }))
+            .expect("decode manual question");
+            let (_, _, options) = request.into_command().expect("valid question");
+            assert_eq!(
+                options.input_text.as_deref(),
+                Some("  Explain this\nwithout searching.\t  ")
+            );
+            assert_eq!(options.reasoning_effort.as_deref(), Some(effort));
+        }
+        for text in [
+            String::new(),
+            " \n\t".to_owned(),
+            "x".repeat(8001),
+            "bad\0text".to_owned(),
+        ] {
+            let request: AccountTestRequest = serde_json::from_value(json!({
+                "accountId": "acct_1", "modelId": "gpt-5.4", "inputText": text
+            }))
+            .expect("decode invalid question");
+            assert_eq!(
+                request
+                    .into_command()
+                    .err()
+                    .expect("invalid question")
+                    .field(),
+                "inputText"
+            );
+        }
+        for effort in ["", "default", "extreme", "HIGH"] {
+            let request: AccountTestRequest = serde_json::from_value(json!({
+                "accountId": "acct_1", "modelId": "gpt-5.4", "reasoningEffort": effort
+            }))
+            .expect("decode invalid effort");
+            assert_eq!(
+                request
+                    .into_command()
+                    .err()
+                    .expect("invalid effort")
+                    .field(),
+                "reasoningEffort"
+            );
+        }
+        let quick: AccountTestRequest = serde_json::from_value(json!({
+            "accountId": "acct_1", "modelId": "gpt-5.4"
+        }))
+        .expect("decode quick test");
+        let (_, _, options) = quick.into_command().expect("valid quick test");
+        assert!(options.input_text.is_none() && options.reasoning_effort.is_none());
+        assert!(
+            serde_json::from_value::<AccountTestQuery>(json!({
+                "accountId": "acct_1", "modelId": "gpt-5.4", "inputText": "private question"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AccountTestRequest>(json!({
+                "accountId": "acct_1", "modelId": "gpt-5.4", "tools": []
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn manual_connection_test_event_reports_actual_question_and_effort() {
+        let event = AccountConnectionTestEvent::from(DomainConnectionTestEvent::Request {
+            model: "gpt-5.4".to_owned(),
+            input_text: "My question".to_owned(),
+            reasoning_effort: Some("high".to_owned()),
+            stream: true,
+            store: false,
+        })
+        .data;
+        assert_eq!(
+            event["payload"]["input"][0]["content"][0]["text"],
+            "My question"
+        );
+        assert_eq!(event["payload"]["reasoning"]["effort"], "high");
+    }
+
+    #[test]
     fn connection_test_events_should_preserve_the_existing_frontend_contract() {
         let events = [
             DomainConnectionTestEvent::Started {
@@ -689,6 +775,7 @@ mod actions {
                 input_text: "Reply with exactly OK.".to_owned(),
                 stream: true,
                 store: false,
+                reasoning_effort: None,
             },
             DomainConnectionTestEvent::Content {
                 text: "OK".to_owned(),

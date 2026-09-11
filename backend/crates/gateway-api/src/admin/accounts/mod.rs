@@ -15,7 +15,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, FixedOffset, Utc};
-use futures::{Stream, StreamExt as _};
+use futures::StreamExt as _;
 use gateway_admin::model::{
     AdminError as AdminServiceError, PageSize,
     accounts::{

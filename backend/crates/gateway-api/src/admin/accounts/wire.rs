@@ -521,7 +521,10 @@ pub struct AccountTestQuery {
 impl AccountTestQuery {
     pub fn validate(&self) -> Result<(), WireValidationError> {
         require_account_id(&self.account_id, "accountId")?;
-        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+        if self.model_id.trim().is_empty()
+            || self.model_id.len() > MAX_ID_BYTES
+            || self.model_id.chars().any(char::is_control)
+        {
             return Err(WireValidationError::new("modelId"));
         }
         Ok(())
@@ -536,6 +539,41 @@ impl AccountTestQuery {
                 .map_err(|_| WireValidationError::new("accountId"))?,
             UpstreamModelId::new(self.model_id).map_err(|_| WireValidationError::new("modelId"))?,
         ))
+    }
+}
+
+/// Custom questions are accepted only in a JSON body, never in the query string.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountTestRequest {
+    pub account_id: String,
+    pub model_id: String,
+    pub input_text: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl AccountTestRequest {
+    pub fn into_command(
+        self,
+    ) -> Result<
+        (
+            ProviderAccountId,
+            UpstreamModelId,
+            gateway_admin::model::accounts::AccountConnectionTestOptions,
+        ),
+        WireValidationError,
+    > {
+        let (account_id, model_id) = AccountTestQuery {
+            account_id: self.account_id,
+            model_id: self.model_id,
+        }
+        .into_command()?;
+        let options = gateway_admin::model::accounts::AccountConnectionTestOptions {
+            input_text: self.input_text,
+            reasoning_effort: self.reasoning_effort,
+        };
+        options.validate().map_err(WireValidationError::new)?;
+        Ok((account_id, model_id, options))
     }
 }
 
@@ -793,9 +831,9 @@ impl From<DomainConnectionTestEvent> for AccountConnectionTestEvent {
                 input_text,
                 stream,
                 store,
-            } => serde_json::json!({
-                "type": "request",
-                "payload": {
+                reasoning_effort,
+            } => {
+                let mut payload = serde_json::json!({
                     "model": model,
                     "input": [{
                         "role": "user",
@@ -803,8 +841,12 @@ impl From<DomainConnectionTestEvent> for AccountConnectionTestEvent {
                     }],
                     "stream": stream,
                     "store": store
+                });
+                if let Some(effort) = reasoning_effort {
+                    payload["reasoning"] = serde_json::json!({ "effort": effort });
                 }
-            }),
+                serde_json::json!({ "type": "request", "payload": payload })
+            }
             DomainConnectionTestEvent::Content { text } => {
                 serde_json::json!({ "type": "content", "text": text })
             }

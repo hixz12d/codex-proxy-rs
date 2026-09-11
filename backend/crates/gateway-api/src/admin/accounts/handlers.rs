@@ -45,7 +45,7 @@ where
         )
         .route(
             "/api/admin/accounts/connection-test",
-            get(test_account_connection::<S>),
+            get(test_account_connection::<S>).post(test_account_question::<S>),
         )
         .route(
             "/api/admin/accounts/oauth/start",
@@ -553,7 +553,7 @@ async fn test_account_connection<S>(
     _auth: AdminAuth,
     State(state): State<S>,
     AdminQuery(query): AdminQuery<AccountTestQuery>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AdminError>
+) -> Result<Response, AdminError>
 where
     S: AdminSessionState + Send + Sync,
 {
@@ -561,13 +561,43 @@ where
     let stream = state
         .admin_services()
         .accounts()
-        .test_connection(account_id, upstream_model)
+        .test_connection(account_id, upstream_model, Default::default())
         .await
-        .map_err(map_service_error)?
-        .map(|event| {
-            let event = AccountConnectionTestEvent::from(event);
-            let data = serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_owned());
-            Ok(Event::default().data(data))
-        });
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+        .map_err(map_service_error)?;
+    Ok(connection_test_response(stream))
+}
+
+async fn test_account_question<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<AccountTestRequest>,
+) -> Result<Response, AdminError>
+where
+    S: AdminSessionState + Send + Sync,
+{
+    let (account_id, upstream_model, options) = request.into_command().map_err(map_wire_error)?;
+    let stream = state
+        .admin_services()
+        .accounts()
+        .test_connection(account_id, upstream_model, options)
+        .await
+        .map_err(map_service_error)?;
+    Ok(connection_test_response(stream))
+}
+
+fn connection_test_response(
+    stream: gateway_admin::model::accounts::AccountConnectionTestEventStream,
+) -> Response {
+    let stream = stream.map(|event| {
+        let event = AccountConnectionTestEvent::from(event);
+        let data = serde_json::to_string(&event.data).unwrap_or_else(|_| "{}".to_owned());
+        Ok::<_, Infallible>(Event::default().data(data))
+    });
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }

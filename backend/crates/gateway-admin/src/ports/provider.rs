@@ -108,6 +108,7 @@ pub trait ProviderAdmin: Send + Sync {
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
+        reasoning_effort: Option<&str>,
     ) -> Result<Operation, ProviderAdminError>;
 
     /// 返回该 Provider 实际持有的 Dashboard 上游身份画像。

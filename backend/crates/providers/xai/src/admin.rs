@@ -338,7 +338,11 @@ impl ProviderAdmin for XaiAdminProvider {
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
+        reasoning_effort: Option<&str>,
     ) -> Result<Operation, ProviderAdminError> {
+        if reasoning_effort.is_some() {
+            return Err(provider_error(ProviderAdminErrorKind::Unsupported));
+        }
         build_connection_test_operation(upstream_model, input_text)
     }
 

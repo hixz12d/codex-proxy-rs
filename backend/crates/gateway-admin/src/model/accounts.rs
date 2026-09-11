@@ -254,6 +254,7 @@ pub enum AccountConnectionTestEvent {
         input_text: String,
         stream: bool,
         store: bool,
+        reasoning_effort: Option<String>,
     },
     Content {
         text: String,
@@ -275,3 +276,33 @@ pub enum AccountConnectionTestEvent {
 /// 每次连接测试独占的有限事件流。
 pub type AccountConnectionTestEventStream =
     Pin<Box<dyn Stream<Item = AccountConnectionTestEvent> + Send + 'static>>;
+
+/// Parameters for one administrator-triggered probe; question text is never logged.
+#[derive(Clone, Default)]
+pub struct AccountConnectionTestOptions {
+    pub input_text: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl AccountConnectionTestOptions {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.input_text.as_ref().is_some_and(|text| {
+            text.trim().is_empty()
+                || text.chars().count() > 8000
+                || text
+                    .chars()
+                    .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+        }) {
+            return Err("inputText");
+        }
+        if self.reasoning_effort.as_deref().is_some_and(|effort| {
+            !matches!(
+                effort,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            )
+        }) {
+            return Err("reasoningEffort");
+        }
+        Ok(())
+    }
+}

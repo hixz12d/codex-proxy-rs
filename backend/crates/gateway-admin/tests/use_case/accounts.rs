@@ -213,12 +213,14 @@ impl ProviderAdmin for FakeProviderAdmin {
         &self,
         model: &gateway_core::routing::UpstreamModelId,
         input: &str,
+        effort: Option<&str>,
     ) -> Result<gateway_core::operation::Operation, ProviderAdminError> {
         let payload = ProtocolPayload::json_object(
             "openai",
             Map::from_iter([
                 ("model".to_owned(), json!(model.as_str())),
                 ("input".to_owned(), json!(input)),
+                ("reasoning".to_owned(), json!({ "effort": effort })),
                 ("stream".to_owned(), json!(true)),
                 ("store".to_owned(), json!(false)),
             ]),
@@ -963,6 +965,7 @@ async fn connection_test_should_probe_unavailable_account() {
         .test_connection(
             ProviderAccountId::new("acct_test").expect("account ID"),
             gateway_core::routing::UpstreamModelId::new("grok-4.5").expect("model"),
+            Default::default(),
         )
         .await
         .expect("connection test stream")
@@ -986,6 +989,77 @@ async fn connection_test_should_probe_unavailable_account() {
 }
 
 #[tokio::test]
+async fn manual_connection_test_passes_question_and_effort_to_the_selected_account() {
+    use gateway_admin::model::accounts::AccountConnectionTestOptions;
+    struct QuestionProbe;
+    impl AccountProbe for QuestionProbe {
+        fn probe(
+            &self,
+            request: AccountProbeRequest,
+        ) -> BoxFuture<'_, Result<AccountProbeResult, AccountProbeError>> {
+            Box::pin(async move {
+                assert_eq!(request.account_id.as_str(), "acct_test");
+                assert_eq!(request.provider_kind.as_str(), "openai");
+                assert_eq!(request.upstream_model.as_str(), "gpt-5.4");
+                let gateway_core::operation::Operation::Generate(generate) = request.operation
+                else {
+                    panic!("generate operation required")
+                };
+                let body = generate.protocol_payload().body();
+                assert_eq!(
+                    body.get("input"),
+                    Some(&json!("My question\nwithout web search"))
+                );
+                assert_eq!(body.get("reasoning"), Some(&json!({ "effort": "high" })));
+                Ok(AccountProbeResult {
+                    text: vec!["My answer".to_owned()],
+                })
+            })
+        }
+    }
+    let provider = FakeProviderAdmin::new("openai", events());
+    let store = FakeAccountStore::new("openai", events());
+    let services = accounts_service_with_probe(provider, store, Arc::new(QuestionProbe)).await;
+    let events = services
+        .accounts()
+        .test_connection(
+            ProviderAccountId::new("acct_test").expect("account"),
+            gateway_core::routing::UpstreamModelId::new("gpt-5.4").expect("model"),
+            AccountConnectionTestOptions {
+                input_text: Some("My question\nwithout web search".to_owned()),
+                reasoning_effort: Some("high".to_owned()),
+            },
+        )
+        .await
+        .expect("question stream")
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        matches!(&events[1], AccountConnectionTestEvent::Request { input_text, reasoning_effort, .. }
+        if input_text == "My question\nwithout web search" && reasoning_effort.as_deref() == Some("high"))
+    );
+    assert!(
+        matches!(&events[2], AccountConnectionTestEvent::Content { text } if text == "My answer")
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AccountConnectionTestEvent::Completed)
+    ));
+    let invalid = services
+        .accounts()
+        .test_connection(
+            ProviderAccountId::new("acct_test").expect("account"),
+            gateway_core::routing::UpstreamModelId::new("gpt-5.4").expect("model"),
+            AccountConnectionTestOptions {
+                input_text: Some(" ".to_owned()),
+                reasoning_effort: None,
+            },
+        )
+        .await;
+    assert!(invalid.is_err());
+}
+
+#[tokio::test]
 async fn connection_test_rate_limited_probe_returns_provider_failure() {
     let events = events();
     let provider = FakeProviderAdmin::new("xai", events.clone());
@@ -1000,6 +1074,7 @@ async fn connection_test_rate_limited_probe_returns_provider_failure() {
         .test_connection(
             ProviderAccountId::new("acct_test").expect("account ID"),
             gateway_core::routing::UpstreamModelId::new("grok-4.5").expect("model"),
+            Default::default(),
         )
         .await
         .expect("connection test stream")
@@ -1033,6 +1108,7 @@ async fn connection_test_should_preserve_disabled_account_status() {
         .test_connection(
             ProviderAccountId::new("acct_test").expect("account ID"),
             gateway_core::routing::UpstreamModelId::new("grok-4.5").expect("model"),
+            Default::default(),
         )
         .await
         .expect("connection test stream")
