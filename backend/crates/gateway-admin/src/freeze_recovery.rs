@@ -193,7 +193,7 @@ impl FreezeRecoveryTask {
         let probe_succeeded = match self
             .deps
             .accounts
-            .test_connection(account.clone(), model)
+            .test_connection(account.clone(), model, Default::default())
             .await
         {
             Ok(events) => drain_probe(events).await,

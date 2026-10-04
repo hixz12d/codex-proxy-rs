@@ -876,6 +876,7 @@ impl ProviderAdmin for UnavailableProvider {
         &self,
         _: &gateway_core::routing::UpstreamModelId,
         _: &str,
+        _: Option<&str>,
     ) -> Result<gateway_core::operation::Operation, ProviderAdminError> {
         Err(unsupported_provider())
     }

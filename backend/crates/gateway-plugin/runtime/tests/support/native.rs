@@ -196,6 +196,7 @@ impl ProviderAdmin for NativeAdmin {
         &self,
         _: &UpstreamModelId,
         _: &str,
+        _: Option<&str>,
     ) -> Result<Operation, ProviderAdminError> {
         Err(Self::unsupported())
     }

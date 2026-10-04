@@ -408,8 +408,9 @@ impl ProviderAdmin for XaiAdminProvider {
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
+        reasoning_effort: Option<&str>,
     ) -> Result<Operation, ProviderAdminError> {
-        build_connection_test_operation(upstream_model, input_text)
+        build_connection_test_operation(upstream_model, input_text, reasoning_effort)
     }
 
     fn dashboard_wire_profile(&self) -> Option<DashboardWireProfile> {
@@ -1407,6 +1408,7 @@ fn provider_error(kind: ProviderAdminErrorKind) -> ProviderAdminError {
 fn build_connection_test_operation(
     upstream_model: &UpstreamModelId,
     input_text: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<Operation, ProviderAdminError> {
     let mut body = Map::new();
     body.insert(
@@ -1423,6 +1425,13 @@ fn build_connection_test_operation(
     );
     body.insert("stream".to_owned(), Value::Bool(true));
     body.insert("store".to_owned(), Value::Bool(false));
+    // 管理员显式选择思考强度时原样透传；上游不支持时由上游忽略或报错，结果只体现在该账号。
+    if let Some(effort) = reasoning_effort {
+        body.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({ "effort": effort }),
+        );
+    }
     let payload = ProtocolPayload::json_object("openai", body)
         .map_err(|_| provider_error(ProviderAdminErrorKind::Invalid))?;
     Ok(Operation::Generate(GenerateRequest::from_protocol_payload(

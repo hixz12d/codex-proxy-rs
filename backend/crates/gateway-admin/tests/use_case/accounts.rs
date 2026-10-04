@@ -318,6 +318,7 @@ impl ProviderAdmin for FakeProviderAdmin {
         &self,
         model: &gateway_core::routing::UpstreamModelId,
         input: &str,
+        _: Option<&str>,
     ) -> Result<gateway_core::operation::Operation, ProviderAdminError> {
         let payload = ProtocolPayload::json_object(
             "openai",
@@ -1285,6 +1286,7 @@ async fn connection_test_should_probe_unavailable_account() {
         .test_connection(
             ProviderAccountId::new("acct_test").expect("account ID"),
             gateway_core::routing::UpstreamModelId::new("grok-4.5").expect("model"),
+            Default::default(),
         )
         .await
         .expect("connection test stream")
@@ -1322,6 +1324,7 @@ async fn connection_test_rate_limited_probe_returns_provider_failure() {
         .test_connection(
             ProviderAccountId::new("acct_test").expect("account ID"),
             gateway_core::routing::UpstreamModelId::new("grok-4.5").expect("model"),
+            Default::default(),
         )
         .await
         .expect("connection test stream")
@@ -1355,6 +1358,7 @@ async fn connection_test_should_preserve_disabled_account_status() {
         .test_connection(
             ProviderAccountId::new("acct_test").expect("account ID"),
             gateway_core::routing::UpstreamModelId::new("grok-4.5").expect("model"),
+            Default::default(),
         )
         .await
         .expect("connection test stream")

@@ -55,7 +55,7 @@ where
         )
         .route(
             "/api/admin/accounts/connection-test",
-            get(test_account_connection::<S>),
+            get(test_account_connection::<S>).post(test_account_connections::<S>),
         )
         .route(
             "/api/admin/accounts/oauth/start",
@@ -615,7 +615,7 @@ where
     let stream = state
         .admin_services()
         .accounts()
-        .test_connection(account_id, upstream_model)
+        .test_connection(account_id, upstream_model, Default::default())
         .await
         .map_err(map_service_error)?
         .map(move |event| {
@@ -624,4 +624,127 @@ where
             Ok(Event::default().data(data))
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// 单个账号在多账号连接测试中的最长执行时间；高思考强度需要等待完整回答。
+const CONNECTION_TEST_BATCH_ACCOUNT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// 多账号连接测试：所有账号同时探测，事件按到达顺序交错写入同一条 SSE。
+///
+/// 客户端断开时 axum 丢弃响应流，尚未结束的账号探测随之取消。
+async fn test_account_connections<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<AccountConnectionTestBatchRequest>,
+) -> Result<Response, AdminError>
+where
+    S: SessionState + Clone + Send + Sync + 'static,
+{
+    let time = crate::time::TimePresenter::new(state.admin_services().timezone());
+    let batch = request.into_command().map_err(map_wire_error)?;
+    let accounts = batch
+        .account_ids
+        .into_iter()
+        .map(|account_id| {
+            connection_test_account_events(
+                state.clone(),
+                account_id,
+                batch.upstream_model.clone(),
+                batch.options.clone(),
+                time,
+            )
+        })
+        .collect::<Vec<_>>();
+    let stream = futures::stream::select_all(accounts)
+        .chain(futures::stream::once(async move {
+            AccountConnectionTestEvent::batch_complete(time).data
+        }))
+        .map(|data| {
+            let data = serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_owned());
+            Ok::<_, Infallible>(Event::default().data(data))
+        });
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+/// 单个账号的完整事件流：启动失败与超时都收敛为一条终态 error，不影响其他账号。
+fn connection_test_account_events<S>(
+    state: S,
+    account_id: ProviderAccountId,
+    upstream_model: UpstreamModelId,
+    options: gateway_admin::model::accounts::AccountConnectionTestOptions,
+    time: crate::time::TimePresenter,
+) -> futures::stream::BoxStream<'static, Value>
+where
+    S: SessionState + Send + Sync + 'static,
+{
+    let account_id_value = Value::String(account_id.to_string());
+    let deadline = tokio::time::Instant::now() + CONNECTION_TEST_BATCH_ACCOUNT_TIMEOUT;
+    let events = futures::stream::once(async move {
+        match state
+            .admin_services()
+            .accounts()
+            .test_connection(account_id, upstream_model, options)
+            .await
+        {
+            Ok(events) => events
+                .map(move |event| AccountConnectionTestEvent::from((event, time)).data)
+                .boxed(),
+            Err(error) => futures::stream::iter([AccountConnectionTestEvent::gateway_failure(
+                connection_test_start_error_kind(error.kind()),
+                error.message(),
+                time,
+            )
+            .data])
+            .boxed(),
+        }
+    })
+    .flatten()
+    .boxed();
+    // 截止时间覆盖账号查询、请求构造与探测全过程；超时后丢弃内部流即取消该账号的探测。
+    futures::stream::unfold(Some(events), move |events| async move {
+        let mut events = events?;
+        match tokio::time::timeout_at(deadline, events.next()).await {
+            Ok(Some(data)) => Some((data, Some(events))),
+            Ok(None) => None,
+            Err(_) => Some((
+                AccountConnectionTestEvent::gateway_failure(
+                    gateway_core::error::GatewayErrorKind::Timeout,
+                    "测试超时（5 分钟）",
+                    time,
+                )
+                .data,
+                None,
+            )),
+        }
+    })
+    .map(move |mut data| {
+        data["accountId"] = account_id_value.clone();
+        data
+    })
+    .boxed()
+}
+
+/// 将启动前的管理错误归入最接近的网关错误机器码。
+const fn connection_test_start_error_kind(
+    kind: gateway_admin::model::AdminErrorKind,
+) -> gateway_core::error::GatewayErrorKind {
+    use gateway_admin::model::AdminErrorKind as Admin;
+    use gateway_core::error::GatewayErrorKind as Gateway;
+    match kind {
+        Admin::Invalid | Admin::NotFound => Gateway::InvalidRequest,
+        Admin::Unauthorized => Gateway::Unauthorized,
+        Admin::Forbidden => Gateway::PolicyDenied,
+        Admin::RateLimited => Gateway::RateLimited,
+        Admin::Internal => Gateway::Internal,
+        Admin::Conflict | Admin::BadGateway | Admin::UpstreamResultUnknown | Admin::Unavailable => {
+            Gateway::UpstreamUnavailable
+        }
+    }
 }

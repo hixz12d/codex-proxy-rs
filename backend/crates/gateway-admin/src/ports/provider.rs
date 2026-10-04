@@ -164,10 +164,12 @@ pub trait ProviderAdmin: Send + Sync {
     async fn account_facts_changed(&self, _account_ids: &[ProviderAccountId]) {}
 
     /// 生成一次连接测试所需的 Provider-owned operation；Core 负责实际执行与落账。
+    /// `reasoning_effort` 为 `None` 时不得在请求体中写入 reasoning 字段。
     async fn connection_test_operation(
         &self,
         upstream_model: &UpstreamModelId,
         input_text: &str,
+        reasoning_effort: Option<&str>,
     ) -> Result<Operation, ProviderAdminError>;
 
     /// 返回该 Provider 实际持有的 Dashboard 上游身份画像。

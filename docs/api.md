@@ -552,6 +552,7 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `GET` | `/api/admin/accounts/models/catalog` | `accountId` | 读取指定账号的完整 Codex 原生模型目录，返回 `{ modelCount, observedAt, catalog }` |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
+| `POST` | `/api/admin/accounts/connection-test` | `{ accountIds, modelId, inputText?, reasoningEffort? }` | 同时测试 1–200 个账号，所有账号事件通过同一条 SSE 交错返回，不作为业务 Responses 用量记录 |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 为支持登录的 Provider 创建 flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
@@ -719,6 +720,41 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
 - `error`、`providerErrorCode`、`providerErrorType`、`upstreamStatus`、`upstreamContentType` 和
   `upstreamBody` 是实际捕获的原始诊断字段；缺失时为 `null`，不会由本地猜测或翻译
 
+`GET` 版固定发送 `Reply with exactly OK.`，不带思考强度。`request` 事件的 `payload` 是实际发往上游的请求摘要：
+`input` 中的文本即实际问题；设置了思考强度时多一个 `"reasoning": {"effort": "<值>"}`，未设置时没有该字段
+
+#### 多账号连接测试
+
+`POST /api/admin/accounts/connection-test` 一次测试多个账号，请求体拒绝未知字段：
+
+```json
+{
+  "accountIds": ["acct_1", "acct_2"],
+  "modelId": "gpt-5.4",
+  "inputText": "你是什么模型？",
+  "reasoningEffort": "high"
+}
+```
+
+- `accountIds`：1–200 个，不得重复
+- `modelId`：非空，最多 256 字节，不含控制字符
+- `inputText`：可省略或 `null`，使用默认 `Reply with exactly OK.`；提供时去掉首尾空白后不能为空，最多 8000 个字符，
+  除换行、回车、Tab 外不能含控制字符
+- `reasoningEffort`：可省略或 `null`，不发送 reasoning 字段；否则为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`。
+  请求体原样透传给上游，xAI 等不支持该字段的上游由其自行忽略或报错
+- 请求体校验失败返回普通 400 JSON 错误，不开启 SSE
+
+响应为 `text/event-stream`，带 `Cache-Control: no-store`。所有账号同时开始测试，不设并发上限；每条事件与 `GET`
+版字段相同，另带 `accountId`，不同账号的事件交错到达。每个账号必然以一条 `test_complete` 或 `error` 结束：
+
+- 测试开始前失败（账号不存在、Provider 构造请求失败等）时，只给该账号发一条 `source` 为 `gateway`、
+  `sendState` 为 `null` 的 `error`，`gatewayErrorCode` 取最接近的机器码，`error` 为原始说明
+- 单个账号 5 分钟内没有结束时，发一条 `gatewayErrorCode` 为 `timeout`、`error` 为 `测试超时（5 分钟）` 的
+  `gateway` 错误，并取消该账号的探测
+- 全部账号结束后发一条带时间字段的 `{"type":"batch_complete"}`，然后关闭流
+- 客户端断开连接时，服务端丢弃响应流，未完成的探测随之取消
+
+测试结果对账号状态的回写与单账号测试相同
 ### 后台导入任务
 
 管理端通过后台任务导入账号，关闭页面不会取消执行。`submissionId` 为客户端生成的 UUID；同一管理员在任务记录

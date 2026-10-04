@@ -774,6 +774,7 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
         .connection_test_operation(
             &UpstreamModelId::new("gpt-5.4").expect("upstream model"),
             "Reply with exactly OK.",
+            None,
         )
         .await
         .expect("connection test operation");

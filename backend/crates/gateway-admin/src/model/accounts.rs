@@ -294,6 +294,48 @@ pub struct DeleteAccounts {
     pub account_ids: Vec<String>,
 }
 
+/// 连接测试问题的最大字符数。
+pub const CONNECTION_TEST_MAX_INPUT_CHARS: usize = 8000;
+
+/// 连接测试允许的思考强度取值。
+pub const CONNECTION_TEST_REASONING_EFFORTS: [&str; 6] =
+    ["none", "minimal", "low", "medium", "high", "xhigh"];
+
+/// 管理员为一次连接测试指定的可选参数；全部缺省时与默认测试完全一致。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountConnectionTestOptions {
+    /// 自定义问题；`None` 时使用默认测试问题。
+    pub input_text: Option<String>,
+    /// 思考强度；`None` 时不向上游发送 reasoning 字段。
+    pub reasoning_effort: Option<String>,
+}
+
+impl AccountConnectionTestOptions {
+    /// 校验问题与思考强度，失败时返回不合法的字段名。
+    ///
+    /// # Errors
+    ///
+    /// 问题去掉首尾空白后为空、超过字符上限或含换行、回车、Tab 以外的控制字符时返回
+    /// `inputText`；思考强度不在允许列表时返回 `reasoningEffort`。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(text) = &self.input_text
+            && (text.trim().is_empty()
+                || text.chars().count() > CONNECTION_TEST_MAX_INPUT_CHARS
+                || text
+                    .chars()
+                    .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t')))
+        {
+            return Err("inputText");
+        }
+        if let Some(effort) = &self.reasoning_effort
+            && !CONNECTION_TEST_REASONING_EFFORTS.contains(&effort.as_str())
+        {
+            return Err("reasoningEffort");
+        }
+        Ok(())
+    }
+}
+
 /// 账号连接测试的语义事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountConnectionTestEvent {
@@ -303,6 +345,7 @@ pub enum AccountConnectionTestEvent {
     Request {
         model: String,
         input_text: String,
+        reasoning_effort: Option<String>,
         stream: bool,
         store: bool,
     },

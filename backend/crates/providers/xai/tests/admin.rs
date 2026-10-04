@@ -442,6 +442,7 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
         .connection_test_operation(
             &UpstreamModelId::new("grok-4.5").expect("upstream model"),
             "Reply with exactly OK.",
+            None,
         )
         .await
         .expect("connection test operation");

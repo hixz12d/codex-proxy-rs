@@ -882,6 +882,7 @@ mod actions {
             DomainConnectionTestEvent::Request {
                 model: "grok-4.5".to_owned(),
                 input_text: "Reply with exactly OK.".to_owned(),
+                reasoning_effort: None,
                 stream: true,
                 store: false,
             },

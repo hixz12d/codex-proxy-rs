@@ -709,6 +709,71 @@ impl AccountTestQuery {
     }
 }
 
+/// 多账号连接测试请求；所有账号使用同一模型、问题与思考强度。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountConnectionTestBatchRequest {
+    pub account_ids: Vec<String>,
+    pub model_id: String,
+    pub input_text: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// 校验通过的多账号连接测试命令。
+#[derive(Debug, Clone)]
+pub struct AccountConnectionTestBatch {
+    pub account_ids: Vec<ProviderAccountId>,
+    pub upstream_model: UpstreamModelId,
+    pub options: gateway_admin::model::accounts::AccountConnectionTestOptions,
+}
+
+impl AccountConnectionTestBatchRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.account_ids.is_empty()
+            || self.account_ids.len() > MAX_ACCOUNT_CONNECTION_TEST_BATCH
+            || self
+                .account_ids
+                .iter()
+                .any(|id| require_account_id(id, "accountIds").is_err())
+            || self.account_ids.iter().collect::<BTreeSet<_>>().len() != self.account_ids.len()
+        {
+            return Err(WireValidationError::new("accountIds"));
+        }
+        if self.model_id.trim().is_empty()
+            || self.model_id.len() > MAX_ID_BYTES
+            || self.model_id.chars().any(char::is_control)
+        {
+            return Err(WireValidationError::new("modelId"));
+        }
+        // 问题与思考强度的规则由用例层唯一定义，这里提前校验以便在开启 SSE 前返回 400。
+        gateway_admin::model::accounts::AccountConnectionTestOptions {
+            input_text: self.input_text.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+        }
+        .validate()
+        .map_err(WireValidationError::new)
+    }
+
+    pub(super) fn into_command(self) -> Result<AccountConnectionTestBatch, WireValidationError> {
+        self.validate()?;
+        Ok(AccountConnectionTestBatch {
+            account_ids: self
+                .account_ids
+                .into_iter()
+                .map(|id| {
+                    ProviderAccountId::new(id).map_err(|_| WireValidationError::new("accountIds"))
+                })
+                .collect::<Result<_, _>>()?,
+            upstream_model: UpstreamModelId::new(self.model_id)
+                .map_err(|_| WireValidationError::new("modelId"))?,
+            options: gateway_admin::model::accounts::AccountConnectionTestOptions {
+                input_text: self.input_text,
+                reasoning_effort: self.reasoning_effort,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountModelView {
     pub id: String,
@@ -1084,11 +1149,11 @@ impl From<(DomainConnectionTestEvent, crate::time::TimePresenter)> for AccountCo
             DomainConnectionTestEvent::Request {
                 model,
                 input_text,
+                reasoning_effort,
                 stream,
                 store,
-            } => serde_json::json!({
-                "type": "request",
-                "payload": {
+            } => {
+                let mut payload = serde_json::json!({
                     "model": model,
                     "input": [{
                         "role": "user",
@@ -1096,8 +1161,13 @@ impl From<(DomainConnectionTestEvent, crate::time::TimePresenter)> for AccountCo
                     }],
                     "stream": stream,
                     "store": store
+                });
+                // 只有显式设置思考强度时才展示 reasoning，默认测试的 payload 保持原样。
+                if let Some(effort) = reasoning_effort {
+                    payload["reasoning"] = serde_json::json!({ "effort": effort });
                 }
-            }),
+                serde_json::json!({ "type": "request", "payload": payload })
+            }
             DomainConnectionTestEvent::Content { text } => {
                 serde_json::json!({ "type": "content", "text": text })
             }
@@ -1128,12 +1198,48 @@ impl From<(DomainConnectionTestEvent, crate::time::TimePresenter)> for AccountCo
                 "upstreamBody": upstream_body
             }),
         };
-        let now = Utc::now();
-        data["occurredAt"] = now.to_rfc3339().into();
-        data["occurredAtDisplay"] = time.datetime(&now).into();
-        data["timeDisplay"] = time.time(&now).into();
+        stamp_connection_test_event(&mut data, time);
         Self { data }
     }
+}
+
+impl AccountConnectionTestEvent {
+    /// 网关在该账号探测结束前给出的终态错误，例如启动前失败或批量测试超时。
+    pub(super) fn gateway_failure(
+        gateway_error_code: gateway_core::error::GatewayErrorKind,
+        message: impl Into<String>,
+        time: crate::time::TimePresenter,
+    ) -> Self {
+        Self::from((
+            DomainConnectionTestEvent::Failed {
+                source: gateway_core::engine::probe::AccountProbeErrorSource::Gateway,
+                gateway_error_code,
+                send_state: None,
+                message: message.into(),
+                provider_error_code: None,
+                provider_error_type: None,
+                upstream_status: None,
+                upstream_content_type: None,
+                upstream_body: None,
+            },
+            time,
+        ))
+    }
+
+    /// 多账号连接测试全部账号结束后的收尾事件。
+    pub(super) fn batch_complete(time: crate::time::TimePresenter) -> Self {
+        let mut data = serde_json::json!({ "type": "batch_complete" });
+        stamp_connection_test_event(&mut data, time);
+        Self { data }
+    }
+}
+
+/// 连接测试事件统一附带发生时间，前端按同一字段展示。
+fn stamp_connection_test_event(data: &mut Value, time: crate::time::TimePresenter) {
+    let now = Utc::now();
+    data["occurredAt"] = now.to_rfc3339().into();
+    data["occurredAtDisplay"] = time.datetime(&now).into();
+    data["timeDisplay"] = time.time(&now).into();
 }
 
 #[derive(Debug, Clone, Serialize)]
