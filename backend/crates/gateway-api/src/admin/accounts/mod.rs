@@ -58,6 +58,8 @@ const MAX_NAME_BYTES: usize = 512;
 const MAX_IMPORT_DATA_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CALLBACK_URL_BYTES: usize = 64 * 1024;
 const MAX_ACCOUNT_DELETE_BATCH: usize = 200;
+/// 多账号连接测试一次最多包含的账号数，与批量删除上限一致。
+const MAX_ACCOUNT_CONNECTION_TEST_BATCH: usize = 200;
 const MAX_ACCOUNT_GROUP_BATCH: usize = 1000;
 const MAX_AVATAR_VERSION_BYTES: usize = 32;
 

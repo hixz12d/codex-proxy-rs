@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { useTableColumns, ZCard, ZCheckbox, ZConfirmDialog, ZPageHeader, ZPagination, ZTable, ZTableColumnSettings } from '@codex-proxy/ui'
+import type { Account } from '@/api'
 
+import { useTableColumns, ZCard, ZCheckbox, ZConfirmDialog, ZPageHeader, ZPagination, ZTable, ZTableColumnSettings } from '@codex-proxy/ui'
 import { ChevronDown } from '@lucide/vue'
-import { ref } from 'vue'
+import { ref, shallowRef, watch } from 'vue'
 import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
@@ -14,6 +15,7 @@ import AccountQuotaPanel from './components/account-quota-panel/index.vue'
 import AccountQuotaSummaryCell from './components/account-quota-summary-cell/index.vue'
 import AccountStatusBadge from './components/account-status-badge/index.vue'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
+import AccountCompareTestModal from './components/AccountCompareTestModal.vue'
 import AccountConnectionTestModal from './components/AccountConnectionTestModal.vue'
 import AccountEditModal from './components/AccountEditModal.vue'
 import AccountFilters from './components/AccountFilters.vue'
@@ -129,11 +131,37 @@ const {
   refreshingConnectionTestModels,
   connectionTestSelectedModel,
   connectionTestModelOptions,
+  connectionTestInputText,
+  connectionTestReasoning,
   connectionTestStatusView,
   openConnectionTest,
   handleRefreshConnectionTestModels,
   handleTestConnection,
 } = useAccountConnectionTest({ reload: refreshAccountsSilently })
+
+// 选中账号可能跨页，记住见过的行数据，打开对比测试时按选中 ID 映射
+const selectedAccountRows = new Map<string, Account>()
+watch([accounts, selectedIds], ([rows, ids]) => {
+  for (const row of rows) {
+    if (ids.has(row.id))
+      selectedAccountRows.set(row.id, row)
+  }
+  for (const id of selectedAccountRows.keys()) {
+    if (!ids.has(id))
+      selectedAccountRows.delete(id)
+  }
+}, { immediate: true, flush: 'sync' })
+
+const showCompareTestModal = shallowRef(false)
+const compareTestAccounts = shallowRef<Account[]>([])
+
+function openCompareTest() {
+  compareTestAccounts.value = [...selectedIds.value]
+    .map(id => selectedAccountRows.get(id))
+    .filter((row): row is Account => Boolean(row))
+  if (compareTestAccounts.value.length > 0)
+    showCompareTestModal.value = true
+}
 
 const {
   expandedAccountIds,
@@ -225,6 +253,7 @@ const {
           @export-selected="handleExportAccounts"
           @create="openCreateAccount"
           @edit-selected="openBatchEdit"
+          @compare-selected="openCompareTest"
         >
           <template #actions>
             <ZTableColumnSettings
@@ -371,6 +400,8 @@ const {
     <AccountConnectionTestModal
       v-model="showConnectionTestModal"
       v-model:selected-model="connectionTestSelectedModel"
+      v-model:input-text="connectionTestInputText"
+      v-model:reasoning="connectionTestReasoning"
       :account="testingAccount"
       :duration-ms="connectionTestDurationMs"
       :error="connectionTestError"
@@ -385,6 +416,12 @@ const {
       :status-view="connectionTestStatusView"
       @refresh-models="handleRefreshConnectionTestModels()"
       @test="handleTestConnection()"
+    />
+
+    <AccountCompareTestModal
+      v-model="showCompareTestModal"
+      :accounts="compareTestAccounts"
+      @finished="refreshAccountsSilently()"
     />
 
     <AccountImportTasks

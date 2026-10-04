@@ -2,7 +2,7 @@
 import type { AccountGroupRef } from '@/api'
 import { ZButton, ZInput, ZSelect } from '@codex-proxy/ui'
 
-import { Download, ListTodo, Pencil, Search, Trash2, Upload } from '@lucide/vue'
+import { Download, ListTodo, MessagesSquare, Pencil, Search, Trash2, Upload } from '@lucide/vue'
 import { computed } from 'vue'
 import ProviderFilter from '@/components/ProviderFilter.vue'
 import { accountStatusFilterOptions } from '../constants'
@@ -24,6 +24,7 @@ const emit = defineEmits<{
   importTasks: []
   create: []
   editSelected: []
+  compareSelected: []
 }>()
 
 const search = defineModel<string>('search', { required: true })
@@ -91,6 +92,15 @@ const groupOptions = computed(() => [
       >
         <Pencil class="size-4 text-cp-link" />
         批量编辑账号
+      </ZButton>
+      <ZButton
+        v-if="selectedCount > 0"
+        type="default" variant="solid"
+        class="w-full whitespace-nowrap xl:w-auto"
+        @click="emit('compareSelected')"
+      >
+        <MessagesSquare class="size-4 text-cp-link" />
+        对比测试
       </ZButton>
       <ZButton
         v-if="selectedCount > 0"

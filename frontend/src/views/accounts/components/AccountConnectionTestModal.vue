@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import type { useAccountConnectionTest } from '../composables/useAccountConnectionTest'
 
-import { ZButton, ZDialog, ZIconButton, ZSelect } from '@codex-proxy/ui'
+import { ZButton, ZDialog, ZIconButton, ZSelect, ZTextarea } from '@codex-proxy/ui'
 import { RefreshCw } from '@lucide/vue'
+import { CONNECTION_TEST_INPUT_MAX_LENGTH, CONNECTION_TEST_REASONING_OPTIONS } from '../composables/useAccountConnectionTest'
 import AccountStatusBadge from './account-status-badge/index.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
 
@@ -29,6 +30,8 @@ const emit = defineEmits<{
 }>()
 const open = defineModel<boolean>({ default: false })
 const selectedModel = defineModel<string>('selectedModel', { required: true })
+const inputText = defineModel<string>('inputText', { required: true })
+const reasoning = defineModel<string>('reasoning', { required: true })
 
 function connectionLogClass(tone: string) {
   if (tone === 'success')
@@ -68,31 +71,59 @@ function connectionLogClass(tone: string) {
       </section>
 
       <section class="rounded-cp-card bg-cp-fill-quaternary px-4 py-3">
-        <div class="grid gap-2">
-          <div class="flex min-h-8 items-center justify-between gap-3">
-            <span class="text-cp-sm font-heavy text-cp-text-quaternary">
-              测试模型
-            </span>
-            <ZIconButton
-              size="small"
-              aria-label="刷新上游模型"
-              :loading="refreshingModels"
-              :disabled="status === 'running' || loadingModels"
-              @click="emit('refreshModels')"
-            >
-              <template #loading>
-                <RefreshCw class="size-3.5 animate-spin motion-reduce:animate-none" />
-              </template>
-              <RefreshCw class="size-3.5" />
-            </ZIconButton>
+        <div class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
+          <div class="grid min-w-0 gap-2">
+            <div class="flex min-h-8 items-center justify-between gap-3">
+              <span class="text-cp-sm font-heavy text-cp-text-quaternary">
+                测试模型
+              </span>
+              <ZIconButton
+                size="small"
+                aria-label="刷新上游模型"
+                :loading="refreshingModels"
+                :disabled="status === 'running' || loadingModels"
+                @click="emit('refreshModels')"
+              >
+                <template #loading>
+                  <RefreshCw class="size-3.5 animate-spin motion-reduce:animate-none" />
+                </template>
+                <RefreshCw class="size-3.5" />
+              </ZIconButton>
+            </div>
+            <ZSelect
+              v-model="selectedModel"
+              aria-label="测试模型"
+              :options="modelOptions"
+              :disabled="status === 'running' || loadingModels || refreshingModels"
+              :placeholder="loadingModels ? '加载模型中...' : '选择上游模型'"
+              empty-text="上游没有返回模型"
+            />
           </div>
-          <ZSelect
-            v-model="selectedModel"
-            aria-label="测试模型"
-            :options="modelOptions"
-            :disabled="status === 'running' || loadingModels || refreshingModels"
-            :placeholder="loadingModels ? '加载模型中...' : '选择上游模型'"
-            empty-text="上游没有返回模型"
+          <div class="grid min-w-0 gap-2">
+            <div class="flex min-h-8 items-center">
+              <span class="text-cp-sm font-heavy text-cp-text-quaternary">
+                思考强度
+              </span>
+            </div>
+            <ZSelect
+              v-model="reasoning"
+              aria-label="思考强度"
+              :options="CONNECTION_TEST_REASONING_OPTIONS"
+              :disabled="status === 'running'"
+            />
+          </div>
+        </div>
+        <div class="mt-3 grid gap-2">
+          <span class="text-cp-sm font-heavy text-cp-text-quaternary">
+            测试问题
+          </span>
+          <ZTextarea
+            v-model="inputText"
+            aria-label="测试问题"
+            :rows="3"
+            :maxlength="CONNECTION_TEST_INPUT_MAX_LENGTH"
+            placeholder="留空使用 Reply with exactly OK."
+            :disabled="status === 'running'"
           />
         </div>
       </section>
