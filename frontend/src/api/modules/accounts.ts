@@ -451,7 +451,7 @@ export interface AccountImportSettings {
   groupIds: string[]
 }
 
-interface AccountImportParam {
+export interface AccountImportItem {
   outboundProxyId?: string
   settings?: AccountImportSettings
   provider: string
@@ -464,7 +464,7 @@ interface AccountImportTaskIdParam {
 
 interface CreateAccountImportTaskParam {
   submissionId: string
-  items: AccountImportParam[]
+  items: AccountImportItem[]
 }
 
 interface AccountOAuthStartParam {
@@ -607,7 +607,7 @@ export function refreshAccountModels(data: AccountIdParam, options: RequestOptio
   })
 }
 
-export function importAccounts(data: AccountImportParam, options: RequestOptions = {}) {
+export function importAccounts(data: AccountImportItem, options: RequestOptions = {}) {
   return request<AccountImportResponse>({
     url: '/api/admin/accounts/import',
     method: 'POST',
