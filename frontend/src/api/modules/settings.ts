@@ -51,6 +51,7 @@ export interface RuntimeSettings {
   accountWarmupEnabled: boolean
   accountWarmupScheduleTime: string
   accountWarmupModel: string | null
+  accountFingerprintEnabled: boolean
   updatedAt: string
   updatedAtDisplay: string
 }

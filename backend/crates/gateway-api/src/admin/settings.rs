@@ -73,6 +73,7 @@ pub struct RuntimeSettingsView {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    pub account_fingerprint_enabled: bool,
     pub updated_at: DateTime<Utc>,
     pub updated_at_display: String,
 }
@@ -119,6 +120,7 @@ pub struct UpdateRuntimeSettingsRequest {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    pub account_fingerprint_enabled: bool,
 }
 
 impl UpdateRuntimeSettingsRequest {
@@ -260,6 +262,7 @@ impl UpdateRuntimeSettingsRequest {
             account_warmup_enabled: self.account_warmup_enabled,
             account_warmup_schedule_time: self.account_warmup_schedule_time,
             account_warmup_model: self.account_warmup_model,
+            account_fingerprint_enabled: self.account_fingerprint_enabled,
         })
     }
 }
@@ -307,6 +310,7 @@ impl From<(RuntimeSettings, crate::time::TimePresenter)> for RuntimeSettingsView
             account_warmup_enabled: settings.account_warmup_enabled,
             account_warmup_schedule_time: settings.account_warmup_schedule_time,
             account_warmup_model: settings.account_warmup_model,
+            account_fingerprint_enabled: settings.account_fingerprint_enabled,
             updated_at_display: time.datetime(&settings.updated_at),
             updated_at: settings.updated_at,
         }

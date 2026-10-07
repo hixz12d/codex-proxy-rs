@@ -218,6 +218,7 @@ impl CodexProvider {
                 .map_err(|_| {
                     provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
                 })?
+                .with_account_identity(lease.installation_id())
                 .with_authentication(lease.authentication())
                 .with_middleware_headers(middleware_headers),
             response_origin: request.response_origin,

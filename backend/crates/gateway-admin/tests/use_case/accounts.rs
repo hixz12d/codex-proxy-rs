@@ -1134,6 +1134,7 @@ impl SettingsStore for StaticSettingsStore {
             account_warmup_enabled: false,
             account_warmup_schedule_time: "08:00".to_owned(),
             account_warmup_model: None,
+            account_fingerprint_enabled: true,
             updated_at: Utc::now(),
         })
     }

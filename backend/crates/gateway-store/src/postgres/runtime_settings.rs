@@ -52,6 +52,7 @@ pub struct RuntimeSettings {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    pub account_fingerprint_enabled: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -115,6 +116,10 @@ impl fmt::Debug for RuntimeSettings {
                 &self.account_warmup_schedule_time,
             )
             .field("account_warmup_model", &self.account_warmup_model)
+            .field(
+                "account_fingerprint_enabled",
+                &self.account_fingerprint_enabled,
+            )
             .field("updated_at", &self.updated_at)
             .finish()
     }
@@ -155,6 +160,7 @@ pub struct RuntimeSettingsUpdate {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    pub account_fingerprint_enabled: bool,
 }
 
 impl fmt::Debug for RuntimeSettingsUpdate {
@@ -269,7 +275,8 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
                     account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                     account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
                     account_auto_freeze_adaptive_concurrency,
-                    account_warmup_enabled, account_warmup_schedule_time, account_warmup_model
+                    account_warmup_enabled, account_warmup_schedule_time, account_warmup_model,
+                    account_fingerprint_enabled
              from runtime_settings where id = 1",
         )
     .fetch_optional(pool)
@@ -429,6 +436,21 @@ impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
             )
         })
     }
+
+    fn load_account_fingerprint_enabled(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<bool, ProviderStoreError>> {
+        Box::pin(async move {
+            // 只读这一列，不加载整行设置：Provider 定时轮询该开关，且开关不进请求冻结快照，
+            // 因此保存后由轮询周期决定生效时间，而不是 config revision。
+            sqlx::query_scalar::<_, bool>(
+                "select account_fingerprint_enabled from runtime_settings where id = 1",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| provider_unavailable("load account fingerprint policy"))
+        })
+    }
 }
 
 pub(crate) async fn load_runtime_settings_in_transaction(
@@ -444,7 +466,8 @@ pub(crate) async fn load_runtime_settings_in_transaction(
                 account_auto_freeze_window_seconds, account_auto_freeze_duration_seconds,
                 account_auto_freeze_probe_enabled, account_auto_freeze_probe_model,
                 account_auto_freeze_adaptive_concurrency,
-                account_warmup_enabled, account_warmup_schedule_time, account_warmup_model
+                account_warmup_enabled, account_warmup_schedule_time, account_warmup_model,
+                account_fingerprint_enabled
          from runtime_settings where id = 1",
     )
     .fetch_optional(&mut **transaction)
@@ -515,6 +538,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      account_warmup_model = $29,
                      smart_scheduling_json = $30,
                      openai_guardian_reserved_concurrency = $31,
+                     account_fingerprint_enabled = $32,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -562,6 +586,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     .bind(update.account_warmup_model.as_deref())
     .bind(sqlx::types::Json(update.smart_scheduling))
     .bind(i64::from(update.openai_guardian_reserved_concurrency))
+    .bind(update.account_fingerprint_enabled)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
@@ -646,6 +671,7 @@ struct RuntimeSettingsRow {
     account_warmup_enabled: bool,
     account_warmup_schedule_time: String,
     account_warmup_model: Option<String>,
+    account_fingerprint_enabled: bool,
 }
 
 fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
@@ -700,6 +726,7 @@ fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSett
         account_warmup_enabled: row.account_warmup_enabled,
         account_warmup_schedule_time: row.account_warmup_schedule_time,
         account_warmup_model: row.account_warmup_model,
+        account_fingerprint_enabled: row.account_fingerprint_enabled,
     })
 }
 

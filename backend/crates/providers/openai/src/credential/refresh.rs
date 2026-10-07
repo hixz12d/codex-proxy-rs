@@ -137,6 +137,8 @@ impl<'a> RefreshFailureContext<'a> {
 pub struct DueCodexCredential {
     pub account: ProviderAccount,
     pub secret: CodexOAuthSecret,
+    /// 账号指纹的确定性输入；刷新请求据此使用账号自己的身份。
+    pub installation_id: String,
 }
 
 impl std::fmt::Debug for DueCodexCredential {
@@ -290,7 +292,11 @@ impl CodexCredentialRefreshService {
             .ok_or(CodexCredentialRefreshError::InvalidRefreshResponse)?;
         let refresh_result = self
             .refresher
-            .refresh_with_proxy(refresh_token.expose_secret(), due.account.outbound_proxy())
+            .refresh_with_proxy(
+                refresh_token.expose_secret(),
+                due.account.outbound_proxy(),
+                Some(&due.installation_id),
+            )
             .await;
         if recovery_window_exhausted && let Err(failure) = &refresh_result {
             let message = failure.message().map(str::to_owned);
@@ -424,6 +430,7 @@ impl CodexCredentialRefreshService {
                     due.push(DueCodexCredential {
                         account: loaded.account,
                         secret: secret.clone(),
+                        installation_id: runtime.installation_id,
                     });
                 }
                 Ok(_) | Err(_) => {

@@ -889,7 +889,8 @@ OpenAI OAuth 账号只接受 `connection: { transport }`，不接受 `baseUrl`�
 连接设置不能修改账号 ID、Provider 或认证类型，也不接受通用凭据文档。
 凭据与设置在同一事务中保存，任一校验或持久化失败均不落库。
 `GET /api/admin/accounts/detail` 对 API Key 账号额外返回 `credentialConfiguration: { base_url, transport }`；
-OAuth 账号返回 `credentialConfiguration: { transport }`。响应不回显密钥或 token；不适用的账号省略该字段。
+OAuth 账号返回 `credentialConfiguration: { transport }`。OpenAI 账号另含只读的 `userAgent` 与 `userAgentSource`，
+见 [OpenAI 上游客户端身份](#openai-上游客户端身份)。响应不回显密钥或 token；不适用的账号省略该字段。
 更新会推进凭据 revision 并失效目录与连接；旧版本会话不可静默续接到新上游
 
 OAuth start 使用：
@@ -1275,6 +1276,7 @@ accountAutoFreezeAdaptiveConcurrency
 accountWarmupEnabled
 accountWarmupScheduleTime
 accountWarmupModel
+accountFingerprintEnabled
 ```
 
 定时账号预热默认关闭。`accountWarmupScheduleTime` 使用部署时区中的 `HH:MM`，
@@ -1282,6 +1284,10 @@ accountWarmupModel
 任务面向可用的 OpenAI OAuth 账号，跳过周额度耗尽及五小时窗口距离重置仍超过 30 分钟的账号。
 不存在的本地时刻跳过，重复时刻只执行较早一次；执行进度跨重启保留，时钟回拨不补跑已领取时刻之前的时段。
 只有收到响应成功终态才记为预热成功；预热不计入客户端业务用量
+
+`accountFingerprintEnabled` 是必填布尔值，默认 `true`，只作用于 OpenAI Provider。开启时，代表某个账号发出的上游请求
+使用该账号自己的固定 Desktop 身份，`providerRequestProfiles` 的全局选择和 Key 的 `providerRequestProfileOverrides`
+不再作用于这些请求；关闭时恢复全局选择与 Key 覆盖。修改后最多约 30 秒生效，规则见 [OpenAI 上游客户端身份](#openai-上游客户端身份)
 
 `requestLocationEnabled` 是必填布尔值，默认 `false`：关闭时不覆盖客户端原有位置和时区；开启时使用已保存的
 `requestLocation`。关闭不会清空自定义值，代理自定义位置仍优先。
@@ -1408,7 +1414,8 @@ models.dev 同步只导入可表示为当前文本 Token 计价的 OpenAI/xAI �
 `openaiClientProfile` 保存通用选择，首次默认 `MacOS · Desktop · 自动最新`。
 兼容字段的更新语义见上节。初始化不读取 YAML 身份字段。
 该配置作用于 Client Key 的 OpenAI 模型请求与原生模型目录，适用于 HTTP/SSE、WebSocket、Images 和 Search。
-不改变 xAI、入站客户端版本门禁、账号认证或后台 Desktop 专属操作
+不改变 xAI、入站客户端版本门禁、账号认证或后台 Desktop 专属操作。
+`accountFingerprintEnabled` 开启时，代表账号发出的请求改用账号指纹，见本节末尾
 
 自定义配置使用 `{ "mode": "custom", "userAgent": "完整 UA" }`。
 已识别的 `Codex Desktop`、`codex-tui`、`codex_exec`、`codex_cli_rs` 前缀由后端解析 `originator` 和 Core `version`，
@@ -1453,6 +1460,21 @@ WebSocket 使用 rustls；配置自定义 CA 时 HTTP 也使用 rustls。TLS 指
 
 配置在请求开始时冻结，Provider 首次解析的版本用于该请求的全部重试与换号。
 已建立 WebSocket 的精确续写沿用所属连接；新请求使用保存后的选择
+
+`accountFingerprintEnabled` 开启时（默认），账号指纹优先于上述全局选择和 Key 覆盖：
+
+- 身份由账号的 `installation_id` 哈希后确定性算出，同一账号永远相同，不入库；增删其他账号不影响已有账号
+- 只用 Desktop；平台按权重 macOS 60 / Windows 30 / Linux 10，架构分别为 arm64 / x86_64 / x86_64，
+  系统版本在每个平台的几个常见值中挑选
+- 版本跟随官方最新（`latest`），与全局自动更新共用官方发布资料
+- 覆盖代表该账号发出的上游请求：模型请求（HTTP/SSE、WebSocket、Images、Search）、token 刷新、
+  额度 / 用量 / 预热 / 重置额度、模型目录、个人资料与头像
+- 所选平台暂无可用版本时，该账号回退为全局身份，请求不失败
+- 没有账号的请求（如启动时检查官方版本）仍用全局身份
+- 账号详情的 `credentialConfiguration` 额外返回只读字段 `userAgent`（该账号当前解析出的 UA）和
+  `userAgentSource`（`account` 为账号指纹，`global` 为全局身份）
+
+关闭开关后完全回到全局选择与 Key 覆盖；指纹只改变应用层请求头，不改变出口 IP 与 TLS 指纹
 
 ### xAI 上游客户端身份
 

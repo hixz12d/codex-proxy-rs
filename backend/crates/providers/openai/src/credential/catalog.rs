@@ -740,11 +740,16 @@ impl CodexCredentialCatalogService {
                 .authentication
                 .authorization_header()
                 .map_err(|_| CodexCredentialCatalogError::InvalidCredentialData)?;
-            let result = client
-                .for_account(account)
-                .map_err(|error| CodexCredentialCatalogError::Upstream {
+            let mut account_client = client.for_account(account).map_err(|error| {
+                CodexCredentialCatalogError::Upstream {
                     detail: error.to_string(),
-                })?
+                }
+            })?;
+            // 传入的 client 可能持有冻结的请求画像；账号指纹必须对着服务共享画像解析。
+            if let Some(profile) = self.profile.account_profile(&credential.installation_id) {
+                account_client = account_client.with_request_profile(profile);
+            }
+            let result = account_client
                 .with_authentication(&credential.authentication)
                 .fetch_models_with_context(
                     CodexRequestContext::auxiliary(

@@ -35,6 +35,16 @@ export function useAccountEditor(options: {
   const savedConfiguration = shallowRef<ApiKeyConfiguration>()
   const oauthTransport = shallowRef<ApiKeyConfiguration['transport']>('prefer_websocket')
   const savedOAuthTransport = shallowRef<ApiKeyConfiguration['transport']>('prefer_websocket')
+  // 只读展示：该账号当前实际使用的 User-Agent 及其来源；Provider 未提供时为空。
+  const userAgent = shallowRef<string>()
+  const userAgentSource = shallowRef<'account' | 'global'>()
+
+  function readUserAgent(configuration: Record<string, unknown> | undefined) {
+    const value = configuration?.userAgent
+    const source = configuration?.userAgentSource
+    userAgent.value = typeof value === 'string' && value ? value : undefined
+    userAgentSource.value = source === 'account' || source === 'global' ? source : undefined
+  }
 
   async function loadConfiguration(accountId: string) {
     const requestId = configurationRequest.start()
@@ -42,6 +52,7 @@ export function useAccountEditor(options: {
       const detail = await getAccountDetail({ accountId }, { signal: configurationRequest.signal })
       if (!configurationRequest.isCurrent(requestId))
         return
+      readUserAgent(detail.credentialConfiguration)
       if (isOpenAiOAuthAccount(detail.account)) {
         const transport = detail.credentialConfiguration?.transport
         if (transport !== 'http' && transport !== 'prefer_websocket')
@@ -82,6 +93,8 @@ export function useAccountEditor(options: {
     savedOAuthTransport.value = 'prefer_websocket'
     savedConfiguration.value = undefined
     configurationReady.value = false
+    userAgent.value = undefined
+    userAgentSource.value = undefined
     showEditModal.value = true
     if (isOpenAiApiKeyAccount(account) || isOpenAiOAuthAccount(account))
       void loadConfiguration(account.id)
@@ -161,6 +174,8 @@ export function useAccountEditor(options: {
   return {
     apiKey,
     oauthTransport,
+    userAgent,
+    userAgentSource,
     configurationLoading,
     configurationReady,
     showEditModal,

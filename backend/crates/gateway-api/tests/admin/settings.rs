@@ -69,7 +69,8 @@ fn update_body() -> Value {
         "accountAutoFreezeAdaptiveConcurrency": true,
         "accountWarmupEnabled": false,
         "accountWarmupScheduleTime": "08:00",
-        "accountWarmupModel": null
+        "accountWarmupModel": null,
+        "accountFingerprintEnabled": true
     })
 }
 
@@ -240,6 +241,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
         account_warmup_enabled: false,
         account_warmup_schedule_time: "08:00".to_owned(),
         account_warmup_model: None,
+        account_fingerprint_enabled: true,
         updated_at: Utc
             .with_ymd_and_hms(2026, 8, 2, 10, 30, 0)
             .single()
@@ -291,6 +293,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
                 "accountWarmupEnabled": false,
                 "accountWarmupScheduleTime": "08:00",
                 "accountWarmupModel": null,
+                "accountFingerprintEnabled": true,
                 "updatedAt": "2026-08-02T10:30:00Z",
                 "updatedAtDisplay": "2026-08-02 18:30:00"
         })
@@ -360,6 +363,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         account_warmup_enabled: false,
         account_warmup_schedule_time: "08:00".to_owned(),
         account_warmup_model: None,
+        account_fingerprint_enabled: true,
         updated_at: chrono::Utc::now(),
     };
 

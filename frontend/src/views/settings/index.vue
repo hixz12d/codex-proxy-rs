@@ -179,6 +179,7 @@ watch(section, (value) => {
           <TokenRefreshCard v-model:refresh-margin-seconds="refreshMarginSecondsValue" v-model:refresh-concurrency="refreshConcurrencyValue" />
           <ClientProfileCard
             v-model="form.providerRequestProfiles"
+            v-model:account-fingerprint-enabled="form.accountFingerprintEnabled"
             :active="section === 'upstream'"
             :disabled="disabled"
           />

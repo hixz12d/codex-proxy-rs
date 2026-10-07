@@ -18,6 +18,8 @@ defineProps<{
   saving: boolean
   configurationLoading: boolean
   configurationReady: boolean
+  userAgent?: string
+  userAgentSource?: 'account' | 'global'
 }>()
 
 const emit = defineEmits<{
@@ -88,6 +90,15 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
         </p>
         <AccountApiKeyFields v-else v-model="apiKey" editing :disabled="saving" />
       </section>
+
+      <BaseFormItem v-if="userAgent" label="当前 User-Agent">
+        <p class="m-0 font-mono text-cp-sm break-all text-cp-text select-all">
+          {{ userAgent }}
+        </p>
+        <p class="mt-1 mb-0 text-cp-xs text-cp-text-secondary">
+          {{ userAgentSource === 'account' ? '账号独立指纹' : '使用全局身份（每个账号独立指纹已关闭或该平台暂无版本）' }}
+        </p>
+      </BaseFormItem>
 
       <AccountSettingsFields
         v-model:enabled="enabled"

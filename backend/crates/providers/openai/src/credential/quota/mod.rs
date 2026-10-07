@@ -1133,7 +1133,7 @@ impl CodexCredentialQuotaService {
             let upstream_request = CodexResponsesRequest::from_body(body);
             let request_id = format!("warmup_{}", Uuid::now_v7().simple());
             let client_for_account = match client.for_account(&account) {
-                Ok(c) => c,
+                Ok(c) => c.with_account_identity(&credential.installation_id),
                 Err(error) => {
                     tracing::warn!(account_id = %account.id(), error = %error, "warmup client for account failed");
                     summary.failed += 1;
@@ -1692,6 +1692,7 @@ async fn list_reset_credits_once(
     client
         .for_account(&prepared.account)
         .map_err(ResetCreditAttemptError::Upstream)?
+        .with_account_identity(&prepared.credential.installation_id)
         .list_rate_limit_reset_credits(CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             prepared.account.upstream_account_id(),
@@ -1717,6 +1718,7 @@ async fn consume_reset_credit_once(
     client
         .for_account(&prepared.account)
         .map_err(ResetCreditAttemptError::Upstream)?
+        .with_account_identity(&prepared.credential.installation_id)
         .consume_rate_limit_reset_credit(
             CodexRequestContext::auxiliary(
                 authorization.expose_secret(),
@@ -1800,6 +1802,7 @@ async fn fetch_usage_once(
     client
         .for_account(&prepared.account)
         .map_err(CodexQuotaFetchAttemptError::Upstream)?
+        .with_account_identity(&prepared.credential.installation_id)
         .fetch_usage(CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             prepared.account.upstream_account_id(),

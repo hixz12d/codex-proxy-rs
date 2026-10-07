@@ -56,6 +56,16 @@ impl CodexBackendClient {
         self
     }
 
+    /// 开关开启时把请求身份换成该账号的固定指纹，覆盖全局选择和 Key 覆盖；
+    /// 开关关闭或该平台暂无可用版本时保持当前身份。
+    #[must_use]
+    pub fn with_account_identity(self, installation_id: &str) -> Self {
+        match self.base_profile.account_profile(installation_id) {
+            Some(profile) => self.with_request_profile(profile),
+            None => self,
+        }
+    }
+
     /// 构造客户端。
     pub fn new(
         client: Client,
@@ -76,6 +86,7 @@ impl CodexBackendClient {
             base_url,
             official_base_url: crate::OFFICIAL_CODEX_BASE_URL.to_owned(),
             protocol: OpenAiUpstreamProtocol::Codex,
+            base_profile: profile.clone(),
             profile,
             websocket_pool: None,
             websocket_origin_breaker: WebSocketOriginBreaker::default(),

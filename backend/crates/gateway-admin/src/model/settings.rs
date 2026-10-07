@@ -57,6 +57,8 @@ pub struct RuntimeSettings {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    /// 每个账号独立指纹开关；只作用于 OpenAI Provider，不进请求冻结快照，由 Provider 定时读取。
+    pub account_fingerprint_enabled: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -97,6 +99,7 @@ pub struct ReplaceRuntimeSettings {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    pub account_fingerprint_enabled: bool,
 }
 
 /// 明文管理员 API Key；按产品约束明文落库，但禁止 Debug 泄漏。
@@ -204,6 +207,7 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
             account_warmup_enabled: settings.account_warmup_enabled,
             account_warmup_schedule_time: settings.account_warmup_schedule_time,
             account_warmup_model: settings.account_warmup_model,
+            account_fingerprint_enabled: settings.account_fingerprint_enabled,
         }
     }
 }

@@ -135,7 +135,7 @@ impl CodexCredentialProfileService {
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<Option<CodexSubscription>, CodexProfileStatisticsError> {
-        let (authorization, upstream_account_id, account) =
+        let (authorization, upstream_account_id, account, installation_id) =
             self.account_authentication(account_id).await?;
         let Some(upstream_account_id) = upstream_account_id else {
             return Ok(None);
@@ -148,6 +148,7 @@ impl CodexCredentialProfileService {
         )
         .for_account(&account)
         .map_err(map_client_error)?
+        .with_account_identity(&installation_id)
         .fetch_subscription(
             CodexRequestContext::auxiliary(
                 authorization.expose_secret(),
@@ -181,7 +182,7 @@ impl CodexCredentialProfileService {
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<CodexProfileStatistics, CodexProfileStatisticsError> {
-        let (authorization, upstream_account_id, account) =
+        let (authorization, upstream_account_id, account, installation_id) =
             self.account_authentication(account_id).await?;
         let request_id = format!("profile_statistics_{}", Uuid::now_v7().simple());
         let statistics = CodexBackendClient::new(
@@ -191,6 +192,7 @@ impl CodexCredentialProfileService {
         )
         .for_account(&account)
         .map_err(map_client_error)?
+        .with_account_identity(&installation_id)
         .fetch_profile_statistics(CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             upstream_account_id.as_deref(),
@@ -204,6 +206,7 @@ impl CodexCredentialProfileService {
     }
 
     /// URL 缓存不缓存认证；每次下载都重新读取所属账号当前的 token。
+    /// 同时返回 installation_id，供账号指纹解析。
     async fn account_authentication(
         &self,
         account_id: &ProviderAccountId,
@@ -212,6 +215,7 @@ impl CodexCredentialProfileService {
             SecretString,
             Option<String>,
             gateway_core::account::ProviderAccount,
+            String,
         ),
         CodexProfileStatisticsError,
     > {
@@ -246,6 +250,7 @@ impl CodexCredentialProfileService {
             authorization,
             account.upstream_account_id().map(str::to_owned),
             account,
+            credential.installation_id,
         ))
     }
 
@@ -261,7 +266,7 @@ impl CodexCredentialProfileService {
                 .image_url
                 .ok_or(CodexProfileAvatarError::Missing)?,
         };
-        let (authorization, upstream_account_id, account) =
+        let (authorization, upstream_account_id, account, installation_id) =
             self.account_authentication(account_id).await?;
         let http = if account.outbound_proxy().is_some() {
             crate::transport::client::build_account_http_client(
@@ -272,10 +277,15 @@ impl CodexCredentialProfileService {
         } else {
             self.http.clone()
         };
+        // 头像不经过 for_account，单独套用账号指纹；取不到时用共享快照。
+        let profile = self
+            .profile
+            .account_profile(&installation_id)
+            .unwrap_or_else(|| self.profile.snapshot());
         fetch_profile_avatar(
             &http,
             &self.base_url,
-            &self.profile.snapshot(),
+            &profile,
             &source,
             CodexRequestContext::auxiliary(
                 authorization.expose_secret(),

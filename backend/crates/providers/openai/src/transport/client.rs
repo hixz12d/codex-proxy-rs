@@ -687,6 +687,8 @@ pub struct CodexBackendClient {
     pub(super) official_base_url: String,
     pub(super) protocol: OpenAiUpstreamProtocol,
     pub(super) profile: CodexWireProfileState,
+    /// Provider 共享画像；`with_request_profile` 不替换它，账号指纹与开关都从这里读取。
+    pub(super) base_profile: CodexWireProfileState,
     pub(super) websocket_pool: Option<Arc<CodexWebSocketPool>>,
     pub(super) websocket_origin_breaker: WebSocketOriginBreaker,
     pub(super) websocket_origin_key: String,

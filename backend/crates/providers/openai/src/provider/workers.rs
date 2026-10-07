@@ -10,6 +10,12 @@ pub(crate) struct ClientReleaseServices {
     pub platforms: Arc<PlatformDesktopReleaseService>,
 }
 
+/// “每个账号独立指纹”开关的刷新依赖。
+pub(crate) struct AccountFingerprintRefresh {
+    pub profile: CodexWireProfileState,
+    pub runtime_policy: Arc<dyn gateway_core::provider_ports::ProviderRuntimePolicyPort>,
+}
+
 pub(super) const WORKER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub(super) const WORKER_MAXIMUM_BACKOFF: Duration = Duration::from_secs(60);
 pub(super) const WORKER_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -21,7 +27,11 @@ pub(super) const MODEL_ETAG_WORKER_OWNER: &str = "openai-model-etag";
 pub(super) const MODEL_CATALOG_WORKER_OWNER: &str = "openai-model-catalog";
 pub(super) const WARMUP_WORKER_OWNER: &str = "openai-account-warmup";
 pub(super) const WARMUP_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+pub(super) const ACCOUNT_FINGERPRINT_WORKER_OWNER: &str = "openai-account-fingerprint";
+pub(super) const ACCOUNT_FINGERPRINT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+// Provider 构造集中交出全部后台任务依赖，拆分参数会模糊所有权。
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn worker_contributions(
     timezone: gateway_core::time::DeploymentTimeZone,
     refresh: Arc<CodexCredentialRefreshService>,
@@ -30,6 +40,7 @@ pub(crate) fn worker_contributions(
     quota_refresh_policy: CodexQuotaRefreshPolicy,
     oauth_refresh_enabled: bool,
     releases: ClientReleaseServices,
+    account_fingerprint: AccountFingerprintRefresh,
 ) -> Result<Vec<WorkerContribution>, WorkerDefinitionError> {
     let refresh_id = WorkerId::try_new(WorkerKind::OAuthRefresh, PROVIDER_NAME)?;
     let quota_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, PROVIDER_NAME)?;
@@ -101,8 +112,41 @@ pub(crate) fn worker_contributions(
                 service: releases.desktop,
             }),
         )?),
+        WorkerContribution::Registration(local_scheduled_registration(
+            WorkerId::try_new(
+                WorkerKind::QuotaCatalogHealth,
+                ACCOUNT_FINGERPRINT_WORKER_OWNER,
+            )?,
+            ACCOUNT_FINGERPRINT_REFRESH_INTERVAL,
+            Box::new(OpenAiAccountFingerprintTask {
+                refresh: account_fingerprint,
+            }),
+        )?),
     ]);
     Ok(contributions)
+}
+
+/// 每个实例都要刷新自己进程内的状态，因此不申请 leader lease。
+fn local_scheduled_registration(
+    id: WorkerId,
+    interval: Duration,
+    task: Box<dyn ScheduledTask>,
+) -> Result<WorkerRegistration, WorkerDefinitionError> {
+    let schedule = WorkerSchedule::try_new(
+        interval,
+        WORKER_INITIAL_BACKOFF,
+        WORKER_MAXIMUM_BACKOFF,
+        WORKER_LEASE_TTL,
+        WORKER_LEASE_RENEWAL,
+    )?;
+    WorkerRegistration::try_new(
+        id,
+        WorkerRunnable::Scheduled {
+            schedule,
+            lease: None,
+            task,
+        },
+    )
 }
 
 pub(super) fn scheduled_registration(
@@ -215,6 +259,36 @@ pub(super) struct OpenAiCatalogEtagTask {
 
 pub(super) struct OpenAiDesktopReleaseTask {
     service: Arc<CodexDesktopReleaseService>,
+}
+
+struct OpenAiAccountFingerprintTask {
+    refresh: AccountFingerprintRefresh,
+}
+
+impl ScheduledTask for OpenAiAccountFingerprintTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            if context.cancellation().is_cancelled() {
+                return Ok(());
+            }
+            match self
+                .refresh
+                .runtime_policy
+                .load_account_fingerprint_enabled()
+                .await
+            {
+                Ok(enabled) => self
+                    .refresh
+                    .profile
+                    .set_account_fingerprint_enabled(enabled),
+                // 读取失败保留上次的值，避免存储抖动导致账号身份来回切换。
+                Err(error) => {
+                    tracing::warn!(error = %error, "OpenAI account fingerprint setting load failed");
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 impl ScheduledTask for OpenAiDesktopReleaseTask {

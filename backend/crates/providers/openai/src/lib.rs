@@ -77,6 +77,13 @@ pub async fn initialize(
             residency: config.residency,
             ..Default::default()
         });
+    // 读取失败按关闭处理，后台任务每 30 秒重试并刷新。
+    match runtime_policy.load_account_fingerprint_enabled().await {
+        Ok(enabled) => profile.set_account_fingerprint_enabled(enabled),
+        Err(error) => {
+            tracing::warn!(error = %error, "OpenAI account fingerprint setting could not be loaded");
+        }
+    }
     let artifact_cache =
         CodexArtifactProfileCache::new(provider_kind.clone(), ports.artifact_profiles());
     let configured_build = profile.snapshot().desktop_build.parse::<u64>().ok();
@@ -221,7 +228,7 @@ pub async fn initialize(
     );
     let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(OpenAiAdminProvider::new(
         provider_kind,
-        profile,
+        profile.clone(),
         accounts,
         OpenAiAdminServices {
             credentials: credential_admin,
@@ -244,6 +251,10 @@ pub async fn initialize(
             desktop: desktop_release,
             cli: cli_release,
             platforms: platform_releases,
+        },
+        provider::AccountFingerprintRefresh {
+            profile,
+            runtime_policy,
         },
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;

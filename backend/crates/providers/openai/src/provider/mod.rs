@@ -105,7 +105,7 @@ mod failure;
 mod observation;
 mod upstream_adapter;
 mod workers;
-pub(crate) use workers::ClientReleaseServices;
+pub(crate) use workers::{AccountFingerprintRefresh, ClientReleaseServices};
 
 use execution::*;
 #[doc(hidden)]
@@ -927,6 +927,7 @@ impl CodexProvider {
                 .map_err(|_| {
                     provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
                 })?
+                .with_account_identity(lease.installation_id())
                 .with_authentication(lease.authentication())
                 .with_connection_budget(context.connection_budget().clone())
                 .with_response_control(context.response_control().cloned())

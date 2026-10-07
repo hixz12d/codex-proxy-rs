@@ -27,7 +27,7 @@ async fn refresh_and_code_exchange_use_the_selected_account_proxy() {
     for (proxy, expected) in [(&proxy_a, "exit-a-access"), (&proxy_b, "exit-b-access")] {
         let proxy = gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap();
         let refreshed = client
-            .refresh_with_proxy("initial-refresh", Some(&proxy))
+            .refresh_with_proxy("initial-refresh", Some(&proxy), None)
             .await
             .unwrap();
         assert_eq!(refreshed.access_token.as_deref(), Some(expected));

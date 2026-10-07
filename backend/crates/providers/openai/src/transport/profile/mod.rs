@@ -1,6 +1,7 @@
 //! Codex Desktop 上游请求画像。
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use url::Url;
 
 use self::desktop_artifact::{CodexDesktopArtifactError, fetch_codex_core_version};
 
+pub mod account;
 pub mod cli_release;
 pub mod desktop_artifact;
 pub mod identity;
@@ -150,6 +152,8 @@ impl CodexWireProfile {
 pub struct CodexWireProfileState {
     profile: Arc<RwLock<CodexWireProfile>>,
     releases: Arc<RwLock<ClientReleases>>,
+    /// “每个账号独立指纹”运行时开关；clone 共享，新建状态默认关闭。
+    account_fingerprint_enabled: Arc<AtomicBool>,
 }
 
 type ClientReleases = BTreeMap<(ClientKind, ClientPlatform, String), ClientReleaseObservation>;
@@ -167,6 +171,7 @@ impl CodexWireProfileState {
         let state = Self {
             profile: Arc::new(RwLock::new(profile)),
             releases: Arc::default(),
+            account_fingerprint_enabled: Arc::default(),
         };
         cli_release::seed_releases(&state);
         platform_release::seed_releases(&state);

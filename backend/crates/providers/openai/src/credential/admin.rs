@@ -957,6 +957,7 @@ impl CodexCredentialAdminService {
             .refresh_with_proxy(
                 refresh_token.expose_secret(),
                 current.account.outbound_proxy(),
+                Some(&runtime.installation_id),
             )
             .await
             .inspect_err(|error| log_manual_refresh_failure(&account_id, error))
@@ -1054,6 +1055,8 @@ impl CodexCredentialAdminService {
             };
             let typed_account_id = ProviderAccountId::new(account_id.clone())
                 .map_err(|_| CodexCredentialAdminError::InvalidInput)?;
+            // 先生成 installation_id，导入时的 RT 刷新和 PAT 检查就使用该账号自己的指纹。
+            let installation_id = uuid::Uuid::new_v4().to_string();
             let (mut secret, mut access_token_expires_at) = self
                 .resolve_import_tokens(
                     &typed_account_id,
@@ -1061,6 +1064,7 @@ impl CodexCredentialAdminService {
                     authentication.refresh_token.clone(),
                     authentication.id_token.clone(),
                     candidate.outbound_proxy.as_ref(),
+                    &installation_id,
                 )
                 .await?;
             let metadata = if secret
@@ -1074,7 +1078,11 @@ impl CodexCredentialAdminService {
                     .personal_access_token_client
                     .as_ref()
                     .ok_or(PersonalAccessTokenError::Unavailable)?
-                    .personal_access_token_metadata(token, candidate.outbound_proxy.as_ref())
+                    .personal_access_token_metadata(
+                        token,
+                        candidate.outbound_proxy.as_ref(),
+                        Some(&installation_id),
+                    )
                     .await?;
                 secret = CodexOAuthSecret {
                     access_token: SecretString::from(token),
@@ -1115,7 +1123,7 @@ impl CodexCredentialAdminService {
                         .or_else(|| metadata.email.clone())
                         .filter(|name| !name.trim().is_empty())
                         .unwrap_or_else(|| "Codex OAuth".to_owned()),
-                    installation_id: uuid::Uuid::new_v4().to_string(),
+                    installation_id,
                     secret,
                     metadata,
                     access_token_expires_at,
@@ -1140,6 +1148,7 @@ impl CodexCredentialAdminService {
         refresh_token: Option<String>,
         id_token: Option<String>,
         proxy: Option<&gateway_core::account::OutboundProxy>,
+        installation_id: &str,
     ) -> Result<(CodexOAuthSecret, Option<DateTime<Utc>>), CodexCredentialAdminError> {
         let id_token = id_token.map(SecretString::from);
         if let Some(access_token) = access_token {
@@ -1159,7 +1168,7 @@ impl CodexCredentialAdminService {
         let refresh_token = refresh_token.ok_or(CodexCredentialAdminError::InvalidCredential)?;
         let tokens = self
             .refresher
-            .refresh_with_proxy(&refresh_token, proxy)
+            .refresh_with_proxy(&refresh_token, proxy, Some(installation_id))
             .await
             .map_err(map_refresh_failure)?;
         let access_token = tokens

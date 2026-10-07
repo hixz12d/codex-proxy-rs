@@ -4,7 +4,7 @@ use super::types::CodexOAuthMetadata;
 
 use crate::transport::{
     headers::build_codex_profile_headers,
-    profile::CodexWireProfileState,
+    profile::{CodexWireProfile, CodexWireProfileState},
     tls::{build_reqwest_client_with_custom_ca, ensure_rustls_provider},
 };
 use async_trait::async_trait;
@@ -207,10 +207,13 @@ impl fmt::Debug for RefreshUpstreamFailure {
 #[async_trait]
 pub trait TokenRefresher: Send + Sync + 'static {
     async fn refresh(&self, refresh_token: &str) -> Result<TokenPair, RefreshFailure>;
+    /// `installation_id` 为所属账号标识；有值且账号指纹开启时，刷新请求使用该账号的指纹身份。
+    /// 默认实现不构造身份头，因此忽略它。
     async fn refresh_with_proxy(
         &self,
         refresh_token: &str,
         proxy: Option<&gateway_core::account::OutboundProxy>,
+        _installation_id: Option<&str>,
     ) -> Result<TokenPair, RefreshFailure> {
         if proxy.is_some() {
             return Err(proxy_refresh_failure());
@@ -338,10 +341,18 @@ impl OpenAiTokenClient {
         }
     }
 
+    /// 账号指纹开启时使用账号身份，否则使用共享画像快照。
+    fn request_profile(&self, installation_id: Option<&str>) -> CodexWireProfile {
+        installation_id
+            .and_then(|installation_id| self.profile.account_profile(installation_id))
+            .unwrap_or_else(|| self.profile.snapshot())
+    }
+
     pub(crate) async fn personal_access_token_metadata(
         &self,
         access_token: &str,
         proxy: Option<&gateway_core::account::OutboundProxy>,
+        installation_id: Option<&str>,
     ) -> Result<CodexOAuthMetadata, PersonalAccessTokenError> {
         if !access_token.starts_with("at-")
             || access_token.len() <= 3
@@ -358,7 +369,7 @@ impl OpenAiTokenClient {
         endpoint.set_path(PERSONAL_ACCESS_TOKEN_WHOAMI_PATH);
         endpoint.set_query(None);
         endpoint.set_fragment(None);
-        let headers = build_codex_profile_headers(&self.profile.snapshot())
+        let headers = build_codex_profile_headers(&self.request_profile(installation_id))
             .map_err(|_| PersonalAccessTokenError::Unavailable)?;
         let client = self
             .with_proxy(proxy)
@@ -499,19 +510,31 @@ impl TokenRefresher for OpenAiTokenClient {
         &self,
         refresh_token: &str,
         proxy: Option<&gateway_core::account::OutboundProxy>,
+        installation_id: Option<&str>,
     ) -> Result<TokenPair, RefreshFailure> {
         self.with_proxy(proxy)
             .map_err(|_| proxy_refresh_failure())?
-            .refresh(refresh_token)
+            .refresh_with_profile(refresh_token, installation_id)
             .await
     }
     async fn refresh(&self, refresh_token: &str) -> Result<TokenPair, RefreshFailure> {
-        let headers = build_codex_profile_headers(&self.profile.snapshot()).map_err(|_| {
-            RefreshFailure::Transport {
-                message: Some("OpenAI OAuth refresh profile is invalid".to_owned()),
-                upstream: None,
-            }
-        })?;
+        self.refresh_with_profile(refresh_token, None).await
+    }
+}
+
+impl OpenAiTokenClient {
+    async fn refresh_with_profile(
+        &self,
+        refresh_token: &str,
+        installation_id: Option<&str>,
+    ) -> Result<TokenPair, RefreshFailure> {
+        let headers =
+            build_codex_profile_headers(&self.request_profile(installation_id)).map_err(|_| {
+                RefreshFailure::Transport {
+                    message: Some("OpenAI OAuth refresh profile is invalid".to_owned()),
+                    upstream: None,
+                }
+            })?;
         let response = self
             .client
             .post(&self.config.token_endpoint)

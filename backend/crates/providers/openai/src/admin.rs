@@ -628,6 +628,12 @@ impl ProviderAdmin for OpenAiAdminProvider {
             .map_err(map_store_error)?;
         let data = CodexCredentialCodec::decode_complete(&current.credential)
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        // 只读展示该账号当前实际使用的 UA；开关关闭或平台暂无版本时为全局身份。
+        let (user_agent, user_agent_source) =
+            match self.profile.account_profile(data.installation_id()) {
+                Some(profile) => (profile.user_agent(), "account"),
+                None => (self.profile.snapshot().user_agent(), "global"),
+            };
         let value = match data {
             crate::credential::CodexCredentialData::ApiKey(data) => {
                 serde_json::to_value(data.configuration())
@@ -637,10 +643,15 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 serde_json::json!({"transport": data.transport})
             }
         };
-        let object = value
+        let mut object = value
             .as_object()
             .cloned()
             .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        object.insert("userAgent".to_owned(), Value::String(user_agent));
+        object.insert(
+            "userAgentSource".to_owned(),
+            Value::String(user_agent_source.to_owned()),
+        );
         Ok(Some(ProviderDocument::new(
             gateway_core::account::OpaqueProviderData::new(object),
         )))

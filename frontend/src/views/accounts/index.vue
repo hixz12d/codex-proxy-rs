@@ -199,6 +199,8 @@ const {
 const {
   apiKey: editingApiKey,
   oauthTransport: editingOAuthTransport,
+  userAgent: editingUserAgent,
+  userAgentSource: editingUserAgentSource,
   configurationLoading,
   configurationReady,
   showEditModal,
@@ -467,6 +469,8 @@ const {
       v-model:selected-group-ids="editingGroupIds"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
+      :user-agent="editingUserAgent"
+      :user-agent-source="editingUserAgentSource"
       :account="editingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"

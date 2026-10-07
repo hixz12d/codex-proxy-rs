@@ -56,6 +56,8 @@ export function useSettingsForm() {
     accountWarmupEnabled: false,
     accountWarmupScheduleTime: '08:00',
     accountWarmupModel: '',
+    // 与数据库列默认值一致；加载后以服务端值为准。
+    accountFingerprintEnabled: true,
   })
 
   function snapshot() {
@@ -154,6 +156,7 @@ export function useSettingsForm() {
     form.accountWarmupEnabled = data.accountWarmupEnabled
     form.accountWarmupScheduleTime = data.accountWarmupScheduleTime ?? '08:00'
     form.accountWarmupModel = data.accountWarmupModel ?? ''
+    form.accountFingerprintEnabled = data.accountFingerprintEnabled
     mappings.value = Object.entries(data.modelMappings || {}).map(([requestedModel, upstreamModel]) => ({
       requestedModel,
       upstreamModel: String(upstreamModel),
@@ -316,6 +319,7 @@ export function useSettingsForm() {
         accountWarmupEnabled: form.accountWarmupEnabled,
         accountWarmupScheduleTime: scheduleTime,
         accountWarmupModel: warmupModel || null,
+        accountFingerprintEnabled: form.accountFingerprintEnabled,
       })
       applySettings(result)
       toast.success('设置已保存')

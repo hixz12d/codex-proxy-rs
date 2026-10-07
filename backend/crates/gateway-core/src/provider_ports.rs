@@ -987,6 +987,15 @@ pub trait ProviderRuntimePolicyPort: Send + Sync {
     ) -> BoxFuture<'_, Result<ProviderWarmupPolicy, ProviderStoreError>> {
         Box::pin(async move { Ok(ProviderWarmupPolicy::disabled()) })
     }
+
+    /// 读取“每个账号独立指纹”开关；默认关闭，只有实现运行时设置的存储需要覆盖。
+    ///
+    /// 只有 OpenAI Provider 使用。开启后，代表某个账号发出的上游请求改用该账号
+    /// 自己的固定 Desktop 身份，全局画像配置和 Client Key 画像覆盖不再作用于这些请求；
+    /// 没有账号上下文的请求仍使用全局身份。
+    fn load_account_fingerprint_enabled(&self) -> BoxFuture<'_, Result<bool, ProviderStoreError>> {
+        Box::pin(async move { Ok(false) })
+    }
 }
 
 /// 账号容量熔断（自动冻结）策略；来源于 `runtime_settings`，
