@@ -34,6 +34,7 @@ const form = defineModel<AccountCreateForm>({ required: true })
       :groups="groups"
       :groups-loading="groupsLoading"
       :preserve-proxy="false"
+      random-proxy
       :disabled="disabled"
       :proxy-error="proxyError"
     />

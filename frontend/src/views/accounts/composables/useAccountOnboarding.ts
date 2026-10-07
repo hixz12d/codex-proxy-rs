@@ -1,4 +1,4 @@
-import type { AccountImportTask, getAccounts } from '@/api'
+import type { AccountImportItem, AccountImportTask, getAccounts } from '@/api'
 import { toast } from '@codex-proxy/ui'
 import { computed, ref, shallowRef, watch } from 'vue'
 import { createAccountImportTask, importAccounts } from '@/api'
@@ -8,6 +8,7 @@ import { formatProviderLabel, isSupportedProvider } from '@/utils/providers'
 import { accountCreateProvider, accountCreateSourceKey, accountImportSettings, accountProxyError, emptyAccountCreateForm } from '../components/AccountCreateModal/model'
 import { accountImportModes } from '../components/AccountCreateModal/presenter'
 import { accountImportDocuments, MAX_ACCOUNT_IMPORT_COUNT, mixedImportDocuments } from '../utils/accountImport'
+import { loadRandomProxyPool, pickRandomProxy } from '../utils/randomProxy'
 import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
 import { useAccountAuthorization } from './useAccountAuthorization'
 
@@ -23,8 +24,11 @@ export function useAccountOnboarding(options: {
   const createForm = ref(emptyAccountCreateForm())
   const authorization = useAccountAuthorization(() => finishCreate(reauthorizingAccount.value ? '账号重新授权成功' : '账号已添加'))
   let submissionId: string | undefined
+  // 随机代理按条目抽取；重试沿用同一 submissionId 时必须提交相同内容，否则后端返回 409。
+  let submissionItems: AccountImportItem[] | undefined
   watch(createForm, () => {
     submissionId = undefined
+    submissionItems = undefined
   }, { deep: true, flush: 'sync' })
 
   const showCreateModal = computed({
@@ -61,7 +65,8 @@ export function useAccountOnboarding(options: {
       if (proxyError)
         throw new Error(proxyError)
       const settings = accountImportSettings(form)
-      const outboundProxyId = form.proxyMode === 'proxy' ? form.proxyId.trim() : undefined
+      const randomPool = form.proxyMode === 'random' ? await loadRandomProxyPool() : undefined
+      const outboundProxyId = () => randomPool ? pickRandomProxy(randomPool) : form.proxyMode === 'proxy' ? form.proxyId.trim() : undefined
       const mode = form.mode
       if (mode === 'oauth')
         return
@@ -75,7 +80,7 @@ export function useAccountOnboarding(options: {
         await importAccounts({
           provider: 'openai',
           settings,
-          outboundProxyId,
+          outboundProxyId: outboundProxyId(),
           data: { provider: 'openai', authentication_kind: 'api_key', name: form.apiKey.name.trim(), base_url: form.apiKey.base_url.trim(), api_key: form.apiKey.apiKey, transport: form.apiKey.transport },
         })
         await finishCreate('API Key 账号已添加')
@@ -89,9 +94,10 @@ export function useAccountOnboarding(options: {
       for (const document of documents)
         requireImportProvider(document.provider)
       submissionId ??= generateRequestId()
+      submissionItems ??= documents.map(entry => ({ provider: entry.provider, data: entry.document, settings, outboundProxyId: outboundProxyId() }))
       const task = await createAccountImportTask({
         submissionId,
-        items: documents.map(entry => ({ provider: entry.provider, data: entry.document, settings, outboundProxyId })),
+        items: submissionItems,
       })
       showCreateModal.value = false
       options.onImportTaskCreated(task)
@@ -111,12 +117,17 @@ export function useAccountOnboarding(options: {
       const proxyError = accountProxyError(form)
       if (proxyError)
         throw new Error(proxyError)
+      const startProxyId = account
+        ? undefined
+        : form.proxyMode === 'random'
+          ? pickRandomProxy(await loadRandomProxyPool())
+          : form.proxyMode === 'proxy' ? form.proxyId.trim() : undefined
       await authorization.start({
         start: {
           provider,
           name: account?.name || account?.email || `${formatProviderLabel(provider)} 账号`,
           accountId: account?.id,
-          outboundProxyId: account ? undefined : form.proxyMode === 'proxy' ? form.proxyId.trim() : undefined,
+          outboundProxyId: startProxyId,
         },
         settings: account ? undefined : accountImportSettings(form),
       })

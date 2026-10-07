@@ -12,6 +12,7 @@ withDefaults(defineProps<{
   endpoint?: string | null
   accountId?: string
   preserveProxy?: boolean
+  randomProxy?: boolean
   preserveModelAccess?: boolean
   showScheduling?: boolean
   proxyError?: string
@@ -71,6 +72,6 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
         :disabled="disabled"
       />
     </BaseFormItem>
-    <AccountProxyField v-model:mode="proxyMode" v-model:proxy-id="proxyId" :preserve="preserveProxy" :error="proxyError" :endpoint="endpoint" :account-id="accountId" :disabled="disabled" />
+    <AccountProxyField v-model:mode="proxyMode" v-model:proxy-id="proxyId" :preserve="preserveProxy" :random="randomProxy" :error="proxyError" :endpoint="endpoint" :account-id="accountId" :disabled="disabled" />
   </div>
 </template>
