@@ -26,6 +26,9 @@ const TURN_ID_CLIENT_METADATA_KEY: &str = "turn_id";
 const THREAD_SPAWN_SUBAGENT_KIND: &str = "thread_spawn";
 const THREAD_SPAWN_CONVERSATION_PREFIX: &str = "thread-spawn:";
 const ENVIRONMENT_CONTEXT_CONTENT_KIND: &str = "environments.environment_context";
+const WEB_SEARCH_CALL_ITEM_TYPE: &str = "web_search_call";
+const ADDITIONAL_TOOLS_ITEM_TYPE: &str = "additional_tools";
+const COMPACTION_TRIGGER_ITEM_TYPE: &str = "compaction_trigger";
 
 const CROSS_ACCOUNT_IDENTITY_KEYS: &[&str] = &[
     "authorization",
@@ -111,7 +114,115 @@ pub fn encode_generate_request(
     encoded.explicit_prompt_cache_key = encoded.prompt_cache_key().is_some();
     extract_request_context(&mut encoded);
     apply_protocol_context(&mut encoded, payload.context());
+    let responses_lite = encoded
+        .responses_lite
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+    ensure_web_search_tool_for_history(encoded.body_mut(), responses_lite);
     Ok(encoded)
+}
+
+/// 上游拒绝回放 `web_search_call` 历史却未声明 `web_search` 工具的请求，
+/// 流内报 "response protection is unavailable"。Codex 本地压缩上下文会带
+/// `tools: []` 发送完整历史，因此联网搜索之后的每次压缩都会失败。
+///
+/// 此时补一个只用缓存的 `web_search` 声明；Responses Lite 顶层不接受托管工具，
+/// 改为放进 `additional_tools` 输入项。调用方完全没有声明工具时再把
+/// `tool_choice` 固定为 `none`，保持原本不调用工具的语义。
+fn ensure_web_search_tool_for_history(body: &mut Map<String, Value>, responses_lite: bool) {
+    let Some(input) = body.get("input").and_then(Value::as_array) else {
+        return;
+    };
+    let mut has_web_search_call = false;
+    let mut caller_declared_tools = false;
+    let mut additional_tools_index = None;
+    for (index, item) in input.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str).map(str::trim) {
+            Some(WEB_SEARCH_CALL_ITEM_TYPE) => has_web_search_call = true,
+            Some(ADDITIONAL_TOOLS_ITEM_TYPE) => {
+                let tools = item.get("tools");
+                if tools_contain_web_search(tools) {
+                    return;
+                }
+                caller_declared_tools |= tools
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| !tools.is_empty());
+                additional_tools_index.get_or_insert(index);
+            }
+            _ => {}
+        }
+    }
+    if !has_web_search_call || tools_contain_web_search(body.get("tools")) {
+        return;
+    }
+    // compaction_trigger 必须保持在最后，补入的 additional_tools 放在它之前。
+    let insert_at = match input.last() {
+        Some(last)
+            if last.get("type").and_then(Value::as_str).map(str::trim)
+                == Some(COMPACTION_TRIGGER_ITEM_TYPE) =>
+        {
+            input.len() - 1
+        }
+        _ => input.len(),
+    };
+    caller_declared_tools |= body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+
+    let history_tool = json!({"type": "web_search", "external_web_access": false});
+    if !responses_lite {
+        match body.get_mut("tools") {
+            Some(Value::Array(tools)) => tools.push(history_tool),
+            _ => {
+                body.insert("tools".to_owned(), Value::Array(vec![history_tool]));
+            }
+        }
+    } else if let Some(item) = additional_tools_index.and_then(|index| {
+        body.get_mut("input")
+            .and_then(Value::as_array_mut)
+            .and_then(|input| input.get_mut(index))
+            .and_then(Value::as_object_mut)
+    }) {
+        match item.get_mut("tools") {
+            Some(Value::Array(tools)) => tools.push(history_tool),
+            _ => {
+                item.insert("tools".to_owned(), Value::Array(vec![history_tool]));
+            }
+        }
+    } else if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        input.insert(
+            insert_at,
+            json!({
+                "type": ADDITIONAL_TOOLS_ITEM_TYPE,
+                "role": "developer",
+                "tools": [history_tool],
+            }),
+        );
+    }
+    if !caller_declared_tools {
+        let pin = match body.get("tool_choice") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(choice)) => matches!(
+                choice.trim().to_ascii_lowercase().as_str(),
+                "" | "auto" | "none"
+            ),
+            Some(_) => false,
+        };
+        if pin {
+            body.insert("tool_choice".to_owned(), Value::String("none".to_owned()));
+        }
+    }
+}
+
+fn tools_contain_web_search(tools: Option<&Value>) -> bool {
+    tools.and_then(Value::as_array).is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            tool.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|tool_type| tool_type.trim().starts_with("web_search"))
+        })
+    })
 }
 
 fn adapt_codex_responses_body(
