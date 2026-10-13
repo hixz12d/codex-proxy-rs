@@ -213,6 +213,7 @@ struct AffinitySelection {
     bound_account: Option<ProviderAccountId>,
     preferred_account: Option<ProviderAccountId>,
     escape_reason: Option<AffinityEscapeReason>,
+    bound_account_lost: bool,
 }
 
 impl AffinitySelection {
@@ -221,6 +222,7 @@ impl AffinitySelection {
             bound_account: Some(account_id.clone()),
             preferred_account: Some(account_id),
             escape_reason: None,
+            bound_account_lost: false,
         }
     }
 
@@ -229,11 +231,20 @@ impl AffinitySelection {
             bound_account: Some(account_id),
             preferred_account: None,
             escape_reason: Some(reason),
+            // 主账号已删除、停用、失效或额度耗尽时不会很快恢复，继续续期旧绑定会让会话每次都随机分流
+            bound_account_lost: matches!(
+                reason,
+                AffinityEscapeReason::HardUnavailable | AffinityEscapeReason::QuotaExhausted
+            ),
         }
     }
 
     fn bound_account(&self) -> Option<&ProviderAccountId> {
         self.bound_account.as_ref()
+    }
+
+    const fn bound_account_lost(&self) -> bool {
+        self.bound_account_lost
     }
 
     fn preferred_account(&self) -> Option<&ProviderAccountId> {
@@ -952,10 +963,13 @@ impl CodexCredentialSelector {
                                 .admit_session(
                                     key,
                                     binding.as_ref(),
-                                    // 分流只改变本次租约，CAS 续期仍保留会话主账号
+                                    // 分流只改变本次租约，CAS 续期仍保留会话主账号；主账号已丢失时迁移到本次账号
                                     binding
                                         .as_ref()
-                                        .filter(|_| affinity_mode == AccountAffinity::Preferred)
+                                        .filter(|_| {
+                                            affinity_mode == AccountAffinity::Preferred
+                                                && !affinity.bound_account_lost()
+                                        })
                                         .map_or(account.id(), ProviderSessionBinding::account_id),
                                     request
                                         .attempt
