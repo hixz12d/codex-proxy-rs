@@ -401,8 +401,8 @@ impl ProviderAdmin for OpenAiAdminProvider {
             OpenAiBillingUsage::new(
                 input_tokens,
                 output_tokens,
-                input.cached_tokens.unwrap_or_default(),
-                input.cache_write_tokens.unwrap_or_default(),
+                input.cached_input_tokens.unwrap_or_default(),
+                input.cache_write_input_tokens.unwrap_or_default(),
             ),
             input.service_tier.as_deref(),
         ) else {
@@ -432,6 +432,33 @@ impl ProviderAdmin for OpenAiAdminProvider {
             service_tier: breakdown.service_tier().map(str::to_owned),
             multiplier_percent: breakdown.multiplier_percent(),
         }))
+    }
+
+    fn evaluate_usage_pricing(
+        &self,
+        input: &gateway_admin::ports::provider::ProviderUsagePricingInput,
+        pricing: Option<&gateway_core::metering::ModelPriceOverride>,
+    ) -> Result<Option<gateway_core::metering::CalculatedCostBreakdown>, ProviderAdminError> {
+        let (Some(input_tokens), Some(output_tokens), Some(cached), Some(written)) = (
+            input.usage.input_tokens,
+            input.usage.output_tokens,
+            input.usage.cached_input_tokens,
+            input.usage.cache_write_input_tokens,
+        ) else {
+            return Ok(None);
+        };
+        if input.usage.image_input_tokens != Some(0) || input.usage.image_output_tokens != Some(0) {
+            return Ok(None);
+        }
+        let usage = OpenAiBillingUsage::new(input_tokens, output_tokens, cached, written);
+        Ok(
+            crate::transport::usage::openai_billing_breakdown_with_override(
+                &input.upstream_model_id,
+                usage,
+                input.service_tier.as_deref(),
+                pricing,
+            ),
+        )
     }
 
     async fn prepare_import(
@@ -520,13 +547,13 @@ impl ProviderAdmin for OpenAiAdminProvider {
             (
                 AuthorizationMutationTarget::Create { .. },
                 CompletedCodexOAuthCredential::Create(credential),
-            ) => prepared_create(credential, Utc::now())
+            ) => prepared_create(*credential, Utc::now())
                 .map(|credential| PreparedAuthorizationCredential::Create(Box::new(credential))),
             (
                 AuthorizationMutationTarget::Reauthorize { .. },
                 CompletedCodexOAuthCredential::Reauthorize(credential),
             ) => {
-                prepared_rotation(credential, mutation.provider_kind().clone()).map(|credential| {
+                prepared_rotation(*credential, mutation.provider_kind().clone()).map(|credential| {
                     PreparedAuthorizationCredential::Reauthorize(Box::new(credential))
                 })
             }
@@ -1063,6 +1090,7 @@ fn account_from_record(account: &AccountRecord) -> Result<ProviderAccount, Provi
         account.access_token_expires_at.map(SystemTime::from),
     )
     .with_outbound_proxy(account.outbound_proxy.clone())
+    .with_notes(account.notes.clone())
     .with_profile(
         account.email.clone(),
         account.upstream_account_id.clone(),

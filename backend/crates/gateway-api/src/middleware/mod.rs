@@ -17,9 +17,10 @@ use axum::{
     http::{HeaderName, HeaderValue, Request, StatusCode},
     response::{IntoResponse as _, Response},
 };
-use gateway_core::engine::middleware::FrozenMiddlewarePlan;
 use gateway_core::engine::middleware::http as contract;
 use gateway_core::engine::middleware::http::Settings;
+use gateway_core::engine::middleware::{FrozenMiddlewarePlan, MiddlewareError};
+use gateway_core::error::GatewayErrorKind;
 use gateway_core::lifecycle::CancellationToken;
 use gateway_core::middleware::compose;
 use http_body::{Body as HttpBody, Frame, SizeHint};
@@ -150,19 +151,6 @@ async fn handle(
     if let Some(plan) = plan.as_ref().filter(|plan| plan.has_websocket()) {
         request.extensions_mut().insert(plan.clone());
     }
-    if inherited.is_none()
-        && !plan
-            .as_ref()
-            .is_some_and(|plan| plan.has_http() || plan.has_service())
-    {
-        let settings = request
-            .extensions()
-            .get::<Settings>()
-            .and_then(|settings| settings.runtime.clone());
-        return SETTINGS
-            .scope(settings, dispatch(router, request, started))
-            .await;
-    }
     let context = inherited.unwrap_or_else(|| {
         let request_id = request
             .headers()
@@ -175,7 +163,8 @@ async fn handle(
             call_id: request_id.clone(),
             request_id,
             parent_call_id: None,
-            extensions: Default::default(),
+            extensions: gateway_core::engine::extensions::ExtensionCallScope::default()
+                .with_request(crate::request_context::capture(&request)),
             cancellation: CancellationToken::new(),
             plan: plan.clone(),
         }
@@ -228,6 +217,8 @@ async fn handle(
             Ok(response.map(|body| body.map_err(|error| Box::new(error) as _).boxed_unsync()))
         })
     });
+    let request_id = context.request_id.clone();
+    let call_id = context.call_id.clone();
     let result = match plan {
         Some(plan) => plan.handle_http(context, request, next).await,
         None => next.run(request).await,
@@ -251,11 +242,27 @@ async fn handle(
                     tokio::select! {
                         biased;
                         () = cancellation.cancelled() => {},
-                        _ = task => {},
+                        result = task => {
+                            if let Err(contract::upgrade::SessionError::Failed { kind, plugin_instance_id }) = result {
+                                tracing::warn!(
+                                    event = "middleware.session.failed",
+                                    request_id,
+                                    call_id,
+                                    plugin_instance_id,
+                                    kind,
+                                    "升级后的中间件会话失败"
+                                );
+                            }
+                        },
                     }
                 });
             }
             response.map(|body| Body::new(ResponseBody::new(body, guard)))
+        }
+        Err(MiddlewareError::Gateway(error))
+            if error.kind() == GatewayErrorKind::MiddlewareCapacityUnavailable =>
+        {
+            crate::openai::error::gateway_error_response(&error)
         }
         Err(error) => {
             let status = if error.is_rejected() {

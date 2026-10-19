@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import type { DashboardHealthTimeline, DashboardHealthTimelinePoint } from '@/api'
-import { ZCard, ZPopover } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZPopover } from '@codex-proxy/ui'
 
-import { usePreferredReducedMotion } from '@vueuse/core'
+import { usePreferredReducedMotion, useResizeObserver } from '@vueuse/core'
 import { gsap } from 'gsap'
 import { computed, onBeforeUnmount, shallowRef, useTemplateRef, watch } from 'vue'
 import HealthTimelinePointPopover from '@/components/usage/HealthTimelinePointPopover.vue'
-import { formatHealthCount, healthLegend, healthReliabilityValueClass, healthStatusMeta } from '@/components/usage/shared/health'
+import { formatHealthCount, healthEligibleRequestCount, healthLegend, healthObservedRequestCount, healthStatusMeta } from '@/components/usage/shared/health'
 
 const props = defineProps<{
   timeline: DashboardHealthTimeline
@@ -18,25 +18,23 @@ const healthPopoverArrowSurfaceClasses = {
 }
 
 const timelineGrid = useTemplateRef<HTMLElement>('timelineGrid')
+const popoverAnchor = useTemplateRef<HTMLElement>('popoverAnchor')
+const pointPopover = useTemplateRef<InstanceType<typeof ZPopover>>('pointPopover')
 const preferredMotion = usePreferredReducedMotion()
 const points = computed(() => props.timeline.points)
 
 const activePoint = shallowRef<DashboardHealthTimelinePoint>()
-const activeAnchor = shallowRef<HTMLElement | null>(null)
 const popoverOpen = shallowRef(false)
-const highlightedPointBucket = shallowRef<string>()
 let wavedCellIndexes = new Set<number>()
-
-function observedRequests(point: DashboardHealthTimelinePoint) {
-  return point.successRequests + point.failedRequests + point.cancelledRequests + point.callerErrorRequests
-}
+let anchorXTo: ReturnType<typeof gsap.quickTo> | undefined
+let anchorYTo: ReturnType<typeof gsap.quickTo> | undefined
 
 function isInteractivePoint(point: DashboardHealthTimelinePoint) {
-  return point.status !== 'future' && observedRequests(point) > 0
+  return point.status !== 'future' && healthObservedRequestCount(point) > 0
 }
 
 function isActivePoint(point: DashboardHealthTimelinePoint) {
-  return popoverOpen.value && highlightedPointBucket.value === point.bucketStart
+  return popoverOpen.value && activePoint.value?.bucketStart === point.bucketStart
 }
 
 function activatePoint(point: DashboardHealthTimelinePoint, pointIndex: number, event: Event) {
@@ -47,23 +45,54 @@ function activatePoint(point: DashboardHealthTimelinePoint, pointIndex: number, 
     return
   }
 
+  const anchor = event.currentTarget
+  const opening = !popoverOpen.value
   activePoint.value = point
-  activeAnchor.value = event.currentTarget
-  popoverOpen.value = true
-  highlightedPointBucket.value = point.bucketStart
   animatePointWave(pointIndex)
+
+  positionPointAnchor(anchor, opening)
+  popoverOpen.value = true
+}
+
+function positionPointAnchor(button: HTMLElement, immediate: boolean) {
+  const anchor = popoverAnchor.value
+  const grid = timelineGrid.value
+  if (!anchor || !grid)
+    return
+
+  const buttonRect = button.getBoundingClientRect()
+  const gridRect = grid.getBoundingClientRect()
+  const x = buttonRect.left + buttonRect.width / 2 - gridRect.left - 0.5
+  const y = buttonRect.top - gridRect.top
+
+  if (immediate || preferredMotion.value === 'reduce') {
+    stopPointAnchor()
+    gsap.set(anchor, { x, y })
+  }
+  if (!anchorXTo || !anchorYTo) {
+    anchorXTo = gsap.quickTo(anchor, 'x', { duration: 0.16, ease: 'power3.out' })
+    anchorYTo = gsap.quickTo(anchor, 'y', {
+      duration: 0.16,
+      ease: 'power3.out',
+      // 原生锚点直接跟随变换，事件定位路径也在同一帧更新面板与箭头
+      onUpdate: () => pointPopover.value?.updatePosition(),
+    })
+  }
+  if (!immediate && preferredMotion.value !== 'reduce') {
+    anchorXTo(x)
+    anchorYTo(y)
+  }
+}
+
+function stopPointAnchor() {
+  if (popoverAnchor.value)
+    gsap.killTweensOf(popoverAnchor.value)
+  anchorXTo = undefined
+  anchorYTo = undefined
 }
 
 function closePointPopover() {
-  popoverOpen.value = false
-  resetPointInteraction()
-}
-
-function resetPointInteraction() {
-  highlightedPointBucket.value = undefined
-  activePoint.value = undefined
-  activeAnchor.value = null
-  releasePointWave()
+  pointPopover.value?.close()
 }
 
 function timelineButtons() {
@@ -163,15 +192,24 @@ function releasePointWave() {
 }
 
 function pointAccessibilityLabel(point: DashboardHealthTimelinePoint) {
-  const eligibleRequests = point.successRequests + point.failedRequests
+  const eligibleRequests = healthEligibleRequestCount(point)
   return `${point.time}，${healthStatusMeta[point.status].label}，有效请求 ${formatHealthCount(eligibleRequests)}，可用性 ${point.reliabilityDisplay}`
 }
 
 watch(popoverOpen, (open) => {
-  if (open)
-    return
+  if (!open) {
+    releasePointWave()
+    stopPointAnchor()
+  }
+})
 
-  resetPointInteraction()
+useResizeObserver(timelineGrid, () => {
+  if (!popoverOpen.value || !activePoint.value)
+    return
+  const index = points.value.findIndex(point => point.bucketStart === activePoint.value?.bucketStart)
+  const button = timelineButtons()[index]
+  if (button)
+    positionPointAnchor(button, true)
 })
 
 onBeforeUnmount(() => {
@@ -179,6 +217,7 @@ onBeforeUnmount(() => {
     .map(button => timelineCell(button))
     .filter((cell): cell is HTMLElement => Boolean(cell))
   gsap.killTweensOf(cells)
+  stopPointAnchor()
 })
 </script>
 
@@ -201,7 +240,7 @@ onBeforeUnmount(() => {
         <div class="flex shrink-0 items-center gap-3">
           <strong
             class="font-mono text-sm leading-none font-heavy tabular-nums"
-            :class="healthReliabilityValueClass(timeline.successRequests, timeline.failedRequests)"
+            :class="healthStatusMeta[timeline.status].valueClass"
           >
             {{ timeline.reliabilityDisplay }}
           </strong>
@@ -210,43 +249,46 @@ onBeforeUnmount(() => {
     </template>
 
     <template #body>
-      <div>
-        <ZPopover
-          v-model="popoverOpen"
-          trigger="hover"
-          placement="top"
-          :offset="12"
-          :reference-element="activeAnchor"
-          :disabled="!activePoint"
-          animate-position
-          :arrow-surface-class="healthPopoverArrowSurfaceClasses"
-          class="min-w-0 w-full"
-        >
-          <template #reference>
+      <ZPopover
+        ref="pointPopover"
+        v-model="popoverOpen"
+        trigger="hover"
+        :show-after="0"
+        :disabled="!activePoint"
+        class="w-full! min-w-0"
+        placement="top"
+        :offset="12"
+        :reference-element="popoverAnchor"
+        :arrow-surface-class="healthPopoverArrowSurfaceClasses"
+        @closed="activePoint = undefined"
+      >
+        <template #reference>
+          <div class="relative flex w-full flex-col">
+            <!-- 同一锚点连续追向各时间格，避免切换原生锚点时的位置跳变 -->
+            <span ref="popoverAnchor" aria-hidden="true" class="pointer-events-none absolute left-0 top-0 h-5 w-px opacity-0" />
             <div
               ref="timelineGrid" class="grid w-full grid-cols-[repeat(var(--timeline-columns),minmax(0,1fr))] items-end gap-x-0.5 gap-y-1 sm:grid-cols-[repeat(var(--timeline-columns-wide),minmax(0,1fr))]"
               :style="{ '--timeline-columns': Math.max(1, Math.ceil(points.length / 2)), '--timeline-columns-wide': Math.max(1, points.length) }"
             >
-              <button
+              <ZButton
                 v-for="(point, pointIndex) in points"
                 :key="point.bucketStart"
                 data-health-timeline-point
-                type="button"
+                variant="text"
                 :aria-disabled="!isInteractivePoint(point)"
                 :tabindex="isInteractivePoint(point) ? 0 : -1"
                 :aria-expanded="isActivePoint(point)"
                 aria-haspopup="dialog"
                 :aria-label="pointAccessibilityLabel(point)"
-                class="group relative flex h-5 w-full min-w-0.5 items-center border-0 bg-transparent p-0 outline-none"
+                class="group relative h-5! w-full min-w-0.5 bg-transparent! p-0! [&>span]:w-full"
                 :class="isInteractivePoint(point) ? 'cursor-pointer' : 'cursor-default'"
                 @mouseenter="activatePoint(point, pointIndex, $event)"
                 @focus="activatePoint(point, pointIndex, $event)"
-                @blur="closePointPopover"
                 @click="activatePoint(point, pointIndex, $event)"
               >
                 <span
                   data-health-timeline-cell
-                  class="block h-3.5 w-full origin-bottom rounded-xs transition-[filter,box-shadow] duration-250 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none group-focus-visible:shadow-[0_0_0_2px_var(--cp-color-bg-container),0_0_0_4px_var(--cp-control-outline)]"
+                  class="block h-3.5 w-full origin-bottom rounded-xs transition-[filter,box-shadow] duration-250 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
                   :class="[
                     healthStatusMeta[point.status].cellClass,
                     isActivePoint(point)
@@ -256,15 +298,14 @@ onBeforeUnmount(() => {
                         : undefined,
                   ]"
                 />
-              </button>
+              </ZButton>
             </div>
-          </template>
-
-          <div class="w-72 overflow-hidden rounded-cp-lg">
-            <HealthTimelinePointPopover v-if="activePoint" :point="activePoint" />
           </div>
-        </ZPopover>
-      </div>
+        </template>
+        <div data-health-timeline-popover class="w-72 overflow-hidden rounded-cp-lg">
+          <HealthTimelinePointPopover v-if="activePoint" :point="activePoint" />
+        </div>
+      </ZPopover>
     </template>
   </ZCard>
 </template>

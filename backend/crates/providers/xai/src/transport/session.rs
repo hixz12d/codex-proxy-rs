@@ -99,6 +99,7 @@ impl<T> GrokSessionLeaseGuard for T where T: Send + Sync + 'static {}
 
 /// 一个选中的 OAuth 会话及其持有的活跃 lease
 pub struct SelectedGrokSession {
+    account_snapshot: Option<gateway_core::account::AccountHistorySnapshot>,
     account_id: ProviderAccountId,
     credential_revision: CredentialRevision,
     access_token: SecretValue,
@@ -134,6 +135,7 @@ impl SelectedGrokSession {
             return Err(GrokSessionDataError::InvalidSecretValue);
         }
         Ok(Self {
+            account_snapshot: None,
             account_id,
             credential_revision,
             access_token,
@@ -160,6 +162,20 @@ impl SelectedGrokSession {
     ) -> Self {
         self.capacity = capacity;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_account_snapshot(
+        mut self,
+        snapshot: gateway_core::account::AccountHistorySnapshot,
+    ) -> Self {
+        self.account_snapshot = Some(snapshot);
+        self
+    }
+
+    #[must_use]
+    pub const fn account_snapshot(&self) -> Option<&gateway_core::account::AccountHistorySnapshot> {
+        self.account_snapshot.as_ref()
     }
 
     /// 返回选中的账号 ID
@@ -231,6 +247,7 @@ impl fmt::Debug for SelectedGrokSession {
 /// 单次 selector 调用的入参，持有冻结且不含密钥的尝试视图
 #[derive(Debug, Clone)]
 pub struct GrokSessionSelection {
+    pub(crate) lease_metadata: Option<Arc<gateway_core::provider_ports::ProviderLeaseMetadata>>,
     upstream_model: UpstreamModelId,
     excluded_accounts: BTreeSet<ProviderAccountId>,
     required_account: Option<ProviderAccountId>,
@@ -247,6 +264,14 @@ pub struct GrokSessionSelection {
 }
 
 impl GrokSessionSelection {
+    pub(crate) fn with_lease_metadata(
+        mut self,
+        metadata: Option<Arc<gateway_core::provider_ports::ProviderLeaseMetadata>>,
+    ) -> Self {
+        self.lease_metadata = metadata;
+        self
+    }
+
     pub(crate) fn with_cancellation(
         mut self,
         cancellation: gateway_core::lifecycle::CancellationToken,
@@ -271,6 +296,7 @@ impl GrokSessionSelection {
         client_api_key_id: ClientApiKeyId,
     ) -> Self {
         Self {
+            lease_metadata: None,
             upstream_model,
             excluded_accounts,
             required_account,
@@ -502,6 +528,9 @@ pub enum GrokSessionSelectorError {
     /// 插件调度策略明确拒绝本次请求
     #[error("account scheduling policy rejected the request")]
     PolicyRejected,
+    /// 插件排除了本轮全部候选，终止本次调度
+    #[error("account scheduling policy left no selectable account")]
+    PolicyFiltered,
     /// 插件调度策略调用失败且配置为拒绝
     #[error("account scheduling policy is unavailable")]
     PolicyUnavailable,

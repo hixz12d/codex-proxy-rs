@@ -3,16 +3,15 @@
 use super::{CallbackScope, MiddlewareCallback, denied, http_middleware, model};
 use gateway_core::lifecycle::CancellationToken;
 use gateway_host::outbound::HttpBody;
-use gateway_plugin_sdk::{CallContext, ErrorCode, PluginFault};
+use gateway_plugin_sdk::{CallContext, ErrorCode, PluginFault, client::CallDeadline};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
-use tokio::time::Instant;
 
 pub(super) struct CallResources {
-    pub(super) deadline: Instant,
+    pub(super) deadline: CallDeadline,
     operation_timeout: Duration,
     pub(super) cancellation: CancellationToken,
     pub(super) scope: Arc<CallbackScope>,
@@ -26,11 +25,12 @@ pub(super) struct CallResources {
 impl CallResources {
     pub(super) fn new(
         context: &CallContext,
+        deadline: &CallDeadline,
         scope: Arc<CallbackScope>,
         middleware: Option<Arc<dyn MiddlewareCallback>>,
     ) -> Self {
         Self {
-            deadline: Instant::now() + Duration::from_millis(context.timeout_ms),
+            deadline: deadline.clone(),
             operation_timeout: Duration::from_millis(context.timeout_ms),
             cancellation: CancellationToken::new(),
             scope,
@@ -46,13 +46,6 @@ impl CallResources {
         }
     }
 
-    pub(super) fn set_streaming(&self, streaming: bool) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .resource_stream = streaming;
-    }
-
     pub(super) fn close(&self) {
         self.cancellation.cancel();
         let mut state = self
@@ -60,6 +53,14 @@ impl CallResources {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.closed = true;
+        // abort 只安排回调 future 稍后析构；返回 Core 前同步封存仍在发送的请求
+        for attempt in state
+            .http_attempts
+            .drain(..)
+            .filter_map(|attempt| attempt.upgrade())
+        {
+            attempt.finish(gateway_core::upstream::UpstreamSendState::Ambiguous);
+        }
         // RPC End 可以先于消费者取完已入队正文到达，这里只撤销新 callback
         // 正文包装器持有 invocation，最后一个 owner 释放时再关闭，保留计量和终态信封
         state.middleware.take();
@@ -71,6 +72,37 @@ impl CallResources {
             stream.close();
         }
         state.model_streams.clear();
+    }
+
+    pub(super) fn start_upstream(
+        &self,
+        purpose: Option<gateway_plugin_sdk::call::upstream_adapter::UpstreamPathPurpose>,
+    ) -> Result<super::scope::HttpAttempt, PluginFault> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(denied());
+        }
+        let attempt = self.scope.start_upstream(purpose);
+        state
+            .http_attempts
+            .retain(|attempt| attempt.strong_count() != 0);
+        state.http_attempts.push(attempt.pending());
+        Ok(attempt)
+    }
+
+    pub(super) fn observe_dispatch(&self) -> Result<(), PluginFault> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(denied());
+        }
+        self.scope.observe_dispatch();
+        Ok(())
     }
 
     pub(super) fn request_settings(
@@ -94,23 +126,24 @@ impl CallResources {
         if state.closed {
             return Err(denied());
         }
-        if state.resource_stream {
-            return Ok(self.operation_timeout);
+        let remaining = self.deadline.remaining().unwrap_or(self.operation_timeout);
+        if remaining.is_zero() {
+            return Err(PluginFault::new(
+                ErrorCode::Timeout,
+                "callback deadline elapsed",
+            ));
         }
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|timeout| !timeout.is_zero())
-            .ok_or_else(|| PluginFault::new(ErrorCode::Timeout, "callback deadline elapsed"))
+        Ok(remaining)
     }
 }
 
 #[derive(Default)]
 pub(super) struct CallState {
     pub(super) closed: bool,
-    pub(super) resource_stream: bool,
     pub(super) middleware: Option<Arc<dyn MiddlewareCallback>>,
     pub(super) streams: BTreeMap<String, Arc<HttpStream>>,
     pub(super) model_streams: BTreeMap<String, Arc<model::ModelStream>>,
+    http_attempts: Vec<Weak<super::scope::HttpAttemptObservation>>,
 }
 
 pub(super) struct HttpStream {

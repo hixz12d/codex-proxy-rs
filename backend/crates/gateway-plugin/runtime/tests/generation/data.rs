@@ -27,6 +27,7 @@ struct Facts(AtomicUsize, AtomicUsize, Option<String>);
 fn account() -> AccountRecord {
     let at = "2026-01-01T00:00:00Z".parse().unwrap();
     AccountRecord {
+        outbound_proxy_enabled: true,
         id: "acct_facts".into(),
         provider_kind: ProviderKind::new("openai").unwrap(),
         groups: vec![gateway_admin::model::account_groups::AccountGroupRef {
@@ -193,6 +194,7 @@ async fn management_facts_validate_queries_without_permission_declarations() {
                 &generation,
                 &view.target,
                 PluginManagementRequest {
+                    request_context: None,
                     headers: Vec::new(),
                     method: "GET".into(),
                     path: "facts".into(),
@@ -284,6 +286,7 @@ async fn quota_refresh_is_available_without_permission_declarations() {
                 &generation,
                 &view.target,
                 PluginManagementRequest {
+                    request_context: None,
                     headers: Vec::new(),
                     method: "GET".into(),
                     path: "facts".into(),

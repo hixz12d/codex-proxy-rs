@@ -5,13 +5,12 @@ use std::sync::Arc;
 use tokio::{
     io::AsyncWrite,
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    time::Instant,
 };
 
 use crate::Frame;
 
-use super::super::frame::{validate_frame, write_frame};
-use super::{CallCancellation, SessionError, lifecycle::wait_deadline};
+use super::super::frame::EncodedFrame;
+use super::{CallCancellation, CallDeadline, SessionError};
 
 pub(super) struct Output {
     pub(super) sender: mpsc::Sender<Outbound>,
@@ -28,8 +27,7 @@ impl Clone for Output {
 }
 
 impl Output {
-    pub(super) async fn send_data(&self, frame: Frame) -> Result<(), SessionError> {
-        validate_frame(&frame)?;
+    pub(super) async fn send_data(&self, frame: EncodedFrame) -> Result<(), SessionError> {
         let permit = Arc::clone(&self.data_slots)
             .acquire_owned()
             .await
@@ -45,20 +43,23 @@ impl Output {
 
     pub(super) async fn send_data_until(
         &self,
-        frame: Frame,
-        deadline: Option<Instant>,
+        frame: EncodedFrame,
+        deadline: &CallDeadline,
         cancellation: &CallCancellation,
     ) -> Result<(), SessionError> {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(SessionError::Cancelled),
-            () = wait_deadline(deadline) => Err(SessionError::Timeout),
+            () = deadline.wait() => Err(SessionError::Timeout),
             result = self.send_data(frame) => result,
         }
     }
 
     pub(super) fn send_control(&self, frame: Frame) -> Result<(), SessionError> {
-        validate_frame(&frame)?;
+        self.send_encoded_control(EncodedFrame::new(frame)?)
+    }
+
+    pub(super) fn send_encoded_control(&self, frame: EncodedFrame) -> Result<(), SessionError> {
         self.sender
             .try_send(Outbound {
                 frame,
@@ -69,7 +70,7 @@ impl Output {
 }
 
 pub(super) struct Outbound {
-    frame: Frame,
+    frame: EncodedFrame,
     _data_slot: Option<OwnedSemaphorePermit>,
 }
 
@@ -78,7 +79,7 @@ pub(super) async fn writer_loop<W: AsyncWrite + Unpin>(
     mut received: mpsc::Receiver<Outbound>,
 ) -> Result<(), SessionError> {
     while let Some(outbound) = received.recv().await {
-        write_frame(&mut writer, &outbound.frame).await?;
+        outbound.frame.write(&mut writer).await?;
     }
     Ok(())
 }

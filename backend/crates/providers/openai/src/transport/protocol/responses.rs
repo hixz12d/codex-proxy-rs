@@ -210,6 +210,18 @@ pub fn transport_requirement(request: &CodexResponsesRequest) -> TransportRequir
     }
 }
 
+/// 仅空响应前导和元数据可在已交付后被下一次尝试替换
+pub(crate) fn is_replaceable_response_prelude(event_type: &str, value: &Value) -> bool {
+    match event_type {
+        // 两类官方元数据都不代表输出，轮次与安全状态仍随原始事件交付
+        "codex.response.metadata" | "response.metadata" | "codex.rate_limits" => true,
+        "response.created" | "response.in_progress" => value
+            .pointer("/response/output")
+            .is_none_or(|output| output.as_array().is_some_and(Vec::is_empty)),
+        _ => false,
+    }
+}
+
 /// 单个 Responses 事件对计时系统提供的稳定语义信号
 ///
 /// `output_start` 只表示官方输出项开始事件；`semantic_output` 仍要求
@@ -243,10 +255,6 @@ pub(crate) fn response_duration_ms(value: &Value) -> Option<u64> {
 pub(crate) struct ResponseTimingMetrics {
     pub upstream_api_overhead_ms: Option<f64>,
     pub upstream_engine_ms: Option<f64>,
-    pub upstream_engine_iapi_ttft_ms: Option<f64>,
-    pub upstream_engine_service_ttft_ms: Option<f64>,
-    pub upstream_engine_iapi_tbt_ms: Option<f64>,
-    pub upstream_engine_service_tbt_ms: Option<f64>,
 }
 
 impl ResponseTimingMetrics {
@@ -275,7 +283,6 @@ impl ResponseTimingMetrics {
             return Self {
                 upstream_api_overhead_ms: overhead,
                 upstream_engine_ms: milliseconds(path, "engine_wall_ms"),
-                ..Self::default()
             };
         }
         // 直接返回的专项指标保留原口径，明确标为整轮累计的值不能归入单次请求
@@ -291,16 +298,6 @@ impl ResponseTimingMetrics {
                 "responses_duration_excl_engine_and_client_tool_time_ms",
             ),
             upstream_engine_ms: milliseconds(metrics, "engine_service_total_ms"),
-            upstream_engine_iapi_ttft_ms: milliseconds(metrics, "engine_iapi_ttft_total_ms"),
-            upstream_engine_service_ttft_ms: milliseconds(metrics, "engine_service_ttft_total_ms"),
-            upstream_engine_iapi_tbt_ms: milliseconds(
-                metrics,
-                "engine_iapi_tbt_across_engine_calls_ms",
-            ),
-            upstream_engine_service_tbt_ms: milliseconds(
-                metrics,
-                "engine_service_tbt_across_engine_calls_ms",
-            ),
         }
     }
 
@@ -310,18 +307,6 @@ impl ResponseTimingMetrics {
         }
         if incoming.upstream_engine_ms.is_some() {
             self.upstream_engine_ms = incoming.upstream_engine_ms;
-        }
-        if incoming.upstream_engine_iapi_ttft_ms.is_some() {
-            self.upstream_engine_iapi_ttft_ms = incoming.upstream_engine_iapi_ttft_ms;
-        }
-        if incoming.upstream_engine_service_ttft_ms.is_some() {
-            self.upstream_engine_service_ttft_ms = incoming.upstream_engine_service_ttft_ms;
-        }
-        if incoming.upstream_engine_iapi_tbt_ms.is_some() {
-            self.upstream_engine_iapi_tbt_ms = incoming.upstream_engine_iapi_tbt_ms;
-        }
-        if incoming.upstream_engine_service_tbt_ms.is_some() {
-            self.upstream_engine_service_tbt_ms = incoming.upstream_engine_service_tbt_ms;
         }
     }
 }

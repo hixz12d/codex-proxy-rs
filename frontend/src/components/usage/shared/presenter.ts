@@ -9,6 +9,9 @@ export type UsagePerformanceRecord = Pick<UsageCommonRecord, 'latencyDetails' | 
   tokenDetails: Pick<UsageListRecord['tokenDetails'], 'outputTokens'> | null
 }
 
+export type UsageModelRecord = Pick<UsageCommonRecord, 'model'> & Partial<Pick<UsageCommonRecord, 'requestedModel' | 'upstreamModel' | 'upstreamResponseModel'>>
+export type UsageReasoningRecord = Pick<UsageCommonRecord, 'reasoningEffort'> & Partial<Pick<UsageCommonRecord, 'reasoningPreset' | 'subagentKind'>>
+
 interface UsageTimingItem {
   label: string
   value: string
@@ -29,7 +32,7 @@ export function usageFreshInputTokens(input: number, cached: number, written: nu
 export function usageTokenDetails(details: UsageTokenDetails): UsageTokenDetails {
   const inputTokens = details.inputTokens === null
     ? null
-    : usageFreshInputTokens(details.inputTokens, details.cachedTokens ?? 0, details.cacheWriteTokens ?? 0)
+    : usageFreshInputTokens(details.inputTokens, details.cachedInputTokens ?? 0, details.cacheWriteInputTokens ?? 0)
 
   return {
     ...details,
@@ -58,7 +61,7 @@ export function usageTransportTypeClass(transport?: string | null) {
   return 'bg-cp-fill-tertiary text-cp-text-secondary'
 }
 
-export function usageAccountText(record: UsageCommonRecord) {
+export function usageAccountText(record: Pick<UsageCommonRecord, 'accountEmail' | 'accountName' | 'accountId'>) {
   return record.accountEmail || record.accountName || record.accountId || '—'
 }
 
@@ -70,14 +73,14 @@ export function usageUserAgent(record: { userAgent?: string | null }) {
   return record.userAgent || '—'
 }
 
-export function usageReasoningEffort(record: UsageCommonRecord) {
+export function usageReasoningEffort(record: UsageReasoningRecord) {
   const reasoningEffort = record.reasoningEffort || '—'
   if (record.subagentKind)
     return reasoningEffort
   return record.reasoningPreset || reasoningEffort
 }
 
-export function usageModelDisplay(record: UsageCommonRecord) {
+export function usageModelDisplay(record: UsageModelRecord) {
   const requestedModel = record.requestedModel || ''
   const upstreamModel = record.upstreamModel || ''
   const storedModel = record.model || ''
@@ -194,10 +197,6 @@ export function usageLatencyDetails(record: UsageLatencyRecord) {
   const performanceItems = [
     { label: 'API 开销', value: durationValue(latencyDetails?.upstreamApiOverheadMs) },
     { label: '引擎耗时', value: durationValue(latencyDetails?.upstreamEngineMs) },
-    { label: 'TTFT · IAPI', value: durationValue(latencyDetails?.upstreamEngineIapiTtftMs) },
-    { label: 'TTFT · Service', value: durationValue(latencyDetails?.upstreamEngineServiceTtftMs) },
-    { label: 'Token 间隔 · IAPI', value: durationValue(latencyDetails?.upstreamEngineIapiTbtMs) },
-    { label: 'Token 间隔 · Service', value: durationValue(latencyDetails?.upstreamEngineServiceTbtMs) },
   ]
   for (const item of performanceItems) {
     if (item.value !== null)
@@ -224,9 +223,24 @@ export function usageLatencyDetails(record: UsageLatencyRecord) {
   return {
     upstreamDisplay,
     firstOutputDisplay: formatDuration(firstTokenMs),
+    firstOutputSeverity: latencySeverity(firstTokenMs, [10_000, 30_000, 60_000]),
     totalDisplay: formatDuration(totalMs),
+    totalSeverity: latencySeverity(totalMs, [60_000, 180_000, 300_000]),
     sections,
   }
+}
+
+function latencySeverity(ms: number | null, thresholds: readonly [number, number, number]): 'good' | 'warn' | 'slow' | 'critical' | null {
+  if (ms === null)
+    return null
+  // 耗时按固定阈值分档，边界值进入下一档，不改变请求状态
+  if (ms >= thresholds[2])
+    return 'critical'
+  if (ms >= thresholds[1])
+    return 'slow'
+  if (ms >= thresholds[0])
+    return 'warn'
+  return 'good'
 }
 
 export function usageBillingText(record: Pick<UsageCommonRecord, 'billing'>) {

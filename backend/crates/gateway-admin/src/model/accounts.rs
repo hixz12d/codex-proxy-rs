@@ -124,6 +124,7 @@ pub struct AccountRecord {
     pub weight: AccountWeight,
     pub model_access: gateway_core::account::AccountModelAccess,
     pub outbound_proxy: Option<gateway_core::account::OutboundProxy>,
+    pub outbound_proxy_enabled: bool,
     pub credential_state: CredentialState,
     pub credential_observed_at: DateTime<Utc>,
     pub quota: QuotaState,
@@ -131,6 +132,16 @@ pub struct AccountRecord {
     pub last_error_message: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl AccountRecord {
+    /// 配置保留绑定，执行请求时禁用代理按直连处理
+    #[must_use]
+    pub fn effective_outbound_proxy(&self) -> Option<&gateway_core::account::OutboundProxy> {
+        self.outbound_proxy
+            .as_ref()
+            .filter(|_| self.outbound_proxy_enabled)
+    }
 }
 
 pub use super::observability::{
@@ -146,9 +157,9 @@ pub struct AccountUsage {
     pub success_count: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
-    pub cached_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
-    pub reasoning_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
     pub image_input_tokens: Option<u64>,
     pub image_output_tokens: Option<u64>,
     pub image_request_count: u64,
@@ -326,3 +337,24 @@ pub enum AccountConnectionTestEvent {
 /// 每次连接测试独占的有限事件流
 pub type AccountConnectionTestEventStream =
     Pin<Box<dyn Stream<Item = AccountConnectionTestEvent> + Send + 'static>>;
+
+/// 单个账号普通并发池的实时租约明细，不关联请求历史
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountConcurrencyEntry {
+    pub lease_id: String,
+    pub request_id: Option<String>,
+    pub client_key_id: Option<String>,
+    pub client_key_name: Option<String>,
+    pub model: Option<String>,
+    pub client_ip: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub acquired_at: Option<DateTime<Utc>>,
+}
+
+/// 同一次 Redis 读取中的当前占用数和分页明细
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountConcurrencyPage {
+    pub entries: Vec<AccountConcurrencyEntry>,
+    pub total: u64,
+    pub observed_at: DateTime<Utc>,
+}

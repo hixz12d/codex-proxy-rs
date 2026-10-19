@@ -9,6 +9,50 @@ use serde_json::json;
 use super::decode_response_create;
 
 #[test]
+fn response_create_should_preserve_field_order_when_removing_frame_type() {
+    let expected = r#"{"model":"smart-code","stream":true,"input":"hello","future_field":{"z":1,"a":2},"client_metadata":{"thread_id":"thread","turn_id":"turn"}}"#;
+    for payload in [
+        r#"{"type":"response.create","model":"smart-code","stream":true,"input":"hello","future_field":{"z":1,"a":2},"client_metadata":{"thread_id":"thread","turn_id":"turn"}}"#,
+        r#"{"model":"smart-code","stream":true,"type":"response.create","input":"hello","future_field":{"z":1,"a":2},"client_metadata":{"thread_id":"thread","turn_id":"turn"}}"#,
+        r#"{"model":"smart-code","stream":true,"input":"hello","future_field":{"z":1,"a":2},"client_metadata":{"thread_id":"thread","turn_id":"turn"},"type":"response.create"}"#,
+    ] {
+        let decoded = decode_response_create(payload).expect("decode response.create");
+        let body = decoded
+            .operation()
+            .middleware_body()
+            .expect("encode transparent body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("UTF-8 JSON body"),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn client_retry_identity_should_follow_each_frame_instead_of_handshake_metadata() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-codex-turn-metadata",
+        HeaderValue::from_static(
+            r#"{"thread_id":"old-thread","turn_id":"old-turn","request_kind":"compaction"}"#,
+        ),
+    );
+    let headers = OpenAiRequestHeaders::from_headers(&headers);
+    for turn in ["turn-one", "turn-two"] {
+        let decoded = decode_response_create_with_context(&json!({
+            "type":"response.create", "model":"smart-code", "input":"hello",
+            "client_metadata": {"thread_id":"thread", "turn_id":turn, "x-codex-turn-metadata":r#"{"request_kind":"turn"}"#}
+        }).to_string(), &headers).unwrap();
+        let Operation::Generate(request) = decoded.operation() else {
+            panic!("generate");
+        };
+        let identity = request.client_turn().unwrap();
+        assert_eq!(identity.thread_id(), "thread");
+        assert_eq!(identity.turn_id(), turn);
+    }
+}
+
+#[test]
 fn response_create_should_carry_source_headers_to_provider_on_every_frame() {
     let mut headers = HeaderMap::new();
     for (name, value) in [

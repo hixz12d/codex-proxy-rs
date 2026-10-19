@@ -113,6 +113,9 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
         .try_get("last_test_latency_ms")
         .map_err(|source| invalid().with_source(source))?;
     Ok(ProxyRecord {
+        enabled: row
+            .try_get("enabled")
+            .map_err(|source| invalid().with_source(source))?,
         auto_location: row
             .try_get("auto_location")
             .map_err(|source| invalid().with_source(source))?,
@@ -128,7 +131,14 @@ fn record(row: PgRow) -> StoreResult<ProxyRecord> {
             &row.try_get::<String, _>("proxy_url")
                 .map_err(|source| invalid().with_source(source))?,
         )
-        .map_err(|source| invalid().with_source(source))?,
+        .map_err(|source| invalid().with_source(source))?
+        .with_max_websocket_connections(
+            u32::try_from(
+                row.try_get::<i64, _>("max_websocket_connections")
+                    .map_err(|source| invalid().with_source(source))?,
+            )
+            .map_err(|source| invalid().with_source(source))?,
+        ),
         revision: AdminRevision::new(
             u64::try_from(
                 row.try_get::<i64, _>("revision")
@@ -345,8 +355,8 @@ pub(crate) async fn resolve_proxy_selection(
             Ok((Some(id), Some(proxy.clone())))
         }
         AccountProxySelection::Saved(id) => {
-            let value: String = sqlx::query_scalar(
-                "select proxy_url from outbound_proxies where id = $1 for share",
+            let (value, enabled, limit): (String, bool, i64) = sqlx::query_as(
+                "select proxy_url, enabled, max_websocket_connections from outbound_proxies where id = $1 for share",
             )
             .bind(id)
             .fetch_optional(&mut **transaction)
@@ -357,9 +367,18 @@ pub(crate) async fn resolve_proxy_selection(
                 entity: ENTITY,
                 id: id.clone(),
             })?;
+            if !enabled {
+                return Err(conflict(id));
+            }
             Ok((
                 Some(id.clone()),
-                Some(OutboundProxy::parse(&value).map_err(|source| invalid().with_source(source))?),
+                Some(
+                    OutboundProxy::parse(&value)
+                        .map_err(|source| invalid().with_source(source))?
+                        .with_max_websocket_connections(
+                            u32::try_from(limit).map_err(|source| invalid().with_source(source))?,
+                        ),
+                ),
             ))
         }
     }
@@ -561,7 +580,13 @@ impl ProxyStore for PgProxyRepository {
         if !acquired {
             return Err(store_error(conflict(id)));
         }
-        let record = match self.get(id).await {
+        let record = match self.get(id).await.and_then(|record| {
+            if record.enabled {
+                Ok(record)
+            } else {
+                Err(store_error(conflict(id)))
+            }
+        }) {
             Ok(record) => record,
             Err(error) => {
                 // 拒绝预留时先等待数据库释放锁，避免连接关闭尚未生效就误挡后续代理操作
@@ -662,9 +687,10 @@ impl ProxyStore for PgProxyRepository {
         save_location(&mut transaction, &id, command.location.as_ref())
             .await
             .map_err(store_error)?;
-        sqlx::query("update outbound_proxies set auto_location = $2 where id = $1")
+        sqlx::query("update outbound_proxies set auto_location = $2, max_websocket_connections = $3 where id = $1")
             .bind(&id)
             .bind(command.auto_location)
+            .bind(i64::from(command.proxy.max_websocket_connections()))
             .execute(&mut *transaction)
             .await
             .map_err(|source| store_error(unavailable(source)))?;
@@ -681,7 +707,13 @@ impl ProxyStore for PgProxyRepository {
             context,
             MutationAuditOperation::OutboundProxyCreate,
             &id,
-            &["name", "proxy_url", "location", "auto_location"],
+            &[
+                "name",
+                "proxy_url",
+                "location",
+                "auto_location",
+                "max_websocket_connections",
+            ],
             revision,
         )
         .await
@@ -730,7 +762,7 @@ impl ProxyStore for PgProxyRepository {
         }
         let changed = sqlx::query(
             "update outbound_proxies set name = $3, proxy_url = coalesce($4, proxy_url), revision = revision + 1, updated_at = now(),
-             auto_location = coalesce($5, auto_location),
+             auto_location = coalesce($5, auto_location), enabled = coalesce($6, enabled), max_websocket_connections = coalesce($7, max_websocket_connections),
              detected_location_json = case when ($4 is not null and $4 <> proxy_url) or ($5 is not null and $5 <> auto_location) then null else detected_location_json end,
              last_location_detection_json = case when ($4 is not null and $4 <> proxy_url) or ($5 is not null and $5 <> auto_location) then '{\"status\":\"notRequested\"}'::jsonb else last_location_detection_json end,
              last_test_at = case when $4 is not null and $4 <> proxy_url then null else last_test_at end,
@@ -743,6 +775,7 @@ impl ProxyStore for PgProxyRepository {
              where id = $1 and revision = $2")
             .bind(&command.id).bind(i64::try_from(command.revision.get()).map_err(|_| store_error(invalid()))?)
             .bind(&command.name).bind(command.proxy.as_ref().map(OutboundProxy::expose_url)).bind(command.auto_location)
+            .bind(command.enabled).bind(command.max_websocket_connections.map(i64::from))
             .execute(&mut *transaction).await.map_err(|source| store_error(unavailable(source)))?;
         if changed.rows_affected() != 1 {
             return Err(store_error(conflict(&command.id)));
@@ -767,7 +800,14 @@ impl ProxyStore for PgProxyRepository {
             context,
             MutationAuditOperation::OutboundProxyUpdate,
             &command.id,
-            &["name", "proxy_url", "location", "auto_location"],
+            &[
+                "name",
+                "proxy_url",
+                "location",
+                "auto_location",
+                "enabled",
+                "max_websocket_connections",
+            ],
             revision,
         )
         .await
@@ -799,6 +839,40 @@ impl ProxyStore for PgProxyRepository {
         let config_revision = bump_config_revision_in_transaction(&mut transaction)
             .await
             .map_err(store_error)?;
+        // 先锁定代理并校验版本，阻止新绑定插入；后续解绑和删除共同提交
+        let locked: Option<String> = sqlx::query_scalar(
+            "select id from outbound_proxies where id = $1 and revision = $2 for update",
+        )
+        .bind(id)
+        .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| store_error(unavailable(source)))?;
+        if locked.is_none() {
+            return Err(store_error(conflict(id)));
+        }
+        let account_ids: Vec<String> = sqlx::query_scalar(
+            "update provider_accounts set outbound_proxy_id = null, outbound_proxy_url = null,
+             updated_at = greatest(now(), updated_at) where outbound_proxy_id = $1 returning id",
+        )
+        .bind(id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|source| store_error(unavailable(source)))?;
+        for account_id in account_ids {
+            append_admin_audit_event_in_transaction(
+                &mut transaction,
+                mutation_audit(
+                    context,
+                    MutationAuditOperation::ProviderAccountUpdate,
+                    &account_id,
+                    vec!["outbound_proxy".to_owned()],
+                ),
+                config_revision,
+            )
+            .await
+            .map_err(store_error)?;
+        }
         let result = sqlx::query("delete from outbound_proxies where id = $1 and revision = $2")
             .bind(id)
             .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?)

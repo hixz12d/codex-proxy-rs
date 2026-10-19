@@ -46,6 +46,8 @@ pub enum ProviderErrorKind {
     ConcurrencyQueueTimeout,
     /// Provider 已确认当前请求无法选出可用账号
     NoEligibleAccount,
+    /// 会话已有的策略限制排除了可用账号，本地选号终止且不允许重放
+    SessionPolicyRestricted,
     /// Provider 的账号存储、租约协调或本地凭据数据不可用
     ProviderInfrastructureUnavailable,
     /// 请求超时
@@ -84,6 +86,7 @@ impl ProviderErrorKind {
             Self::ConcurrencyQueueFull => "concurrency_queue_full",
             Self::ConcurrencyQueueTimeout => "concurrency_queue_timeout",
             Self::NoEligibleAccount => "no_eligible_account",
+            Self::SessionPolicyRestricted => "session_policy_restricted",
             Self::ProviderInfrastructureUnavailable => "provider_infrastructure_unavailable",
             Self::Timeout => "timeout",
             Self::Transport => "transport",
@@ -120,19 +123,34 @@ pub enum ContinuationRecoveryDisposition {
     ProviderReplayAllowed,
 }
 
+/// 同账号瞬态错误的恢复策略，明确重试耗尽后的去向
+///
+/// Provider 按上游错误场景选择，Core 共用同一套退避与安全重放检查
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransientRetryPolicy {
+    /// 同账号退避重试，耗尽后允许在安全边界与换号预算内选择其他账号
+    RetryThenRotateAccount,
+    /// 同账号退避重试，耗尽后返回最后一次上游错误，不因该错误换号
+    RetryThenReturnError,
+}
+
 /// Provider 在下游尚未提交事件时请求的隐藏恢复方式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PreDeliveryRetry {
     /// 排除本次账号，按普通调度策略重新选号
     AccountRotation,
-    /// 上游明确拒绝后的同账号退避；耗尽后仍由普通安全重放规则决定是否换号
+    /// 上游明确拒绝后的同账号退避；耗尽动作由 Provider 显式选择
     SameAccountTransientRetry {
         /// 每个账号在本请求中的重试上限，同时受总路由预算约束
         max_retries: NonZeroU32,
         /// 指数退避的起始间隔
         initial_delay: Duration,
-        /// 单次等待上限，避免上游提示把请求拖入长时间等待
+        /// 本地指数退避的基准上限，不含附加抖动，也不缩短上游 Retry-After
         max_delay: Duration,
+        /// Provider 为本次失败采样的附加等待，仅在没有 Retry-After 时使用
+        jitter: Duration,
+        /// 同账号恢复策略，不提供额外安全重放资格
+        policy: TransientRetryPolicy,
     },
     /// 固定本次账号，并按 Provider 给出的序号重试当前传输
     /// 可用于发送结果不明确时的有界尽力恢复，不等于上游未执行的证明
@@ -682,18 +700,22 @@ impl ProviderError {
         self
     }
 
-    /// 请求有界同账号退避；该意图本身不提供安全重放证据
+    /// 请求有界同账号退避并显式选择耗尽去向；该意图本身不提供安全重放证据
     #[must_use]
     pub fn with_transient_retry(
         mut self,
         max_retries: NonZeroU32,
         initial_delay: Duration,
         max_delay: Duration,
+        jitter: Duration,
+        policy: TransientRetryPolicy,
     ) -> Self {
         self.pre_delivery_retry = Some(Box::new(PreDeliveryRetry::SameAccountTransientRetry {
             max_retries,
             initial_delay,
             max_delay,
+            jitter,
+            policy,
         }));
         self
     }
@@ -1048,6 +1070,8 @@ pub enum GatewayErrorKind {
     NoAvailableProvider,
     /// 符合条件的上游账号暂时没有调度容量
     AccountCapacityUnavailable,
+    /// 中间件在途资源或执行等待队列已满
+    MiddlewareCapacityUnavailable,
     ConcurrencyQueueFull,
     ConcurrencyQueueTimeout,
     /// Provider 的本地账号基础设施不可用
@@ -1079,6 +1103,7 @@ impl GatewayErrorKind {
             Self::ModelNotFound => "model_not_found",
             Self::NoAvailableProvider => "no_available_provider",
             Self::AccountCapacityUnavailable => "account_capacity_unavailable",
+            Self::MiddlewareCapacityUnavailable => "middleware_capacity_unavailable",
             Self::ConcurrencyQueueFull => "concurrency_queue_full",
             Self::ConcurrencyQueueTimeout => "concurrency_queue_timeout",
             Self::ProviderInfrastructureUnavailable => "provider_infrastructure_unavailable",
@@ -1165,6 +1190,10 @@ impl GatewayError {
             ProviderErrorKind::InvalidRequest => {
                 Self::new(GatewayErrorKind::InvalidRequest, "invalid upstream request")
             }
+            ProviderErrorKind::SessionPolicyRestricted => Self::new(
+                GatewayErrorKind::InvalidRequest,
+                "session policy excludes all eligible accounts",
+            ),
             ProviderErrorKind::ContinuationRecoveryRequired => Self::new(
                 GatewayErrorKind::InvalidRequest,
                 "conversation continuation must be rebuilt",

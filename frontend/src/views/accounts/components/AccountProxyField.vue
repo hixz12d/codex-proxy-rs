@@ -19,9 +19,10 @@ const options = computed(() => [
   ...(props.random ? [{ label: '随机代理', value: 'random', description: '每个账号从测试通过的 IPv4 代理中随机选一个' }] : []),
   { label: '直连', value: 'direct', description: '不使用代理' },
   ...proxies.value.map(proxy => ({
-    label: `${proxy.name}${proxy.lastTest?.success ? '' : proxy.lastTest ? '（测试失败）' : '（未测试）'}`,
+    label: `${proxy.name}${!proxy.enabled ? '（已禁用）' : proxy.lastTest?.success ? '' : proxy.lastTest ? '（测试失败）' : '（未测试）'}`,
     value: proxy.id,
     description: proxy.endpoint,
+    disabled: !proxy.enabled,
   })),
 ])
 const selection = computed({

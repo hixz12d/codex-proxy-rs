@@ -25,6 +25,18 @@ async fn dashboard_summary_should_include_quota_exhaustion_in_unavailable_headli
         .dashboard_observation
         .lock()
         .expect("dashboard observation") = Some(DashboardObservation {
+        yesterday: Default::default(),
+        analytics: gateway_admin::model::observability::AnalyticsMetadata {
+            coverage_start: Some(now - Duration::hours(1)),
+            coverage_end: Some(now),
+            generated_at: now,
+            lag_seconds: 12,
+            state: gateway_admin::model::observability::AnalyticsState::Lagging,
+            percentiles_approximate: true,
+            schema_version: 1,
+            histogram_version: 1,
+            generation: 42,
+        },
         runtime_slots: None,
         range: TimeRange::new(now - Duration::hours(1), now).expect("dashboard range"),
         totals: Default::default(),
@@ -59,6 +71,14 @@ async fn dashboard_summary_should_include_quota_exhaustion_in_unavailable_headli
         .expect("dashboard response body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("dashboard response JSON");
     assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["data"]["analytics"]["state"], "lagging");
+    assert_eq!(value["data"]["analytics"]["lagSeconds"], 12);
+    assert_eq!(value["data"]["analytics"]["percentilesApproximate"], true);
+    assert_eq!(value["data"]["analytics"]["schemaVersion"], 1);
+    assert_eq!(value["data"]["analytics"]["histogramVersion"], 1);
+    assert!(value["data"]["analytics"]["coverageStart"].is_string());
+    assert!(value["data"]["analytics"]["generatedAtDisplay"].is_string());
+    assert!(value["data"]["analytics"].get("generation").is_none());
 
     assert_eq!(
         (
@@ -87,14 +107,14 @@ async fn dashboard_summary_should_include_quota_exhaustion_in_unavailable_headli
 }
 
 #[tokio::test]
-async fn dashboard_summary_should_use_lifetime_totals_for_card_footers() {
+async fn dashboard_summary_should_keep_yesterday_comparison_separate_from_today_and_lifetime() {
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
     use chrono::{Duration, Utc};
     use gateway_admin::model::observability::{
-        AccountPoolMetrics, DashboardObservation, DashboardTotals, TimeRange,
+        AccountPoolMetrics, DashboardObservation, DashboardTotals, RequestMetrics, TimeRange,
     };
     use gateway_api::admin::observability;
     use tower::ServiceExt as _;
@@ -108,12 +128,20 @@ async fn dashboard_summary_should_use_lifetime_totals_for_card_footers() {
         .dashboard_observation
         .lock()
         .expect("dashboard observation") = Some(DashboardObservation {
+        yesterday: RequestMetrics {
+            request_count: 7,
+            input_tokens: 400,
+            cached_input_tokens: 200,
+            total_tokens: 500,
+            ..Default::default()
+        },
+        analytics: Default::default(),
         runtime_slots: None,
         range: TimeRange::new(now - Duration::hours(1), now).expect("dashboard range"),
         totals: DashboardTotals {
             request_count: 42,
             input_tokens: 800,
-            cached_tokens: 200,
+            cached_input_tokens: 200,
             total_tokens: 840,
             billing_usd: None,
         },
@@ -141,13 +169,26 @@ async fn dashboard_summary_should_use_lifetime_totals_for_card_footers() {
         .expect("dashboard response body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("dashboard response JSON");
     assert_eq!(status, StatusCode::OK, "{value}");
+    let cards = &value["data"]["cards"];
+    assert_eq!(cards["traffic"]["todayRequestsValue"], 0);
+    assert_eq!(cards["traffic"]["yesterdayRequestsValue"], 7);
+    assert_eq!(cards["tokens"]["yesterdayTokensValue"], 500);
+    assert_eq!(cards["cache"]["yesterdayHitRateValue"], 0.5);
+    assert_eq!(
+        value["data"]["analytics"]["coverageStartDisplay"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        value["data"]["analytics"]["coverageEndDisplay"],
+        serde_json::Value::Null
+    );
 
     assert_eq!(
         (
             &value["data"]["cards"]["traffic"]["totalRequests"],
             &value["data"]["cards"]["tokens"]["totalTokens"],
             &value["data"]["cards"]["cache"]["totalHitRate"],
-            &value["data"]["cards"]["cache"]["totalCachedTokens"],
+            &value["data"]["cards"]["cache"]["totalCachedInputTokens"],
         ),
         (
             &serde_json::json!("42"),
@@ -180,6 +221,8 @@ async fn dashboard_summary_should_default_to_current_deployment_day() {
         .dashboard_observation
         .lock()
         .expect("dashboard observation") = Some(DashboardObservation {
+        yesterday: Default::default(),
+        analytics: Default::default(),
         runtime_slots: None,
         range: TimeRange::new(now - Duration::hours(1), now).expect("dashboard range"),
         totals: Default::default(),
@@ -245,10 +288,6 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
     record.upstream_response_ms = Some(1_000);
     record.upstream_api_overhead_ms = Some(120.25);
     record.upstream_engine_ms = Some(6400.0);
-    record.upstream_engine_iapi_ttft_ms = Some(650.5);
-    record.upstream_engine_service_ttft_ms = Some(720.25);
-    record.upstream_engine_iapi_tbt_ms = Some(18.45);
-    record.upstream_engine_service_tbt_ms = Some(20.12);
     fixture
         .usage_detail
         .lock()
@@ -282,9 +321,9 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
                 message: Some("limited".to_owned()),
                 input_tokens: None,
                 output_tokens: None,
-                cached_tokens: None,
-                cache_write_tokens: None,
-                reasoning_tokens: None,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                reasoning_output_tokens: None,
                 total_tokens: None,
                 cost_source: Some("unavailable".to_owned()),
                 cost_amount: None,
@@ -318,22 +357,6 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
     assert_eq!(
         value["data"]["latencyDetails"]["upstreamEngineMs"],
         json!(6400.0)
-    );
-    assert_eq!(
-        value["data"]["latencyDetails"]["upstreamEngineIapiTtftMs"],
-        json!(650.5)
-    );
-    assert_eq!(
-        value["data"]["latencyDetails"]["upstreamEngineServiceTtftMs"],
-        json!(720.25)
-    );
-    assert_eq!(
-        value["data"]["latencyDetails"]["upstreamEngineIapiTbtMs"],
-        json!(18.45)
-    );
-    assert_eq!(
-        value["data"]["latencyDetails"]["upstreamEngineServiceTbtMs"],
-        json!(20.12)
     );
     assert!(value["data"].get("firstTokenMs").is_none());
     assert!(value["data"].get("firstTokenLatencyMsDisplay").is_none());
@@ -369,7 +392,7 @@ async fn usage_detail_should_keep_attempt_snapshot_contract() {
 }
 
 #[tokio::test]
-async fn zero_attempt_failure_detail_keeps_missing_upstream_facts_and_preparation_trace() {
+async fn zero_attempt_failure_detail_omits_trace_and_keeps_missing_upstream_facts() {
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
@@ -401,9 +424,9 @@ async fn zero_attempt_failure_detail_keeps_missing_upstream_facts_and_preparatio
     record.error_message = Some("no upstream account is available".to_owned());
     record.input_tokens = None;
     record.output_tokens = None;
-    record.cached_tokens = None;
-    record.cache_write_tokens = None;
-    record.reasoning_tokens = None;
+    record.cached_input_tokens = None;
+    record.cache_write_input_tokens = None;
+    record.reasoning_output_tokens = None;
     record.image_input_tokens = None;
     record.image_output_tokens = None;
     record.total_tokens = None;
@@ -441,7 +464,8 @@ async fn zero_attempt_failure_detail_keeps_missing_upstream_facts_and_preparatio
     assert_eq!(data["attempts"], json!([]));
     // 明细仍沿用全局 best-effort 合同，不从预备 trace 推断完整尝试列表
     assert_eq!(data["attemptsComplete"], false);
-    assert_eq!(data["trace"], trace);
+    assert!(data.get("trace").is_none());
+    assert!(data.get("relatedRequests").is_none());
     assert_eq!(data["logicalOutcome"], "failed");
     assert_eq!(data["clientStatusCode"], 503);
     assert_eq!(data["message"], "no upstream account is available");
@@ -466,8 +490,6 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
-    use chrono::Utc;
-    use gateway_admin::model::observability::OpsError;
     use gateway_api::admin::observability;
     use tower::ServiceExt as _;
 
@@ -479,63 +501,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
         .ops_errors
         .lock()
         .expect("ops errors")
-        .push(OpsError {
-            client_api_key_name: Some("Production".to_owned()),
-            source: "model_request".to_owned(),
-            event_id: "err_snapshot".to_owned(),
-            request_id: Some("req_err".to_owned()),
-            attempt_index: Some(1),
-            client_api_key_ref: Some("key_err".to_owned()),
-            component: "model_request".to_owned(),
-            operation: "responses".to_owned(),
-            protocol: Some("openai".to_owned()),
-            client_transport: Some("http_sse".to_owned()),
-            requested_model_id: Some("gpt-5.4".to_owned()),
-            service_tier: Some("priority".to_owned()),
-            endpoint: Some("/v1/responses".to_owned()),
-            provider_kind: Some("openai".to_owned()),
-            provider_account_ref: Some("acct_err".to_owned()),
-            provider_account_name: None,
-            provider_account_email: Some("err@example.invalid".to_owned()),
-            provider_account_plan_type: Some("pro".to_owned()),
-            provider_account_plan_type_display: Some("Pro".to_owned()),
-            provider_account_authentication_kind: Some("api_key".to_owned()),
-            upstream_model_id: Some("upstream-err".to_owned()),
-            upstream_transport: Some("http_sse".to_owned()),
-            failure_kind: "upstream_error".to_owned(),
-            upstream_send_state: Some("sent".to_owned()),
-            client_status_code: Some(502),
-            upstream_status_code: Some(502),
-            provider_error_code: Some("upstream".to_owned()),
-            client_response_id: None,
-            upstream_request_id: None,
-            latency_ms: Some(90),
-            message: "snapshot error".to_owned(),
-            error_details: Some(
-                r#"{"error":{"code":"upstream","message":"raw upstream marker"}}"#.to_owned(),
-            ),
-            client_ip: Some("203.0.113.8".to_owned()),
-            user_agent: Some("codex-cli/0.144.0".to_owned()),
-            reasoning_effort: Some("medium".to_owned()),
-            reasoning_preset: None,
-            request_kind: Some("root".to_owned()),
-            subagent_kind: None,
-            compact: Some(false),
-            continuation_affinity_hash: Some("affinity-hash".to_owned()),
-            continuation_previous_response_id_hash: Some("response-hash".to_owned()),
-            continuation_unavailable_reason: Some("reused_connection_lost".to_owned()),
-            upstream_connection_id: Some("connection-id".to_owned()),
-            upstream_connection_exit_reason: Some("tcp_reset".to_owned()),
-            upstream_connection_age_ms: Some(12_000),
-            upstream_connection_idle_ms: Some(4_000),
-            recovery_request_id: None,
-            recovered_at: None,
-            recovery_attempt_count: 0,
-            recovery_retry_delay_ms: None,
-            recovery_total_latency_ms: None,
-            occurred_at: Utc::now(),
-            stable_sort_id: "model_request:req_err".to_owned(),
-        });
+        .push(ops_error_record());
     let response = observability::router::<AdminTestState>()
         .with_state(fixture.state())
         .oneshot(
@@ -592,7 +558,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
             "userAgent": "codex-cli/0.144.0",
             "providerErrorCode": "upstream",
             "upstreamSendState": "sent",
-            "errorDetails": "{\"error\":{\"code\":\"upstream\",\"message\":\"raw upstream marker\"}}",
+            "errorDetails": serde_json::to_string_pretty(&json!({"error": {"code": "upstream", "message": "raw upstream marker"}})).unwrap(),
             "continuationUnavailableReason": "reused_connection_lost",
             "upstreamConnectionExitReason": "tcp_reset",
             "upstreamConnectionAgeMs": 12000,
@@ -617,6 +583,7 @@ async fn diagnostics_should_keep_stable_key_and_display_name_contract() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     *fixture.diagnostics.lock().expect("diagnostics") = DiagnosticsObservation {
+        analytics: Default::default(),
         total_request_count: 4,
         items: vec![DiagnosticObservation {
             key: "acct_diag".to_owned(),
@@ -677,7 +644,7 @@ async fn diagnostics_should_keep_stable_key_and_display_name_contract() {
     );
 }
 
-fn usage_record_with_account(
+pub(super) fn usage_record_with_account(
     id: &str,
     account_id: &str,
     name: &str,
@@ -726,9 +693,9 @@ fn usage_record_with_account(
         retry_after_ms: None,
         input_tokens: Some(1),
         output_tokens: Some(1),
-        cached_tokens: Some(0),
-        cache_write_tokens: Some(0),
-        reasoning_tokens: Some(0),
+        cached_input_tokens: Some(0),
+        cache_write_input_tokens: Some(0),
+        reasoning_output_tokens: Some(0),
         image_input_tokens: Some(0),
         image_output_tokens: Some(0),
         total_tokens: Some(2),
@@ -747,10 +714,6 @@ fn usage_record_with_account(
         upstream_response_ms: None,
         upstream_api_overhead_ms: None,
         upstream_engine_ms: None,
-        upstream_engine_iapi_ttft_ms: None,
-        upstream_engine_service_ttft_ms: None,
-        upstream_engine_iapi_tbt_ms: None,
-        upstream_engine_service_tbt_ms: None,
         latency_ms: None,
         admission_decision_ms: None,
         account_selection_wait_ms: None,
@@ -828,6 +791,10 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .lock()
         .expect("usage records")
         .push(UsageListRecord {
+            error_code: None,
+            error_message: None,
+            client_status_code: None,
+            outcome: gateway_admin::model::observability::RequestOutcome::Succeeded,
             client_api_key_name: Some("Production".to_owned()),
             id: "request_endpoint".to_owned(),
             endpoint: "/v1/responses".to_owned(),
@@ -847,9 +814,9 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             service_tier: Some("default".to_owned()),
             input_tokens: Some(1),
             output_tokens: Some(1),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            reasoning_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+            reasoning_output_tokens: Some(0),
             image_input_tokens: Some(31),
             image_output_tokens: Some(9),
             total_tokens: Some(2),
@@ -886,10 +853,6 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             upstream_response_ms: Some(2_000),
             upstream_api_overhead_ms: None,
             upstream_engine_ms: None,
-            upstream_engine_iapi_ttft_ms: None,
-            upstream_engine_service_ttft_ms: None,
-            upstream_engine_iapi_tbt_ms: None,
-            upstream_engine_service_tbt_ms: None,
             latency_ms: Some(31),
             admission_decision_ms: Some(1),
             account_selection_wait_ms: Some(2),
@@ -918,12 +881,18 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             });
             records.push(image);
         }
+        let mut failed = records[0].clone();
+        failed.id = "request_failed".to_owned();
+        failed.outcome = gateway_admin::model::observability::RequestOutcome::Failed;
+        failed.error_code = Some("server_error".to_owned());
+        failed.error_message = Some("The upstream service is temporarily unavailable.".to_owned());
+        records.push(failed);
     }
     let response = observability::router::<AdminTestState>()
         .with_state(fixture.state())
         .oneshot(
             Request::builder()
-                .uri("/api/admin/usage/records")
+                .uri("/api/admin/usage/records?status=all")
                 .header(header::COOKIE, "cpr_session=valid-session")
                 .header("x-request-id", "req_usage_endpoint")
                 .body(Body::empty())
@@ -937,6 +906,13 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .expect("usage response body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage response JSON");
 
+    assert!(value["data"]["items"][0]["errorCode"].is_null());
+    assert!(value["data"]["items"][0]["errorMessage"].is_null());
+    assert_eq!(value["data"]["items"][3]["errorCode"], "server_error");
+    assert_eq!(
+        value["data"]["items"][3]["errorMessage"],
+        "The upstream service is temporarily unavailable."
+    );
     assert_eq!(value["data"]["items"][0]["clientApiKeyName"], "Production");
     assert_eq!(value["data"]["items"][0]["accountNotes"], "Team workspace");
     assert_eq!(
@@ -1101,6 +1077,13 @@ async fn calendar_queries_and_display_follow_deployment_timezone_with_one_anchor
         let fixture = AdminTestFixture::with_timezone(timezone).await;
         fixture.auth.insert_session("valid-session");
         *fixture.dashboard_observation.lock().unwrap() = Some(DashboardObservation {
+            yesterday: Default::default(),
+            analytics: gateway_admin::model::observability::AnalyticsMetadata {
+                coverage_start: Some(range.start),
+                coverage_end: Some(end),
+                generated_at: end,
+                ..Default::default()
+            },
             runtime_slots: None,
             range,
             totals: Default::default(),
@@ -1142,6 +1125,15 @@ async fn calendar_queries_and_display_follow_deployment_timezone_with_one_anchor
         assert_eq!(queried.end, end);
         assert_eq!(value["data"]["asOf"], anchor);
         assert_eq!(value["data"]["asOfDisplay"], display);
+        let analytics = &value["data"]["analytics"];
+        assert_eq!(analytics["coverageStart"], start);
+        assert_eq!(analytics["coverageEnd"], anchor);
+        assert_eq!(
+            analytics["coverageStartDisplay"],
+            format!("{} 00:00:00", &display[..10])
+        );
+        assert_eq!(analytics["coverageEndDisplay"], display);
+        assert_eq!(analytics["generatedAtDisplay"], display);
         let points = value["data"]["healthTimeline"]["points"]
             .as_array()
             .unwrap();
@@ -1197,4 +1189,184 @@ async fn calendar_query_rejects_an_anchor_outside_the_local_calendar() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(fixture.dashboard_summary_range.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn observability_queries_reject_group_filters_and_analytics_search() {
+    use crate::admin::{AdminTestFixture, AdminTestState};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use gateway_api::admin::observability;
+    use tower::ServiceExt as _;
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let router = observability::router::<AdminTestState>().with_state(fixture.state());
+    for (path, parameter) in [
+        ("/api/admin/usage/records", "routingGroupRefs=group-a"),
+        ("/api/admin/operations/errors", "routingGroupRefs=group-a"),
+        (
+            "/api/admin/usage/records/summary",
+            "routingGroupRefs=group-a",
+        ),
+        (
+            "/api/admin/usage/insights/overview",
+            "routingGroupRefs=group-a",
+        ),
+        (
+            "/api/admin/usage/insights/diagnostics",
+            "routingGroupRefs=group-a",
+        ),
+        ("/api/admin/usage/records/summary", "search=request-prefix"),
+        (
+            "/api/admin/usage/insights/overview",
+            "search=request-prefix",
+        ),
+        (
+            "/api/admin/usage/insights/diagnostics",
+            "search=request-prefix",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{path}?{parameter}"))
+                    .header(header::COOKIE, "cpr_session=valid-session")
+                    .header("x-request-id", "req_rejected_observability_filter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{path}?{parameter}"
+        );
+    }
+    let observations = fixture.observations.lock().unwrap();
+    assert!(observations.records.is_empty());
+    assert!(observations.errors.is_empty());
+}
+
+pub(super) fn ops_error_record() -> gateway_admin::model::observability::OpsError {
+    use gateway_admin::model::observability::OpsError;
+    OpsError {
+        client_api_key_name: Some("Production".to_owned()),
+        source: "model_request".to_owned(),
+        event_id: "err_snapshot".to_owned(),
+        request_id: Some("req_err".to_owned()),
+        attempt_index: Some(1),
+        client_api_key_ref: Some("key_err".to_owned()),
+        component: "model_request".to_owned(),
+        operation: "responses".to_owned(),
+        protocol: Some("openai".to_owned()),
+        client_transport: Some("http_sse".to_owned()),
+        requested_model_id: Some("gpt-5.4".to_owned()),
+        service_tier: Some("priority".to_owned()),
+        endpoint: Some("/v1/responses".to_owned()),
+        provider_kind: Some("openai".to_owned()),
+        provider_account_ref: Some("acct_err".to_owned()),
+        provider_account_name: None,
+        provider_account_email: Some("err@example.invalid".to_owned()),
+        provider_account_plan_type: Some("pro".to_owned()),
+        provider_account_plan_type_display: Some("Pro".to_owned()),
+        provider_account_authentication_kind: Some("api_key".to_owned()),
+        upstream_model_id: Some("upstream-err".to_owned()),
+        upstream_transport: Some("http_sse".to_owned()),
+        failure_kind: "upstream_error".to_owned(),
+        upstream_send_state: Some("sent".to_owned()),
+        client_status_code: Some(502),
+        upstream_status_code: Some(502),
+        provider_error_code: Some("upstream".to_owned()),
+        client_response_id: None,
+        upstream_request_id: None,
+        latency_ms: Some(90),
+        message: "snapshot error".to_owned(),
+        error_details: Some(
+            r#"{"error":{"code":"upstream","message":"raw upstream marker"}}"#.to_owned(),
+        ),
+        client_ip: Some("203.0.113.8".to_owned()),
+        user_agent: Some("codex-cli/0.144.0".to_owned()),
+        reasoning_effort: Some("medium".to_owned()),
+        reasoning_preset: None,
+        request_kind: Some("root".to_owned()),
+        subagent_kind: None,
+        compact: Some(false),
+        continuation_affinity_hash: Some("affinity-hash".to_owned()),
+        continuation_previous_response_id_hash: Some("response-hash".to_owned()),
+        continuation_unavailable_reason: Some("reused_connection_lost".to_owned()),
+        upstream_connection_id: Some("connection-id".to_owned()),
+        upstream_connection_exit_reason: Some("tcp_reset".to_owned()),
+        upstream_connection_age_ms: Some(12_000),
+        upstream_connection_idle_ms: Some(4_000),
+        recovery_request_id: None,
+        recovered_at: None,
+        recovery_attempt_count: 0,
+        recovery_retry_delay_ms: None,
+        recovery_total_latency_ms: None,
+        occurred_at: Utc::now(),
+        stable_sort_id: "model_request:req_err".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn usage_status_query_accepts_three_modes_and_rejects_unknown_values() {
+    use crate::admin::{AdminTestFixture, AdminTestState};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+    };
+    use gateway_api::admin::observability;
+    use tower::ServiceExt as _;
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    for (status, expected) in [
+        ("success", StatusCode::OK),
+        ("error", StatusCode::OK),
+        ("all", StatusCode::OK),
+        ("failed", StatusCode::BAD_REQUEST),
+    ] {
+        let response = observability::router::<AdminTestState>()
+            .with_state(fixture.state())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/admin/usage/records?status={status}"))
+                    .header(header::COOKIE, "cpr_session=valid-session")
+                    .header("x-request-id", "usage_status_fixture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let actual = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            actual,
+            expected,
+            "{status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        if expected == StatusCode::OK {
+            use gateway_admin::model::observability::UsageRecordStatus;
+            let status_value = match status {
+                "success" => UsageRecordStatus::Success,
+                "error" => UsageRecordStatus::Error,
+                _ => UsageRecordStatus::All,
+            };
+            assert_eq!(
+                fixture
+                    .observations
+                    .lock()
+                    .unwrap()
+                    .records
+                    .last()
+                    .unwrap()
+                    .status,
+                status_value
+            );
+        }
+    }
 }

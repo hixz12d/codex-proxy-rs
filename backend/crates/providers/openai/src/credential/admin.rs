@@ -968,7 +968,7 @@ impl CodexCredentialAdminService {
             Err(error) => {
                 super::diagnostics::record_refresh_failure(
                     self.diagnostics.as_ref(),
-                    &account_id,
+                    &current.account,
                     "manual_refresh",
                     &error,
                 )
@@ -1152,6 +1152,14 @@ impl CodexCredentialAdminService {
         let id_token = id_token.map(SecretString::from);
         if let Some(access_token) = access_token {
             let access_token_expires_at = parse_access_token_expiration(&access_token);
+            // 已知过期且无法刷新的 AT 不能产生可用账号
+            if refresh_token.is_none()
+                && access_token_expires_at
+                    .as_ref()
+                    .is_some_and(|expires_at| expires_at <= &Utc::now())
+            {
+                return Err(CodexCredentialAdminError::InvalidCredential);
+            }
             let secret = CodexOAuthSecret {
                 access_token: SecretString::from(access_token),
                 refresh_token: refresh_token.map(SecretString::from),
@@ -1354,7 +1362,7 @@ fn import_proxy(
     }
     let text = |field| proxy.get(field).and_then(Value::as_str).ok_or_else(invalid);
     let scheme = text("protocol")?;
-    // sub2api 的 SOCKS 目标地址由代理解析
+    // 导入的 SOCKS 代理使用远端 DNS，避免改为本地解析目标地址
     let scheme = if scheme == "socks5" {
         "socks5h"
     } else {
@@ -1487,7 +1495,7 @@ fn parse_api_key_import(value: &Value) -> Result<ApiKeyCredentialData, CodexCred
         if crate::transport::parse_upstream_base_url(&base_url).is_none() {
             return Err(CodexCredentialAdminError::InvalidInput);
         }
-        // sub2api 接受服务根、版本前缀或完整 Responses 端点；仅在导入边界归一化
+        // 外部账号的 base_url 可含服务根、版本前缀或完整 Responses 端点，仅在导入边界归一化
         base_url = base_url.trim_end_matches('/').to_owned();
         if let Some(prefix) = base_url.strip_suffix("/responses") {
             base_url = prefix.to_owned();

@@ -89,7 +89,6 @@ pub struct AccountSelectionPolicy {
     strategy: RotationStrategy,
     smart_scheduling: SmartSchedulingConfig,
     max_concurrent_per_account: AccountConcurrency,
-    request_interval: Duration,
     queue_policy: ConcurrencyQueuePolicy,
     openai_guardian_reserved_concurrency: u32,
     openai_account_affinity: AccountAffinity,
@@ -102,13 +101,11 @@ impl AccountSelectionPolicy {
     pub fn new(
         strategy: RotationStrategy,
         max_concurrent_per_account: impl Into<AccountConcurrency>,
-        request_interval: Duration,
     ) -> Self {
         Self {
             strategy,
             smart_scheduling: SmartSchedulingConfig::default(),
             max_concurrent_per_account: max_concurrent_per_account.into(),
-            request_interval,
             openai_guardian_reserved_concurrency: 0,
             openai_account_affinity: AccountAffinity::default(),
             max_account_rotations: 3,
@@ -195,11 +192,6 @@ impl AccountSelectionPolicy {
     #[must_use]
     pub const fn max_concurrent_per_account(self) -> AccountConcurrency {
         self.max_concurrent_per_account
-    }
-
-    #[must_use]
-    pub const fn request_interval(self) -> Duration {
-        self.request_interval
     }
 }
 
@@ -518,6 +510,8 @@ pub struct AccountSelectionContext {
     pub policy: AccountSelectionPolicy,
     pub now: SystemTime,
     pub excluded_accounts: BTreeSet<ProviderAccountId>,
+    /// 租约争用或队列让位只阻止立即选号，不排除等待资格
+    pub busy_accounts: BTreeSet<ProviderAccountId>,
     pub preferred_account: Option<ProviderAccountId>,
     /// 优先账号可调度时，是否优先于其它账号的持久权重
     pub preferred_account_overrides_weight: bool,
@@ -543,8 +537,8 @@ impl AccountSelectionContext {
 /// 选择账号时是否执行本地调度资格投影
 ///
 /// 管理端对指定账号执行诊断时，会直接向上游确认实际状态；该模式跳过
-/// `enabled`、可用性、冷却和 token 到期等本地投影，仍保留租约、并发和
-/// 请求间隔约束，且只能与固定账号约束组合使用
+/// `enabled`、可用性、冷却和 token 到期等本地投影，仍保留租约和并发
+/// 约束，且只能与固定账号约束组合使用
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccountEligibilityPolicy {
     #[default]
@@ -566,7 +560,6 @@ pub enum AccountSchedulingBlocker {
     LocalAvailability,
     Excluded,
     ConcurrencyLimit,
-    RequestInterval,
     LowerWeight,
 }
 
@@ -611,7 +604,7 @@ impl<'a> AccountSelection<'a> {
 pub struct AccountSelector;
 
 impl AccountSelector {
-    /// 返回调度策略可见的全部合格候选；权重层授权由调用策略的宿主适配器裁剪
+    /// 策略同时约束立即选号与等待，候选保留仅因本地容量受阻的账号
     #[must_use]
     pub(crate) fn policy_candidates<'a>(
         &self,
@@ -620,7 +613,12 @@ impl AccountSelector {
     ) -> Vec<&'a AccountCandidate> {
         candidates
             .iter()
-            .filter(|candidate| self.scheduling_blocker(candidate, context).is_none())
+            .filter(|candidate| {
+                matches!(
+                    self.scheduling_blocker(candidate, context),
+                    None | Some(AccountSchedulingBlocker::ConcurrencyLimit)
+                )
+            })
             .collect()
     }
 
@@ -706,10 +704,7 @@ impl AccountSelector {
             .max()?;
         let (mut preferred, preferred_candidate) = self.preferred_decision(candidates, context);
         if let Some(candidate) = preferred_candidate {
-            // 权重回切只裁决内置策略的软亲和，插件显式选号按实际选择记录结果
-            let prefer_higher_weight = context.policy.strategy() == RotationStrategy::Smart
-                && context.policy.smart_scheduling().prefer_higher_weight();
-            if (!context.preferred_account_overrides_weight || prefer_higher_weight)
+            if !context.preferred_account_overrides_weight
                 && candidate.account.weight() < highest_weight
             {
                 preferred =
@@ -791,7 +786,7 @@ impl AccountSelector {
         }
     }
 
-    /// 只有本地并发/调度间隔可等待；账号权限、失效、额度与上游冷却仍立即排除
+    /// 只有本地并发可等待；账号权限、失效、额度与上游冷却仍立即排除
     #[must_use]
     pub fn wait_candidates(
         &self,
@@ -803,10 +798,7 @@ impl AccountSelector {
             .filter(|candidate| {
                 matches!(
                     self.scheduling_blocker(candidate, context),
-                    None | Some(
-                        AccountSchedulingBlocker::ConcurrencyLimit
-                            | AccountSchedulingBlocker::RequestInterval
-                    )
+                    None | Some(AccountSchedulingBlocker::ConcurrencyLimit)
                 )
             })
             .collect::<Vec<_>>();
@@ -872,24 +864,15 @@ impl AccountSelector {
         if context.excluded_accounts.contains(candidate.account.id()) {
             return Some(AccountSchedulingBlocker::Excluded);
         }
+        if context.busy_accounts.contains(candidate.account.id()) {
+            return Some(AccountSchedulingBlocker::ConcurrencyLimit);
+        }
         if context
             .concurrency_limit(&candidate.account)
             .limit()
             .is_some_and(|limit| candidate.signals.in_flight >= limit.get())
         {
             return Some(AccountSchedulingBlocker::ConcurrencyLimit);
-        }
-        if candidate
-            .signals
-            .last_started_at
-            .is_some_and(|last_started| {
-                !context
-                    .now
-                    .duration_since(last_started)
-                    .is_ok_and(|elapsed| elapsed >= context.policy.request_interval())
-            })
-        {
-            return Some(AccountSchedulingBlocker::RequestInterval);
         }
         None
     }

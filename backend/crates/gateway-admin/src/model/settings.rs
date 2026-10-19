@@ -51,7 +51,6 @@ pub struct RuntimeSettingsValues {
     pub refresh_margin_seconds: u64,
     pub refresh_concurrency: u32,
     pub max_concurrent_per_account: u32,
-    pub request_interval_ms: u64,
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
@@ -76,6 +75,8 @@ pub struct RuntimeSettingsValues {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    pub reset_credit_lead_minutes: u32,
+    pub reset_credit_max_weekly_remaining_percent: Option<u32>,
 }
 
 /// 完整运行设置事实
@@ -190,6 +191,15 @@ impl From<RuntimeSettings> for ReplaceRuntimeSettings {
 impl RuntimeSettingsValues {
     /// 校验共同事实，返回字段名供边界转换错误；SQL 类型转换仍由 Store 处理
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=1440).contains(&self.reset_credit_lead_minutes) {
+            return Err("reset_credit_lead_minutes");
+        }
+        if self
+            .reset_credit_max_weekly_remaining_percent
+            .is_some_and(|percent| percent > 100)
+        {
+            return Err("reset_credit_max_weekly_remaining_percent");
+        }
         self.request_location
             .validate()
             .map_err(|_| "request_location")?;
@@ -212,10 +222,6 @@ impl RuntimeSettingsValues {
                 "refresh_margin_seconds",
             ),
             (self.refresh_concurrency > 0, "refresh_concurrency"),
-            (
-                i64::try_from(self.request_interval_ms).is_ok(),
-                "request_interval_ms",
-            ),
         ] {
             if !valid {
                 return Err(field);

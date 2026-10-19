@@ -8,7 +8,7 @@ use axum::{
     response::Response,
 };
 use chrono::Utc;
-use gateway_admin::model::observability::RequestMetrics;
+use gateway_admin::model::observability::{RequestMetrics, RequestOutcome, UsageRecordStatus};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -181,6 +181,7 @@ async fn overview_scopes_every_query_and_projects_only_key_visible_fields() {
             "summary",
             "trend",
             "healthTimeline",
+            "analytics",
         ],
     );
     assert_fields(
@@ -203,8 +204,8 @@ async fn overview_scopes_every_query_and_projects_only_key_visible_fields() {
     assert_eq!(data["key"]["dailyUsedUsd"], "0.640001");
     assert_eq!(data["key"]["maxConcurrency"], 0);
     assert_eq!(data["summary"]["totalTokens"], 1100);
-    assert_eq!(data["summary"]["reasoningTokens"], 40);
-    assert_eq!(data["trend"][0]["reasoningTokens"], 40);
+    assert_eq!(data["summary"]["reasoningOutputTokens"], 40);
+    assert_eq!(data["trend"][0]["reasoningOutputTokens"], 40);
     assert_eq!(data["summary"]["costUsd"], "0.123456");
     assert_eq!(data["summary"]["costIncomplete"], true);
     assert_eq!(data["trend"][0]["bucketSeconds"], 900);
@@ -254,7 +255,16 @@ async fn records_keep_pagination_and_hide_admin_and_upstream_data() {
     let fixture = fixtures::fixture().await;
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
     let cookie = login(&app, "key").await;
-    for kind in ["success", "error"] {
+    for (kind, outcome) in [
+        ("success", RequestOutcome::Succeeded),
+        ("error", RequestOutcome::Failed),
+        ("all", RequestOutcome::Incomplete),
+    ] {
+        {
+            let mut records = fixture.usage_records.lock().unwrap();
+            records[0].outcome = outcome;
+            records[0].client_status_code = (kind != "success").then_some(502);
+        }
         let response = get(
             &app,
             "records",
@@ -290,7 +300,10 @@ async fn records_keep_pagination_and_hide_admin_and_upstream_data() {
                 "statusCode",
             ],
         );
-        assert_eq!(record["status"], kind);
+        assert_eq!(
+            record["status"],
+            if kind == "all" { "incomplete" } else { kind }
+        );
         assert_eq!(record["model"], "coding");
         assert_eq!(record["reasoningEffort"], "xhigh");
         assert_eq!(record["clientTransport"], "http_sse");
@@ -300,14 +313,14 @@ async fn records_keep_pagination_and_hide_admin_and_upstream_data() {
         assert!(!data.to_string().contains("private-sentinel"));
         if kind == "success" {
             assert_eq!(record["billing"]["totalAmountDisplay"], "$0.1235");
-            assert_eq!(record["tokenDetails"]["reasoningTokens"], 40);
+            assert_eq!(record["tokenDetails"]["reasoningOutputTokens"], 40);
             assert_eq!(record["tokenDetails"]["totalTokens"], 1100);
             assert_eq!(record["firstTokenLatencyMs"], 210);
             assert_fields(
                 &record["latencyDetails"],
                 &[
                     "upstreamResponseMs",
-                    "upstreamEngineIapiTbtMs",
+                    "upstreamEngineMs",
                     "firstEventMs",
                     "firstReasoningMs",
                     "firstTextMs",
@@ -315,29 +328,58 @@ async fn records_keep_pagination_and_hide_admin_and_upstream_data() {
             );
             assert_eq!(record["latencyDetails"]["firstEventMs"], 100);
             assert_eq!(record["latencyDetails"]["upstreamResponseMs"], 1000);
-            assert_eq!(
-                record["latencyDetails"]["upstreamEngineIapiTbtMs"],
-                2.450638
-            );
+            assert_eq!(record["latencyDetails"]["upstreamEngineMs"], 2.450638);
             assert!(record["statusCode"].is_null());
         } else {
             assert_eq!(record["statusCode"], 502);
-            assert!(record["billing"].is_null());
-            assert!(record["tokenDetails"].is_null());
-            assert_eq!(record["latencyDetails"], json!({}));
+            assert_eq!(record["billing"]["totalAmountDisplay"], "$0.1235");
+            assert_eq!(record["tokenDetails"]["totalTokens"], 1100);
         }
     }
     let data = fixture.observations.lock().unwrap();
-    assert_eq!(
-        data.records[0].filter.client_api_key_ref.as_deref(),
-        Some("key-42")
-    );
-    assert_eq!(
-        data.errors[0].filter.client_api_key_ref.as_deref(),
-        Some("key-42")
-    );
-    assert_eq!(data.records[0].filter.model.as_deref(), Some("coding"));
-    assert_eq!(data.errors[0].filter.model.as_deref(), Some("coding"));
+    assert!(data.errors.is_empty());
+    assert_eq!(data.records.len(), 3);
+    for (query, status) in data.records.iter().zip([
+        UsageRecordStatus::Success,
+        UsageRecordStatus::Error,
+        UsageRecordStatus::All,
+    ]) {
+        assert_eq!(query.status, status);
+        assert_eq!(query.filter.client_api_key_ref.as_deref(), Some("key-42"));
+        assert_eq!(query.filter.model.as_deref(), Some("coding"));
+        assert!(query.filter.provider_account_ref.is_none());
+        assert!(query.filter.provider_kind.is_none());
+    }
+}
+
+#[tokio::test]
+async fn failed_records_without_usage_keep_token_and_billing_details_unknown() {
+    let fixture = fixtures::fixture().await;
+    {
+        let mut records = fixture.usage_records.lock().unwrap();
+        let record = &mut records[0];
+        record.outcome = RequestOutcome::Failed;
+        record.client_status_code = Some(502);
+        record.input_tokens = None;
+        record.output_tokens = None;
+        record.cached_input_tokens = None;
+        record.cache_write_input_tokens = None;
+        record.reasoning_output_tokens = None;
+        record.image_input_tokens = None;
+        record.image_output_tokens = None;
+        record.total_tokens = None;
+        record.billing = None;
+    }
+    let app = crate::openai::api_router_with_admin(fixture.services.clone());
+    let cookie = login(&app, "key").await;
+    let response = get(&app, "records", "&kind=error", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = response_json(response).await;
+    let record = &data["data"]["items"][0];
+    assert_eq!(record["status"], "error");
+    assert_eq!(record["statusCode"], 502);
+    assert!(record["tokenDetails"].is_null());
+    assert!(record["billing"].is_null());
 }
 
 #[tokio::test]
@@ -391,7 +433,7 @@ async fn unknown_scope_fields_and_unbounded_queries_are_rejected() {
         "&currentPage=0",
         "&pageSize=0",
         "&pageSize=101",
-        "&kind=all",
+        "&kind=unknown",
         "&currentPage=-1",
     ] {
         assert!(
@@ -430,6 +472,7 @@ async fn empty_usage_has_zero_cost_but_unknown_pricing_stays_unknown() {
         {
             let mut data = fixture.observations.lock().unwrap();
             let summary = data.summary.as_mut().unwrap();
+            summary.analytics.generation += 1;
             summary.requests = RequestMetrics {
                 request_count: requests,
                 ..Default::default()

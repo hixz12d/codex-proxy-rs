@@ -42,7 +42,6 @@ pub struct RuntimeSettingsFields {
     pub refresh_margin_seconds: u64,
     pub refresh_concurrency: u64,
     pub max_concurrent_per_account: u64,
-    pub request_interval_ms: u64,
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
@@ -67,6 +66,8 @@ pub struct RuntimeSettingsFields {
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
+    pub reset_credit_lead_minutes: u32,
+    pub reset_credit_max_weekly_remaining_percent: Option<u32>,
 }
 
 /// 运行配置投影与设置页字段的聚合响应
@@ -276,6 +277,10 @@ where
         )
         .route("/api/admin/settings/pricing/sync", post(sync_pricing::<S>))
         .route("/api/admin/settings", get(settings::<S>))
+        .route(
+            "/api/admin/settings/location/detect",
+            post(detect_location::<S>),
+        )
         .route(
             "/api/admin/settings/client-profiles/{provider}",
             get(client_profile_options::<S>),
@@ -649,6 +654,25 @@ fn deserialize_profile_update<'de, D: serde::Deserializer<'de>>(
     serde_json::Map::<String, serde_json::Value>::deserialize(deserializer).map(Some)
 }
 
+async fn detect_location<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let result = state
+        .admin_services()
+        .proxies()
+        .probe(None, true)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(result.location),
+    ))
+}
+
 async fn client_profile_options<S>(
     _auth: AdminAuth,
     Path(provider): Path<String>,
@@ -735,7 +759,6 @@ impl RuntimeSettingsFields {
                 .map_err(|_| WireValidationError::new("settingsRefreshConcurrencyOverflow"))?,
             max_concurrent_per_account: u32::try_from(self.max_concurrent_per_account)
                 .map_err(|_| WireValidationError::new("settingsMaxConcurrencyOverflow"))?,
-            request_interval_ms: self.request_interval_ms,
             max_waiting_per_key: self.max_waiting_per_key,
             max_waiting_per_account: self.max_waiting_per_account,
             concurrency_wait_timeout_seconds: self.concurrency_wait_timeout_seconds,
@@ -764,6 +787,9 @@ impl RuntimeSettingsFields {
             account_warmup_enabled: self.account_warmup_enabled,
             account_warmup_schedule_time: self.account_warmup_schedule_time,
             account_warmup_model: self.account_warmup_model,
+            reset_credit_lead_minutes: self.reset_credit_lead_minutes,
+            reset_credit_max_weekly_remaining_percent: self
+                .reset_credit_max_weekly_remaining_percent,
         };
         values.validate().map_err(settings_validation_error)?;
         Ok(values)
@@ -779,7 +805,6 @@ impl From<gateway_admin::model::settings::RuntimeSettingsValues> for RuntimeSett
             refresh_margin_seconds: settings.refresh_margin_seconds,
             refresh_concurrency: u64::from(settings.refresh_concurrency),
             max_concurrent_per_account: u64::from(settings.max_concurrent_per_account),
-            request_interval_ms: settings.request_interval_ms,
             max_waiting_per_key: settings.max_waiting_per_key,
             max_waiting_per_account: settings.max_waiting_per_account,
             concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
@@ -805,6 +830,9 @@ impl From<gateway_admin::model::settings::RuntimeSettingsValues> for RuntimeSett
             account_warmup_enabled: settings.account_warmup_enabled,
             account_warmup_schedule_time: settings.account_warmup_schedule_time,
             account_warmup_model: settings.account_warmup_model,
+            reset_credit_lead_minutes: settings.reset_credit_lead_minutes,
+            reset_credit_max_weekly_remaining_percent: settings
+                .reset_credit_max_weekly_remaining_percent,
         }
     }
 }
@@ -820,6 +848,8 @@ fn settings_validation_error(field: &'static str) -> WireValidationError {
         "account_auto_freeze_window_seconds" => "accountAutoFreezeWindowSeconds",
         "account_warmup_enabled" => "accountWarmupEnabled",
         "account_warmup_model" => "accountWarmupModel",
+        "reset_credit_lead_minutes" => "resetCreditLeadMinutes",
+        "reset_credit_max_weekly_remaining_percent" => "resetCreditMaxWeeklyRemainingPercent",
         "account_warmup_schedule_time" => "accountWarmupScheduleTime",
         "audit_retention_days" => "auditRetentionDays",
         "concurrency_wait_timeout_seconds" => "concurrencyWaitTimeoutSeconds",
@@ -835,7 +865,6 @@ fn settings_validation_error(field: &'static str) -> WireValidationError {
         "ops_event_retention_days" => "opsEventRetentionDays",
         "refresh_concurrency" => "refreshConcurrency",
         "refresh_margin_seconds" => "refreshMarginSeconds",
-        "request_interval_ms" => "requestIntervalMs",
         "request_location" => "requestLocation",
         "request_location_enabled" => "requestLocationEnabled",
         "responses_max_decompressed_body_bytes" => "responsesMaxDecompressedBodyBytes",

@@ -5,6 +5,13 @@ sqlx 在服务启动、监听请求之前按编号执行迁移，并把文件 ch
 
 迁移按递增编号组织，完整清单以本目录 SQL 文件和 `.frozen-sha256` 为准
 
+## 命名约定
+
+- 表名使用小写 `snake_case`，实体集合使用复数，配置与单例状态使用自然语义，如 `runtime_settings`、`request_analytics_build_state`
+- 业务归属使用领域前缀，同一实体统一使用 `client_api_key`、`account_group`、`provider` 等术语，不添加 `tbl_` 等对象类型前缀
+- 统计时间粒度使用 `15m`、`1h`、`1d`；只保存计数的表保留 `_counts` 后缀
+- 表名调整时同步查询、函数体及所属索引和约束名称，已冻结迁移仍保持原样
+
 ## 冻结规则
 
 - 同一大版本内，已合入 main 的迁移文件**按字节永久冻结**，包括注释和空白。schema 变更及错误修正都须新增编号迁移，使用 `alter` 或回填补偿；修改原文件会导致已部署实例重启时 checksum 失配，且没有自动恢复路径
@@ -41,7 +48,8 @@ export CPR_TEST_REDIS_URL='redis://:<password>@127.0.0.1:6379'
 PostgreSQL 的临时 schema 测试连接使用异步提交，保留事务可见性、回滚和完整迁移检查
 需要验证数据库崩溃后的持久性时，使用独立数据库与生产连接配置，不复用这类 fixture
 
-运行包含 `StoreBundle` 初始化的完整集成测试时，两条测试 URL 都须包含密码，且密码满足 Store
-启动配置的 48 位十六进制要求；仅能连接数据库并不代表该初始化合同通过。专用服务使用对应测试密码，
+运行包含 `StoreBundle` 初始化的完整集成测试时，两条测试 URL 都须包含密码，原始密码须满足
+[Store 密码要求](../../deploy/README.md#手动安装)，在测试 URL 中按 URL 规则编码。
+仅能连接数据库并不代表该初始化合同通过。专用服务使用对应测试密码，
 并在测试进程中清除 `CPR_DATABASE_URL`、`CPR_REDIS_URL`、`CPR_DATABASE_PASSWORD` 和
 `CPR_REDIS_PASSWORD`，避免启动配置被部署环境覆盖

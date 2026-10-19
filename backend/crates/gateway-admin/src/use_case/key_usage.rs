@@ -14,9 +14,7 @@ use crate::{
             KeyUsageOverview, KeyUsageQuery, KeyUsageRecordKind, KeyUsageRecords,
             KeyUsageRecordsQuery,
         },
-        observability::{
-            Granularity, OpsErrorFilter, OpsErrorQuery, TimeRange, UsageFilter, UsageQuery,
-        },
+        observability::{Granularity, TimeRange, UsageFilter, UsageQuery, UsageRecordStatus},
         system::SystemVersion,
     },
     ports::store::{ClientKeyStore, ObservabilityStore},
@@ -192,10 +190,12 @@ impl KeyUsageService for DefaultKeyUsageService {
                 .ok_or_else(|| AdminError::internal("时间超出支持范围"))?,
             end: now,
         };
-        let (overview, trend, health_points) = futures::try_join!(
-            self.observations.usage_summary(query.range, filter.clone()),
-            self.observations
-                .usage_trend(query.range, filter, Granularity::for_range(query.range)),
+        let (observation, health_points) = futures::try_join!(
+            self.observations.usage_insights_observation(
+                query.range,
+                filter,
+                Granularity::for_range(query.range)
+            ),
             self.observations.usage_trend(
                 today,
                 usage_filter(&id, None),
@@ -205,8 +205,8 @@ impl KeyUsageService for DefaultKeyUsageService {
         .map_err(|error| map_store_error(error, "key usage overview"))?;
         Ok(Some(KeyUsageOverview {
             key,
-            overview,
-            trend,
+            overview: observation.overview,
+            trend: observation.trend,
             health_timeline: health_timeline_at(&health_points, now, self.timezone)?,
         }))
     }
@@ -219,34 +219,21 @@ impl KeyUsageService for DefaultKeyUsageService {
         let Some(id) = self.key_id(session_id).await? else {
             return Ok(None);
         };
-        let result = match query.kind {
-            KeyUsageRecordKind::Success => KeyUsageRecords::Success(
-                self.observations
-                    .list_usage_records(UsageQuery {
-                        range: query.usage.range,
-                        filter: usage_filter(&id, query.usage.model),
-                        current_page: query.current_page,
-                        page_size: query.page_size,
-                    })
-                    .await
-                    .map_err(|error| map_store_error(error, "key usage records"))?,
-            ),
-            KeyUsageRecordKind::Error => KeyUsageRecords::Error(
-                self.observations
-                    .list_ops_errors(OpsErrorQuery {
-                        range: query.usage.range,
-                        filter: OpsErrorFilter {
-                            client_api_key_ref: Some(id.as_str().to_owned()),
-                            model: query.usage.model,
-                            ..OpsErrorFilter::default()
-                        },
-                        current_page: query.current_page,
-                        page_size: query.page_size,
-                    })
-                    .await
-                    .map_err(|error| map_store_error(error, "key usage errors"))?,
-            ),
-        };
+        let result = self
+            .observations
+            .list_usage_records(UsageQuery {
+                status: match query.kind {
+                    KeyUsageRecordKind::Success => UsageRecordStatus::Success,
+                    KeyUsageRecordKind::Error => UsageRecordStatus::Error,
+                    KeyUsageRecordKind::All => UsageRecordStatus::All,
+                },
+                range: query.usage.range,
+                filter: usage_filter(&id, query.usage.model),
+                current_page: query.current_page,
+                page_size: query.page_size,
+            })
+            .await
+            .map_err(|error| map_store_error(error, "key usage records"))?;
         Ok(Some(result))
     }
 }

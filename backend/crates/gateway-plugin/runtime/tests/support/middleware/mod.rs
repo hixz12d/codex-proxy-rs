@@ -1,6 +1,7 @@
 //! 中间件测试插件子进程入口及异常退出清理辅助
 
 mod http_resources;
+mod usage_data;
 
 use gateway_plugin_sdk::{
     Capability, ContributionDeclaration, Contributions, Stage,
@@ -25,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Capability::Middleware,
             ContributionDeclaration {
                 id: "test.example.middleware".into(),
-                version: 4,
+                version: 5,
                 stages: vec![
                     Stage::Http,
                     Stage::WebSocket,
@@ -54,6 +55,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 async move {
                     use std::io::Write as _;
                     let context = call.context().clone();
+                    let request = context.request.as_ref().expect("entry request snapshot");
+                    assert_eq!(request.method, "POST");
+                    assert_eq!(request.uri, "/v1/responses?fixture=1");
+                    assert_eq!(request.http_version, "HTTP/2.0");
+                    assert_eq!(request.peer_addr.as_deref(), Some("192.0.2.1:42000"));
+                    assert_eq!(request.client_ip.as_deref(), Some("203.0.113.7"));
+                    assert_eq!(request.headers.len(), 2);
+                    assert_eq!(request.headers[1].value, b"two");
                     let record = |phase| {
                         let mut file = std::fs::OpenOptions::new()
                             .create(true)
@@ -79,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             id: "test.example.middleware".into(),
             version: configuration["middleware_version"]
                 .as_u64()
-                .unwrap_or(4)
+                .unwrap_or(5)
                 .try_into()?,
             stages: vec![if configuration["service"] == true {
                 Stage::Service
@@ -179,6 +188,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ));
                     }
                     use gateway_plugin_sdk::{call::services::settings, client::ServiceResponse};
+                    if mode == "usage_data" && call.is::<settings::ApiKeyExists>() {
+                        return usage_data::exercise(call).await;
+                    }
                     if call.is::<settings::ApiKeyExists>() && mode == "recover" {
                         return ServiceResponse::from_result::<settings::ApiKeyExists>(Ok(true));
                     }
@@ -189,13 +201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut output = call.next.run(()).await.unwrap();
                         assert_eq!(output.config_revision, nested.config_revision);
                         if mode == "rewrite" {
-                            output.request_interval_ms = 4321;
+                            output.refresh_margin_seconds = 4321;
                         }
                         return ServiceResponse::from_result::<settings::Load>(Ok(output));
                     }
                     if call.is::<settings::Replace>() {
                         let mut call = call.into_typed::<settings::Replace>()?;
-                        call.input.1.request_interval_ms = 1234;
+                        call.input.1.refresh_margin_seconds = 1234;
                         return ServiceResponse::from_result::<settings::Replace>(
                             call.next.run(call.input).await,
                         );
@@ -311,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             assert!(call.request.settings["min_codex_cli_version"].is_null());
                             call.request.settings["min_codex_cli_version"] =
                                 serde_json::json!("0.40.0");
-                            call.request.settings["request_interval_ms"] = serde_json::json!(0);
+                            call.request.settings["max_account_rotations"] = serde_json::json!(0);
                         } else {
                             assert_eq!(call.request.timeout_ms, Some(90_000));
                             assert_eq!(
@@ -330,6 +342,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 serde_json::json!(8192);
                         }
                         return call.host.dispatch_http(call.request).await;
+                    }
+                    if mode == "session-error" || mode == "session-cancelled" {
+                        use gateway_plugin_sdk::{ErrorCode, PluginFault};
+                        let code = if mode == "session-error" {
+                            ErrorCode::PermissionDenied
+                        } else {
+                            ErrorCode::Cancelled
+                        };
+                        return call
+                            .upgrade(vec!["test-session".into()], move |_session| async move {
+                                Err(PluginFault::new(
+                                    code,
+                                    "private-plugin-error-must-not-be-logged",
+                                ))
+                            })
+                            .await;
                     }
                     if mode == "callbacks" {
                         let host = call.host.clone();

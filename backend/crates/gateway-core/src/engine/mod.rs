@@ -3,11 +3,13 @@
 pub mod admission;
 pub mod authentication;
 pub mod budget;
+pub mod client_retry;
 pub mod connection;
 pub mod continuation;
 pub mod coordinator;
 pub mod execution;
 pub mod extensions;
+mod image_generation;
 pub mod middleware;
 pub mod nested;
 pub mod observation;
@@ -36,7 +38,9 @@ use crate::account::{
     ProviderAccountId,
 };
 use crate::engine::continuation::{ContinuationBinding, NativeContinuationPin};
-use crate::error::{GatewayError, ProviderConnectionObservation, ProviderError, StoreError};
+use crate::error::{
+    GatewayError, ProviderConnectionObservation, ProviderError, ProviderErrorKind, StoreError,
+};
 use crate::event::ProviderEvent;
 use crate::identity::ProviderKind;
 use crate::lifecycle::CancellationToken;
@@ -282,6 +286,7 @@ impl ContinuationAttempt {
 /// Provider 每次执行可见的 request-local context
 #[derive(Debug, Clone)]
 pub struct RequestAttemptContext {
+    lease_metadata: Option<Arc<crate::provider_ports::ProviderLeaseMetadata>>,
     response_control: Option<response_control::ResponseControl>,
     pricing: Arc<crate::metering::PricingOverrides>,
     request_profile: Option<crate::account::OpaqueProviderData>,
@@ -306,6 +311,15 @@ pub struct RequestAttemptContext {
 }
 
 impl RequestAttemptContext {
+    #[must_use]
+    pub fn with_lease_metadata(
+        mut self,
+        metadata: Arc<crate::provider_ports::ProviderLeaseMetadata>,
+    ) -> Self {
+        self.lease_metadata = Some(metadata);
+        self
+    }
+
     #[must_use]
     pub fn with_requested_model(mut self, model: Option<PublicModelId>) -> Self {
         self.requested_model = model;
@@ -373,6 +387,7 @@ impl RequestAttemptContext {
     pub fn new(request_id: ModelRequestId, client_api_key_ref: ClientApiKeyId) -> Self {
         Self {
             response_control: None,
+            lease_metadata: None,
             request_id,
             client_api_key_ref,
             request_profile: None,
@@ -528,6 +543,11 @@ pub struct AttemptContext {
 
 impl AttemptContext {
     #[must_use]
+    pub fn lease_metadata(&self) -> Option<Arc<crate::provider_ports::ProviderLeaseMetadata>> {
+        self.request.lease_metadata.clone()
+    }
+
+    #[must_use]
     pub fn execution_effects(&self) -> Option<Arc<nested::ExecutionEffects>> {
         self.request.execution_effects.as_ref().map(Arc::clone)
     }
@@ -557,6 +577,12 @@ impl AttemptContext {
     #[must_use]
     pub const fn client_transport(&self) -> execution::ClientTransport {
         self.request.client_transport
+    }
+
+    /// 原生响应可交付可替换前导事件；中间件可能改变其输出语义
+    #[must_use]
+    pub fn allows_replayable_prelude(&self) -> bool {
+        self.request.middleware.is_none()
     }
 
     #[must_use]
@@ -681,6 +707,26 @@ impl AttemptContext {
         account_id: ProviderAccountId,
         terminal: provider::ProviderMiddlewareTerminal,
     ) -> Result<provider::ProviderStream, ProviderError> {
+        // 入口已校验原请求，此处复查中间件最终提交的 operation，每次重试均生效
+        let terminal: provider::ProviderMiddlewareTerminal = if self
+            .account_scope()
+            .is_some_and(|scope| !scope.allows_image_generation())
+        {
+            Box::new(move |operation, headers| {
+                Box::pin(async move {
+                    image_generation::check_image_generation(false, &operation).map_err(|_| {
+                        ProviderError::new(
+                            ProviderErrorKind::RequestPolicyDenied,
+                            UpstreamSendState::NotSent,
+                        )
+                        .with_retry_prohibited()
+                    })?;
+                    terminal(operation, headers).await
+                })
+            })
+        } else {
+            terminal
+        };
         let context = middleware::MiddlewareContext::new(
             middleware::MiddlewareTarget {
                 request_id: self.request.request_id.clone(),
@@ -799,7 +845,7 @@ impl AttemptContext {
         provider: &ProviderKind,
         model: Option<&str>,
         candidates: &'a [AccountCandidate],
-        context: &AccountSelectionContext,
+        context: &mut AccountSelectionContext,
     ) -> Result<Option<AccountSelection<'a>>, policy::AccountPolicyError> {
         match self.request.request_policy() {
             Some(policy) => {
@@ -815,8 +861,8 @@ impl AttemptContext {
 /// 创建唯一 `model_requests` 行所需的入口事实
 #[derive(Debug, Clone)]
 pub struct NewModelRequest {
+    pub client_api_key_name_snapshot: Option<String>,
     pub id: ModelRequestId,
-    pub client_api_key_id: Option<ClientApiKeyId>,
     pub client_api_key_ref: ClientApiKeyId,
     pub config_revision: ConfigRevision,
     pub routing: crate::routing::AccountRoutingSnapshot,
@@ -844,11 +890,11 @@ pub struct NewModelRequest {
 /// 每次真实上游发送前对同一 `model_requests` 行的更新
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptRecord {
+    pub account_snapshot: Option<crate::account::AccountHistorySnapshot>,
     pub request_id: ModelRequestId,
     pub attempt_count: NonZeroU32,
     pub trigger: AttemptTrigger,
     pub provider_kind: ProviderKind,
-    pub provider_account_id: Option<ProviderAccountId>,
     pub provider_account_ref: Option<ProviderAccountId>,
     pub upstream_model_id: Option<UpstreamModelId>,
     pub upstream_transport: String,
@@ -863,6 +909,7 @@ pub struct AttemptRecord {
 /// 需要解释换号的中间失败
 #[derive(Debug)]
 pub struct IntermediateFailure {
+    pub account_snapshot: Option<crate::account::AccountHistorySnapshot>,
     pub request_id: ModelRequestId,
     pub attempt_index: NonZeroU32,
     pub trigger: AttemptTrigger,
@@ -908,10 +955,6 @@ pub struct ModelRequestTimings {
     pub upstream_response_ms: Option<u64>,
     pub upstream_api_overhead_ms: Option<f64>,
     pub upstream_engine_ms: Option<f64>,
-    pub upstream_engine_iapi_ttft_ms: Option<f64>,
-    pub upstream_engine_service_ttft_ms: Option<f64>,
-    pub upstream_engine_iapi_tbt_ms: Option<f64>,
-    pub upstream_engine_service_tbt_ms: Option<f64>,
     pub latency_ms: Option<u64>,
 }
 
@@ -1114,12 +1157,26 @@ pub enum EngineError {
 pub struct GatewayEngine<S: ?Sized> {
     store: Arc<S>,
     providers: provider::ProviderRegistry,
+    client_retry: Option<Arc<dyn client_retry::ClientRetryStore>>,
 }
 
 impl<S: ?Sized> GatewayEngine<S> {
     #[must_use]
     pub const fn new(store: Arc<S>, providers: provider::ProviderRegistry) -> Self {
-        Self { store, providers }
+        Self {
+            store,
+            providers,
+            client_retry: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_client_retry_store(
+        mut self,
+        store: Arc<dyn client_retry::ClientRetryStore>,
+    ) -> Self {
+        self.client_retry = Some(store);
+        self
     }
 
     #[must_use]

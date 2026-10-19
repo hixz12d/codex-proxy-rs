@@ -5,7 +5,7 @@ import { ZNotification } from '@codex-proxy/ui'
 import { cloneDeep, isEqual } from 'es-toolkit'
 
 import { computed, reactive, ref, shallowRef } from 'vue'
-import { getSettings, updateSettings } from '@/api'
+import { detectRequestLocation, getSettings, updateSettings } from '@/api'
 import { ApiError } from '@/api/request'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { normalizeRequestLocation, requestLocationError } from '@/utils/location'
@@ -19,6 +19,8 @@ export function useSettingsForm() {
   const loading = shallowRef(true)
   const saveAction = useAsyncAction()
   const saving = saveAction.loading
+  const locationAction = useAsyncAction()
+  const detectingLocation = locationAction.loading
   const error = shallowRef('')
   const mappings = ref<Array<{ requestedModel: string, upstreamModel: string }>>([])
   const smartSchedulingDefaults = shallowRef<SmartSchedulingConfig>()
@@ -36,7 +38,6 @@ export function useSettingsForm() {
     openaiAccountAffinity: '' as AccountAffinity | '',
     maxAccountRotations: null as number | null,
     openaiSessionAffinityTtlHours: null as number | null,
-    requestIntervalMs: null as number | null,
     maxWaitingPerKey: null as number | null,
     maxWaitingPerAccount: null as number | null,
     concurrencyWaitTimeoutSeconds: null as number | null,
@@ -45,7 +46,7 @@ export function useSettingsForm() {
     rotationStrategy: '' as RotationStrategy | '',
     minCodexDesktopVersion: '',
     minCodexCliVersion: '',
-    usageRetentionDays: 31,
+    usageRetentionDays: 31 as number | null,
     opsEventRetentionDays: 30,
     auditRetentionDays: 90,
 
@@ -59,6 +60,8 @@ export function useSettingsForm() {
     accountWarmupEnabled: false,
     accountWarmupScheduleTime: '08:00',
     accountWarmupModel: '',
+    resetCreditLeadMinutes: 10 as number | null,
+    resetCreditMaxWeeklyRemainingPercent: null as number | null,
   })
 
   function snapshot() {
@@ -70,14 +73,14 @@ export function useSettingsForm() {
     && !isEqual({ form, mappings: mappings.value }, saved.value))
 
   function resetSettings() {
-    if (!saved.value || saving.value)
+    if (!saved.value || saving.value || detectingLocation.value)
       return
     const initial = cloneDeep(saved.value)
     Object.assign(form, initial.form)
     mappings.value = initial.mappings
   }
 
-  function numericModel(key: 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'openaiGuardianReservedConcurrency' | 'maxAccountRotations' | 'openaiSessionAffinityTtlHours' | 'requestIntervalMs' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'responsesMaxDecompressedBodyMiB' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds') {
+  function numericModel(key: 'resetCreditMaxWeeklyRemainingPercent' | 'resetCreditLeadMinutes' | 'refreshMarginSeconds' | 'refreshConcurrency' | 'maxConcurrentPerAccount' | 'openaiGuardianReservedConcurrency' | 'maxAccountRotations' | 'openaiSessionAffinityTtlHours' | 'maxWaitingPerKey' | 'maxWaitingPerAccount' | 'concurrencyWaitTimeoutSeconds' | 'responsesMaxDecompressedBodyMiB' | 'usageRetentionDays' | 'accountAutoFreezeThreshold' | 'accountAutoFreezeWindowSeconds' | 'accountAutoFreezeDurationSeconds') {
     return computed({
       get: () => (form[key] === null ? '' : String(form[key])),
       set: (value: string) => {
@@ -97,10 +100,12 @@ export function useSettingsForm() {
   const openaiGuardianReservedConcurrencyValue = numericModel('openaiGuardianReservedConcurrency')
   const maxAccountRotationsValue = numericModel('maxAccountRotations')
   const openaiSessionAffinityTtlHoursValue = numericModel('openaiSessionAffinityTtlHours')
-  const requestIntervalMsValue = numericModel('requestIntervalMs')
   const maxWaitingPerKeyValue = numericModel('maxWaitingPerKey')
   const maxWaitingPerAccountValue = numericModel('maxWaitingPerAccount')
   const responsesMaxDecompressedBodyMiBValue = numericModel('responsesMaxDecompressedBodyMiB')
+  const resetCreditLeadMinutesValue = numericModel('resetCreditLeadMinutes')
+  const resetCreditMaxWeeklyRemainingPercentValue = numericModel('resetCreditMaxWeeklyRemainingPercent')
+  const usageRetentionDaysValue = numericModel('usageRetentionDays')
   const concurrencyWaitTimeoutSecondsValue = numericModel('concurrencyWaitTimeoutSeconds')
   const accountAutoFreezeThresholdValue = numericModel('accountAutoFreezeThreshold')
   const accountAutoFreezeWindowSecondsValue = numericModel('accountAutoFreezeWindowSeconds')
@@ -126,7 +131,6 @@ export function useSettingsForm() {
     form.openaiAccountAffinity = data.openaiAccountAffinity
     form.maxAccountRotations = data.maxAccountRotations
     form.openaiSessionAffinityTtlHours = data.openaiSessionAffinityTtlHours
-    form.requestIntervalMs = data.requestIntervalMs
     form.maxWaitingPerKey = data.maxWaitingPerKey
     form.maxWaitingPerAccount = data.maxWaitingPerAccount
     form.concurrencyWaitTimeoutSeconds = data.concurrencyWaitTimeoutSeconds
@@ -151,6 +155,8 @@ export function useSettingsForm() {
     form.accountWarmupEnabled = data.accountWarmupEnabled
     form.accountWarmupScheduleTime = data.accountWarmupScheduleTime ?? '08:00'
     form.accountWarmupModel = data.accountWarmupModel ?? ''
+    form.resetCreditLeadMinutes = data.resetCreditLeadMinutes
+    form.resetCreditMaxWeeklyRemainingPercent = data.resetCreditMaxWeeklyRemainingPercent
     mappings.value = Object.entries(data.modelMappings).map(([requestedModel, upstreamModel]) => ({
       requestedModel,
       upstreamModel,
@@ -159,6 +165,8 @@ export function useSettingsForm() {
   }
 
   async function loadSettings(silent = false) {
+    if (detectingLocation.value)
+      return
     loading.value = true
     error.value = ''
     try {
@@ -170,6 +178,25 @@ export function useSettingsForm() {
     finally {
       loading.value = false
     }
+  }
+
+  async function detectLocation() {
+    if (saving.value || loading.value || error.value)
+      return
+    await locationAction.run(async () => {
+      const result = await detectRequestLocation()
+      if (result.status === 'detected') {
+        form.requestLocation = { ...result.location }
+        form.requestLocationEnabled = true
+        ZNotification.success({ message: '已填入出口位置' })
+      }
+      else if (result.status === 'conflict') {
+        ZNotification.warning({ message: 'IPv4 与 IPv6 出口时区不一致，请手动填写' })
+      }
+      else {
+        ZNotification.warning({ message: result.status === 'failed' ? result.message : '未获取到出口位置' })
+      }
+    })
   }
 
   function addMapping() {
@@ -209,10 +236,10 @@ export function useSettingsForm() {
     if (!smartScheduling)
       return
     const savedSettings = saved.value
-    if (saving.value || loading.value || !savedSettings)
+    if (saving.value || loading.value || detectingLocation.value || !savedSettings)
       return
-    const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, openaiGuardianReservedConcurrency, openaiAccountAffinity, maxAccountRotations, openaiSessionAffinityTtlHours, requestIntervalMs, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, responsesMaxDecompressedBodyMiB, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
-    if (!openaiAccountAffinity || maxAccountRotations === null || openaiSessionAffinityTtlHours === null || refreshMarginSeconds === null || refreshConcurrency === null || maxConcurrentPerAccount === null || openaiGuardianReservedConcurrency === null || requestIntervalMs === null || !rotationStrategy || maxWaitingPerKey === null || maxWaitingPerAccount === null || concurrencyWaitTimeoutSeconds === null) {
+    const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, openaiGuardianReservedConcurrency, openaiAccountAffinity, maxAccountRotations, openaiSessionAffinityTtlHours, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, responsesMaxDecompressedBodyMiB, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
+    if (!openaiAccountAffinity || maxAccountRotations === null || openaiSessionAffinityTtlHours === null || refreshMarginSeconds === null || refreshConcurrency === null || maxConcurrentPerAccount === null || openaiGuardianReservedConcurrency === null || !rotationStrategy || maxWaitingPerKey === null || maxWaitingPerAccount === null || concurrencyWaitTimeoutSeconds === null) {
       ZNotification.warning({ message: '请完整填写并发、队列、凭据刷新参数和调度策略' })
       return
     }
@@ -235,6 +262,21 @@ export function useSettingsForm() {
     if (responsesMaxDecompressedBodyMiB === null || !Number.isInteger(responsesMaxDecompressedBodyMiB) || responsesMaxDecompressedBodyMiB < 1
       || !Number.isSafeInteger(responsesMaxDecompressedBodyMiB * MIB)) {
       ZNotification.warning({ message: 'Responses 解压上限应为有效的正整数（MiB）' })
+      return
+    }
+    const resetCreditMaxWeeklyRemainingPercent = form.resetCreditMaxWeeklyRemainingPercent
+    if (resetCreditMaxWeeklyRemainingPercent !== null && (!Number.isInteger(resetCreditMaxWeeklyRemainingPercent) || resetCreditMaxWeeklyRemainingPercent < 0 || resetCreditMaxWeeklyRemainingPercent > 100)) {
+      ZNotification.warning({ message: '剩余周额度上限应为 0～100 的整数，留空表示不限制' })
+      return
+    }
+    const resetCreditLeadMinutes = form.resetCreditLeadMinutes
+    if (resetCreditLeadMinutes === null || !Number.isInteger(resetCreditLeadMinutes) || resetCreditLeadMinutes < 1 || resetCreditLeadMinutes > 1440) {
+      ZNotification.warning({ message: '重置卡提前使用时间应为 1～1440 分钟的整数' })
+      return
+    }
+    const usageRetentionDays = form.usageRetentionDays
+    if (usageRetentionDays === null || !Number.isInteger(usageRetentionDays) || usageRetentionDays < 1 || usageRetentionDays > 31) {
+      ZNotification.warning({ message: '历史保留天数应为 1–31 的整数' })
       return
     }
     if (![maxWaitingPerKey, maxWaitingPerAccount].every(value => Number.isInteger(value) && value >= 0 && value <= 1000)
@@ -303,7 +345,6 @@ export function useSettingsForm() {
         openaiAccountAffinity,
         maxAccountRotations,
         openaiSessionAffinityTtlHours,
-        requestIntervalMs,
         maxWaitingPerKey,
         maxWaitingPerAccount,
         concurrencyWaitTimeoutSeconds,
@@ -312,7 +353,7 @@ export function useSettingsForm() {
         smartScheduling: { ...smartScheduling },
         minCodexDesktopVersion: form.minCodexDesktopVersion.trim() || null,
         minCodexCliVersion: form.minCodexCliVersion.trim() || null,
-        usageRetentionDays: form.usageRetentionDays,
+        usageRetentionDays,
         opsEventRetentionDays: form.opsEventRetentionDays,
         auditRetentionDays: form.auditRetentionDays,
         accountAutoFreezeEnabled: form.accountAutoFreezeEnabled,
@@ -325,6 +366,8 @@ export function useSettingsForm() {
         accountWarmupEnabled: form.accountWarmupEnabled,
         accountWarmupScheduleTime: scheduleTime,
         accountWarmupModel: warmupModel || null,
+        resetCreditLeadMinutes,
+        resetCreditMaxWeeklyRemainingPercent,
       })
       applySettings(result)
       ZNotification.success({ message: '设置已保存' })
@@ -339,6 +382,8 @@ export function useSettingsForm() {
   return {
     loading,
     saving,
+    detectingLocation,
+    detectLocation,
     hasChanges,
     resetSettings,
     error,
@@ -354,11 +399,13 @@ export function useSettingsForm() {
     openaiGuardianReservedConcurrencyValue,
     maxAccountRotationsValue,
     openaiSessionAffinityTtlHoursValue,
-    requestIntervalMsValue,
     maxWaitingPerKeyValue,
     maxWaitingPerAccountValue,
     concurrencyWaitTimeoutSecondsValue,
     responsesMaxDecompressedBodyMiBValue,
+    usageRetentionDaysValue,
+    resetCreditLeadMinutesValue,
+    resetCreditMaxWeeklyRemainingPercentValue,
     accountAutoFreezeThresholdValue,
     accountAutoFreezeWindowSecondsValue,
     accountAutoFreezeDurationSecondsValue,

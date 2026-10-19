@@ -64,8 +64,8 @@ export interface AccountModelUsage {
   inputTokensDisplay: string
   outputTokens: number | null
   outputTokensDisplay: string
-  cachedTokens: number | null
-  cachedTokensDisplay: string
+  cachedInputTokens: number | null
+  cachedInputTokensDisplay: string
   imageInputTokens: number | null
   imageInputTokensDisplay: string
   imageOutputTokens: number | null
@@ -96,10 +96,10 @@ export interface AccountUsage {
   inputTokensDisplay: string
   outputTokens: number | null
   outputTokensDisplay: string
-  cachedTokens: number | null
-  cachedTokensDisplay: string
-  reasoningTokens: number | null
-  reasoningTokensDisplay: string
+  cachedInputTokens: number | null
+  cachedInputTokensDisplay: string
+  reasoningOutputTokens: number | null
+  reasoningOutputTokensDisplay: string
   imageInputTokens: number | null
   imageInputTokensDisplay: string
   imageOutputTokens: number | null
@@ -110,10 +110,8 @@ export interface AccountUsage {
   imageRequestFailedCountDisplay: string
   totalTokens: number | null
   totalTokensDisplay: string
-  createdTokens: number | null
-  createdTokensDisplay: string
-  readTokens: number | null
-  readTokensDisplay: string
+  cacheWriteInputTokens: number | null
+  cacheWriteInputTokensDisplay: string
   lastUsedAt: string | null
   lastUsedAtDisplay: string
   lastUsedAtFullDisplay: string | null
@@ -453,7 +451,7 @@ export interface AccountImportSettings {
   groupIds: string[]
 }
 
-export interface AccountImportItem {
+export interface AccountImportParam {
   outboundProxyId?: string
   settings?: AccountImportSettings
   provider: string
@@ -466,7 +464,7 @@ interface AccountImportTaskIdParam {
 
 interface CreateAccountImportTaskParam {
   submissionId: string
-  items: AccountImportItem[]
+  items: AccountImportParam[]
 }
 
 interface AccountOAuthStartParam {
@@ -489,6 +487,30 @@ interface AccountExportParam {
   confirm: string
 }
 
+interface AccountExportResponse {
+  exportedAt: string
+  fileName: string
+  documents: unknown[]
+}
+
+interface AccountImportTaskListResponse {
+  items: AccountImportTask[]
+}
+
+interface AccountDetailResponse {
+  account: Account
+  credentialConfiguration?: Record<string, unknown>
+}
+
+interface AccountResetCreditAutomationParam extends AccountIdParam {
+  enabled: boolean
+}
+
+interface AccountConcurrencyParams extends AccountIdParam {
+  page: number
+  pageSize: number
+}
+
 export function getAccounts(data: AccountListParams, options: RequestOptions = {}) {
   return request<AccountListResponse>({
     url: '/api/admin/accounts',
@@ -499,7 +521,7 @@ export function getAccounts(data: AccountListParams, options: RequestOptions = {
 }
 
 export function exportAccounts(data: AccountExportParam) {
-  return request<{ exportedAt: string, fileName: string, documents: unknown[] }>({
+  return request<AccountExportResponse>({
     url: '/api/admin/accounts/export',
     method: 'GET',
     params: data,
@@ -777,7 +799,7 @@ export function refreshAccountModels(data: AccountIdParam, options: RequestOptio
   })
 }
 
-export function importAccounts(data: AccountImportItem, options: RequestOptions = {}) {
+export function importAccounts(data: AccountImportParam, options: RequestOptions = {}) {
   return request<AccountImportResponse>({
     url: '/api/admin/accounts/import',
     method: 'POST',
@@ -795,7 +817,7 @@ export function createAccountImportTask(data: CreateAccountImportTaskParam) {
 }
 
 export function getAccountImportTasks(options: RequestOptions = {}) {
-  return request<{ items: AccountImportTask[] }>({
+  return request<AccountImportTaskListResponse>({
     url: '/api/admin/accounts/import-tasks',
     method: 'GET',
     ...options,
@@ -873,8 +895,64 @@ export interface ApiKeyConfiguration {
 }
 
 export function getAccountDetail(data: AccountIdParam, options: RequestOptions = {}) {
-  return request<{ account: Account, credentialConfiguration?: Record<string, unknown> }>({
+  return request<AccountDetailResponse>({
     url: '/api/admin/accounts/detail',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export interface AccountResetCreditAutomation {
+  enabled: boolean
+  leadMinutes: number
+  nextDiscoveryAtDisplay: string | null
+  nextConsumeAtDisplay: string | null
+  lastResult: string | null
+}
+
+export function getAccountResetCreditAutomation(data: AccountIdParam, options: RequestOptions = {}) {
+  return request<AccountResetCreditAutomation>({
+    url: '/api/admin/accounts/reset-credits/automation',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function setAccountResetCreditAutomation(data: AccountResetCreditAutomationParam, options: RequestOptions = {}) {
+  return request<AccountResetCreditAutomation>({
+    url: '/api/admin/accounts/reset-credits/automation',
+    method: 'POST',
+    data,
+    ...options,
+  })
+}
+
+export interface AccountConcurrencyEntry {
+  leaseId: string
+  requestId: string | null
+  clientKeyId: string | null
+  clientKeyName: string | null
+  model: string | null
+  clientIp: string | null
+  startedAt: string | null
+  startedAtDisplay: string | null
+  occupiedMs: number | null
+}
+
+export interface AccountConcurrencyPage {
+  accountId: string
+  entries: AccountConcurrencyEntry[]
+  total: number
+  page: number
+  pageSize: number
+  observedAt: string
+}
+
+export function getAccountConcurrency(data: AccountConcurrencyParams, options: RequestOptions = {}) {
+  return request<AccountConcurrencyPage>({
+    url: '/api/admin/accounts/concurrency',
     method: 'GET',
     params: data,
     ...options,

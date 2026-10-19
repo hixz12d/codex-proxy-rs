@@ -403,10 +403,38 @@ pub struct GenerateRequest {
 
 #[derive(Clone, PartialEq)]
 struct GeneratePayload {
+    source_image_generation: bool,
     protocol_payload: ProtocolPayload,
+    client_turn: Option<ClientTurn>,
     provider_session_state: Option<ProviderSessionState>,
     source_requirements: Option<CapabilityRequirements>,
     inherited_capability_requirements: Option<CapabilityRequirements>,
+}
+
+/// 协议入口确认的客户端推理轮次，不使用连接路由键猜测身份
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientTurn {
+    thread_id: String,
+    turn_id: String,
+}
+
+impl ClientTurn {
+    pub fn new(thread_id: String, turn_id: String) -> Option<Self> {
+        if [thread_id.as_str(), turn_id.as_str()].iter().any(|value| {
+            value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+        }) {
+            return None;
+        }
+        Some(Self { thread_id, turn_id })
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
 }
 
 impl GenerateRequest {
@@ -418,7 +446,9 @@ impl GenerateRequest {
     pub fn from_protocol_payload(protocol_payload: ProtocolPayload) -> Self {
         Self {
             payload: Arc::new(GeneratePayload {
+                source_image_generation: false,
                 protocol_payload,
+                client_turn: None,
                 provider_session_state: None,
                 source_requirements: None,
                 inherited_capability_requirements: None,
@@ -426,27 +456,14 @@ impl GenerateRequest {
         }
     }
 
-    /// 写回原生 Provider 编码结果，保留已准入的能力、连接上下文和会话状态
-    ///
-    /// 原生编码不消耗中间件的一次跨协议改写额度：可以保留协议名，也可以在一次
-    /// 中间件改写后编码到 Provider wire
-    /// 调用方仍须验证保护字段没有被改动
-    ///
-    /// # Errors
-    ///
-    /// 目标协议名无效时返回错误
-    pub fn with_native_encoded_body(
-        mut self,
-        protocol: impl Into<String>,
-        body: Map<String, Value>,
-    ) -> Result<Self, OperationError> {
-        let encoded = ProtocolPayload::json_object(protocol, body)?
-            .with_context(self.protocol_payload().context().clone());
-        let requirements = self.requirements();
-        let payload = Arc::make_mut(&mut self.payload);
-        payload.protocol_payload = encoded;
-        payload.source_requirements = Some(requirements);
-        Ok(self)
+    #[must_use]
+    pub fn with_client_turn(mut self, client_turn: Option<ClientTurn>) -> Self {
+        Arc::make_mut(&mut self.payload).client_turn = client_turn;
+        self
+    }
+
+    pub fn client_turn(&self) -> Option<&ClientTurn> {
+        self.payload.client_turn.as_ref()
     }
 
     /// 附着同一客户端连接上一轮由 Provider 返回的不透明状态
@@ -491,14 +508,9 @@ impl GenerateRequest {
     /// 返回客户端是否请求了图片生成工具
     #[must_use]
     pub fn image_generation_requested(&self) -> bool {
-        self.body()
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| {
-                tools.iter().any(|tool| {
-                    tool.get("type").and_then(Value::as_str) == Some("image_generation")
-                })
-            })
+        self.payload.source_image_generation
+            || (self.protocol_payload().protocol() == "openai"
+                && requests_image_generation(self.body()))
     }
 
     /// 返回指定 Provider 的连接内会话状态
@@ -595,6 +607,35 @@ fn contains_type(value: Option<&Value>, expected: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// 原生工具声明授权上游生成图片，Codex 的被动 namespace 与图片输入不属于该权限
+fn requests_image_generation(body: &Map<String, Value>) -> bool {
+    contains_image_tool(body.get("tools"))
+        || body
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                        && contains_image_tool(item.get("tools"))
+                })
+            })
+        || body.get("tool_choice").is_some_and(|choice| {
+            is_image_tool(choice)
+                || (choice.get("type").and_then(Value::as_str) == Some("allowed_tools")
+                    && contains_image_tool(choice.get("tools")))
+        })
+}
+
+fn contains_image_tool(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(is_image_tool))
+}
+
+fn is_image_tool(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("image_generation")
 }
 
 /// 图像 API 的稳定端点语义
@@ -951,41 +992,6 @@ impl Operation {
         self.replace_protocol_wire_inner(None, body, context)
     }
 
-    /// 替换 Provider HTTP 正文、非 wire 上下文和已解析 headers，同时保持 endpoint、
-    /// method 与 query 不变
-    /// headers 继续由 [`ProviderHttpRequest::new`] 统一验证；
-    /// Core 不解析插件传输使用的 base64 表示
-    ///
-    /// # Errors
-    ///
-    /// 当前 operation 不是 Provider HTTP，或替换后的 headers 超出请求边界时返回错误
-    pub fn replace_provider_http_wire(
-        self,
-        body: Option<Bytes>,
-        context: Map<String, Value>,
-        headers: Vec<ProviderHttpHeader>,
-    ) -> Result<Self, OperationError> {
-        let Self::ProviderHttp(request) = self else {
-            return Err(OperationError::EmptyField {
-                field: "provider_http_request",
-            });
-        };
-        let payload = request.payload;
-        ProviderHttpRequest::new(
-            request.endpoint,
-            request.method,
-            request.query,
-            headers,
-            RawHttpPayload {
-                protocol: payload.protocol,
-                body: body.unwrap_or(payload.body),
-                context,
-                translated: payload.translated,
-            },
-        )
-        .map(Self::ProviderHttp)
-    }
-
     /// 把一次已选择的协议转换结果写回 operation，同时保留非 wire 上下文和
     /// Provider 会话状态
     /// 该方法只验证公共载荷形状，不解释目标协议字段
@@ -1040,6 +1046,7 @@ impl Operation {
             Self::Generate(request) => {
                 let protocol_payload = request.protocol_payload();
                 let source_requirements = translating.then(|| request.requirements());
+                let source_image_generation = translating && request.image_generation_requested();
                 let body = match body {
                     Some(body) => {
                         serde_json::from_slice::<Map<String, Value>>(&body).map_err(|_| {
@@ -1058,6 +1065,8 @@ impl Operation {
                 };
                 let mut payload = (*request.payload).clone();
                 payload.protocol_payload = replacement;
+                // 跨协议转换不能抹去已识别的生图权限要求，也不解释目标私有协议
+                payload.source_image_generation |= source_image_generation;
                 if let Some(requirements) = source_requirements {
                     payload.source_requirements = Some(requirements);
                 }

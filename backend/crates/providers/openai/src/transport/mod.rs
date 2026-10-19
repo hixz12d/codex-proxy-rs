@@ -1,5 +1,6 @@
 //! Codex HTTP/SSE/WebSocket 上游 transport
 
+mod automatic_context;
 pub mod canonical;
 pub mod catalog;
 pub mod client;

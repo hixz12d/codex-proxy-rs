@@ -665,6 +665,7 @@ async fn select_grok_session(
         Arc::clone(candidate.account_scope()),
         context.client_api_key_ref().clone(),
     )
+    .with_lease_metadata(context.lease_metadata())
     .with_cancellation(context.cancellation().clone())
     .with_concurrency_wait_budget(context.concurrency_wait_budget().clone())
     .with_request_policy(
@@ -720,6 +721,7 @@ fn provider_call_metadata(
         selected.account_id().clone(),
         UpstreamTransport::new(HTTP_SSE_TRANSPORT).map_err(|_| protocol_not_sent())?,
     )
+    .with_account_snapshot(selected.account_snapshot().cloned())
     .with_selection_observation(ProviderSelectionObservation::new(
         account_selection_wait_ms,
         selected.capacity_snapshot(),

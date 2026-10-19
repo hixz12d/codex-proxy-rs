@@ -29,6 +29,10 @@ where
             get(usage_insights_diagnostics::<S>),
         )
         .route("/api/admin/operations/errors", get(ops_errors::<S>))
+        .route(
+            "/api/admin/diagnostics/export",
+            get(super::export::download::<S>),
+        )
 }
 
 pub(crate) async fn dashboard_summary<S>(
@@ -151,7 +155,7 @@ where
         state.admin_services().timezone(),
     )
     .map_err(map_wire_error)?;
-    let filter = usage_filter(&query).map_err(map_wire_error)?;
+    let filter = analytics_filter(&query).map_err(map_wire_error)?;
     let result = state
         .admin_services()
         .observability()
@@ -160,7 +164,10 @@ where
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(usage_summary_view(result)),
+        AdminEnvelope::ok(usage_summary_view(
+            result,
+            crate::time::TimePresenter::new(state.admin_services().timezone()),
+        )),
     ))
 }
 
@@ -181,7 +188,7 @@ where
         state.admin_services().timezone(),
     )
     .map_err(map_wire_error)?;
-    let filter = usage_filter(&query).map_err(map_wire_error)?;
+    let filter = analytics_filter(&query).map_err(map_wire_error)?;
     let result = state
         .admin_services()
         .observability()
@@ -215,7 +222,6 @@ where
         provider_kind: non_empty(query.provider),
         model: non_empty(query.model),
         status_code: parse_status(query.status_code).map_err(map_wire_error)?,
-        search: non_empty(query.search),
         ..domain::UsageFilter::default()
     };
     let result = state
@@ -226,7 +232,11 @@ where
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(diagnostics_view(result, dimension)),
+        AdminEnvelope::ok(diagnostics_view(
+            result,
+            dimension,
+            crate::time::TimePresenter::new(state.admin_services().timezone()),
+        )),
     ))
 }
 

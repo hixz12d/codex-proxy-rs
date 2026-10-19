@@ -20,25 +20,29 @@ pub enum WorkerKind {
     RuntimeSnapshotReconciliation,
     RuntimeChangeSubscription,
     StaleModelRequestRecovery,
+    RequestAnalytics,
     Retention,
     OpsFlush,
     Backup,
     AccountImport,
     AccountFreezeRecovery,
+    ResetCreditAutomation,
 }
 
 impl WorkerKind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::OAuthRefresh,
         Self::QuotaCatalogHealth,
         Self::RuntimeSnapshotReconciliation,
         Self::RuntimeChangeSubscription,
         Self::StaleModelRequestRecovery,
+        Self::RequestAnalytics,
         Self::Retention,
         Self::OpsFlush,
         Self::Backup,
         Self::AccountImport,
         Self::AccountFreezeRecovery,
+        Self::ResetCreditAutomation,
     ];
 
     #[must_use]
@@ -48,12 +52,14 @@ impl WorkerKind {
             Self::QuotaCatalogHealth => "quota_catalog_health",
             Self::RuntimeSnapshotReconciliation => "runtime_snapshot_reconciliation",
             Self::RuntimeChangeSubscription => "runtime_change_subscription",
+            Self::RequestAnalytics => "request_analytics",
             Self::StaleModelRequestRecovery => "stale_model_request_recovery",
             Self::Retention => "retention",
             Self::OpsFlush => "ops_flush",
             Self::Backup => "backup",
             Self::AccountImport => "account_import",
             Self::AccountFreezeRecovery => "account_freeze_recovery",
+            Self::ResetCreditAutomation => "reset_credit_automation",
         }
     }
 }

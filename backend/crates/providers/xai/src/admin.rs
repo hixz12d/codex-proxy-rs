@@ -459,7 +459,7 @@ impl ProviderAdmin for XaiAdminProvider {
             &input.upstream_model_id,
             input_tokens,
             output_tokens,
-            input.cached_tokens.unwrap_or_default(),
+            input.cached_input_tokens.unwrap_or_default(),
             input.service_tier.as_deref(),
         ) else {
             return Ok(None);
@@ -488,6 +488,35 @@ impl ProviderAdmin for XaiAdminProvider {
             service_tier: breakdown.service_tier().map(str::to_owned),
             multiplier_percent: breakdown.multiplier_percent(),
         }))
+    }
+
+    fn evaluate_usage_pricing(
+        &self,
+        input: &gateway_admin::ports::provider::ProviderUsagePricingInput,
+        pricing: Option<&gateway_core::metering::ModelPriceOverride>,
+    ) -> Result<Option<gateway_core::metering::CalculatedCostBreakdown>, ProviderAdminError> {
+        let (Some(input_tokens), Some(output_tokens), Some(cached), Some(written)) = (
+            input.usage.input_tokens,
+            input.usage.output_tokens,
+            input.usage.cached_input_tokens,
+            input.usage.cache_write_input_tokens,
+        ) else {
+            return Ok(None);
+        };
+        if input.usage.image_input_tokens != Some(0) || input.usage.image_output_tokens != Some(0) {
+            return Ok(None);
+        }
+        Ok(
+            crate::transport::canonical::grok_billing_breakdown_with_override(
+                &input.upstream_model_id,
+                input_tokens,
+                output_tokens,
+                cached,
+                written,
+                input.service_tier.as_deref(),
+                pricing,
+            ),
+        )
     }
 
     async fn prepare_import(
@@ -1120,6 +1149,7 @@ fn account_from_record(account: &AccountRecord) -> Result<ProviderAccount, Provi
         account.access_token_expires_at.map(SystemTime::from),
     )
     .with_outbound_proxy(account.outbound_proxy.clone())
+    .with_notes(account.notes.clone())
     .with_profile(
         account.email.clone(),
         account.upstream_account_id.clone(),

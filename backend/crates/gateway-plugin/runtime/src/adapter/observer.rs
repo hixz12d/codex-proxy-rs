@@ -61,8 +61,9 @@ impl ObserverEntry {
     ) {
         let request_id = event.request_id();
         let mut context = self.session.context(Stage::Observation, timeout);
+        context.request = crate::adapter::request_context(extensions.request());
         context.request_id = Some(request_id.to_owned());
-        let Ok(_scope) = self.callbacks.prepare_observation(&context, extensions) else {
+        let Ok(_scope) = self.callbacks.prepare_extensions(&context, extensions) else {
             return;
         };
         let Ok(params) = serde_json::to_value(&event) else {
@@ -73,30 +74,12 @@ impl ObserverEntry {
             );
             return;
         };
-        match self
+        if let Err(error) = self
             .session
             .call("observer.observe", context, params, payload)
             .await
         {
-            Ok(reply)
-                if reply.payload.is_empty()
-                    && (reply.result.is_null()
-                        || reply
-                            .result
-                            .as_object()
-                            .is_some_and(serde_json::Map::is_empty)) => {}
-            Ok(_) => {
-                self.session.invalid_response(Stage::Observation);
-                tracing::warn!(
-                    plugin_id = self.plugin_id,
-                    instance_id = self.instance_id,
-                    request_id,
-                    "插件观察返回了无效结果"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(plugin_id = self.plugin_id, instance_id = self.instance_id, request_id, %error, "插件观察失败")
-            }
+            tracing::warn!(plugin_id = self.plugin_id, instance_id = self.instance_id, request_id, %error, "插件观察失败")
         }
     }
 }
@@ -495,9 +478,9 @@ fn wire_observation(observation: &RequestObservation) -> RequestCompleted {
             RequestUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
-                cached_tokens: usage.cached_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
+                cached_tokens: usage.cached_input_tokens,
+                cache_write_tokens: usage.cache_write_input_tokens,
+                reasoning_tokens: usage.reasoning_output_tokens,
                 image_input_tokens: usage.image_input_tokens,
                 image_output_tokens: usage.image_output_tokens,
                 total_tokens: usage.total_tokens,
@@ -560,10 +543,6 @@ fn wire_timings(observation: &RequestObservation) -> RequestTimings {
         upstream_response_ms: timings.upstream_response_ms,
         upstream_api_overhead_ms: timings.upstream_api_overhead_ms,
         upstream_engine_ms: timings.upstream_engine_ms,
-        upstream_engine_iapi_ttft_ms: timings.upstream_engine_iapi_ttft_ms,
-        upstream_engine_service_ttft_ms: timings.upstream_engine_service_ttft_ms,
-        upstream_engine_iapi_tbt_ms: timings.upstream_engine_iapi_tbt_ms,
-        upstream_engine_service_tbt_ms: timings.upstream_engine_service_tbt_ms,
         latency_ms: timings.latency_ms,
     }
 }

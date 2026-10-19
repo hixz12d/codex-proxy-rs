@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use super::client_retry::{ClientRetryGuard, ClientRetryKey};
 use super::nested::ExecutionEffects;
 use super::observation::{
     RequestObservationDispatch, ResponseObservation, WebSocketResponseAttempt,
@@ -219,7 +220,7 @@ where
 
     /// 对固定账号执行诊断请求
     ///
-    /// 仅跳过该账号的本地可用性投影；账号租约、并发和请求间隔仍必须满足
+    /// 仅跳过该账号的本地可用性投影；账号租约和并发仍必须满足
     pub async fn start_diagnostic(
         &self,
         request: NewModelRequest,
@@ -293,6 +294,20 @@ where
                 "admissionMs": request.admission_decision_ms,
                 "continuation": format!("{continuation_attempt:?}"),
                 "candidateCount": plan.candidates().len(),
+                "accountPolicy": {
+                    "strategy": plan.account_selection_policy().strategy().as_str(),
+                    "affinity": plan.account_selection_policy().openai_account_affinity().as_str(),
+                    "maxAccountRotations": plan.account_selection_policy().max_account_rotations(),
+                    "maxRoutingAttempts": plan.max_attempts().get(),
+                    "maxConcurrentPerAccount": plan.account_selection_policy().max_concurrent_per_account().get(),
+                    "queueMaxWaiting": plan.account_selection_policy().queue_policy().max_waiting,
+                    "queueTimeoutMs": plan.account_selection_policy().queue_policy().timeout.as_millis(),
+                    "sessionAffinityTtlMs": plan.account_selection_policy().openai_session_affinity_ttl().as_millis(),
+                    "smartWeights": plan.account_selection_policy().smart_scheduling().weights(),
+                },
+                "requiredAccount": account_selection.required_account().map(|account| account.as_str()),
+                "hasMiddleware": middleware.is_some(),
+                "hasRetryPolicy": request_policy.is_some(),
             }),
         );
         let image_generation_requested = operation.image_generation_requested();
@@ -307,11 +322,23 @@ where
             request_observation,
             budget_prior_attempts_usd: Decimal::ZERO,
             budget_attempt_already_counted: false,
+            response_commit: super::execution::ResponseCommit::new(trace.clone()),
             trace,
             deadline,
             deadline_timer: deadline.wait().fuse(),
             lease: Some(self.engine.store.maintain_request(&request.id, deadline)),
             requested_model: request.requested_model.clone(),
+            lease_metadata: Arc::new(crate::provider_ports::ProviderLeaseMetadata {
+                request_id: request.id.as_str().to_owned(),
+                client_key_id: request.client_api_key_ref.clone(),
+                client_key_name: request.client_api_key_name_snapshot.clone(),
+                model: request
+                    .requested_model
+                    .as_ref()
+                    .map(|model| model.as_str().to_owned()),
+                client_ip: request.client_ip,
+                started_at: request.started_at,
+            }),
             pending_request: Some(request),
             request_persisted: false,
             response_control,
@@ -345,7 +372,8 @@ where
             request_profiles: BTreeMap::new(),
             current: None,
             send_state_watermark: UpstreamSendState::NotSent,
-            downstream_committed_at: None,
+            delivery_committed: false,
+            replay_barrier_reached: false,
             client_status_code: None,
             delivery_pending: false,
             upstream_complete: false,
@@ -356,6 +384,7 @@ where
             last_retryable_failure_events: Vec::new(),
             last_observed_provider: None,
             pending_terminal_failure: None,
+            client_retry: None,
         };
 
         if session.cancellation.is_cancelled() {
@@ -365,6 +394,26 @@ where
         if deadline.is_elapsed() {
             session.finish_interruption(&EngineError::Deadline).await?;
             return Err(EngineError::Deadline);
+        }
+        if !session.account_selection.is_diagnostic()
+            && let Some(store) = &self.engine.client_retry
+            && let Operation::Generate(generate) = &session.operation
+            && let Some(turn) = generate.client_turn()
+        {
+            let guard = ClientRetryGuard::load(
+                Arc::clone(store),
+                ClientRetryKey {
+                    client_key_id: session.client_api_key_ref.clone(),
+                    turn: turn.clone(),
+                },
+                session.request_id.clone(),
+            )
+            .await;
+            session.trace.record(
+                "client_retry.loaded",
+                json!({"previousFailure": guard.has_failure()}),
+            );
+            session.client_retry = Some(guard);
         }
         Ok(session)
     }
@@ -431,6 +480,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     lease: Option<Box<dyn LeaseGuard>>,
     /// 会话级 deadline 计时器；deadline 固定，帧循环内复用而非逐事件新建
     deadline_timer: Fuse<BoxFuture<'static, ()>>,
+    lease_metadata: Arc<crate::provider_ports::ProviderLeaseMetadata>,
     pending_request: Option<NewModelRequest>,
     requested_model: Option<crate::routing::PublicModelId>,
     request_persisted: bool,
@@ -482,7 +532,11 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     current: Option<CurrentAttempt>,
     /// 请求级发送状态水位；跨 attempt 单调不降，终态写回不得低于此档
     send_state_watermark: UpstreamSendState,
-    downstream_committed_at: Option<SystemTime>,
+    response_commit: super::execution::ResponseCommit,
+    // 传输心跳可先于首个业务批次提交，两者不能共用重放屏障
+    delivery_committed: bool,
+    /// 已交付的实际输出禁止重放，可替换前导事件不跨越此屏障
+    replay_barrier_reached: bool,
     client_status_code: Option<u16>,
     delivery_pending: bool,
     upstream_complete: bool,
@@ -496,6 +550,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     last_observed_provider: Option<crate::identity::ProviderKind>,
     /// 原子失败批次已交给协议层、但尚待下游提交后收敛的原 Provider 错误
     pending_terminal_failure: Option<PendingTerminalFailure>,
+    client_retry: Option<ClientRetryGuard>,
 }
 
 struct PendingTerminalFailure {
@@ -516,6 +571,11 @@ where
     pub(crate) fn with_concurrency_wait_budget(mut self, budget: ConcurrencyWaitBudget) -> Self {
         self.concurrency_wait_budget = budget;
         self
+    }
+
+    /// 传输首字节事实可在 next_event 等待期间由协议层提交
+    pub fn response_commit(&self) -> super::execution::ResponseCommit {
+        self.response_commit.clone()
     }
 
     /// 当前请求共享的诊断上下文
@@ -548,7 +608,9 @@ where
         loop {
             match self.pull().await? {
                 PullOutcome::Events(events) => {
-                    let requirement = if self.downstream_committed_at.is_some() {
+                    self.replay_barrier_reached |= self.middleware.is_some()
+                        || events.iter().any(|event| !event.is_replayable_prelude());
+                    let requirement = if self.delivery_committed {
                         CommitRequirement::AlreadyCommitted
                     } else {
                         self.delivery_pending = true;
@@ -562,18 +624,20 @@ where
                     error,
                     send_state,
                 } => {
-                    let requirement = if self.downstream_committed_at.is_some() {
+                    self.record_client_retry_failure(&error).await;
+                    let requirement = if self.delivery_committed {
                         CommitRequirement::AlreadyCommitted
                     } else {
                         self.delivery_pending = true;
                         CommitRequirement::CommitBeforeDelivery
                     };
+                    self.replay_barrier_reached = true;
                     self.pending_terminal_failure =
                         Some(PendingTerminalFailure { error, send_state });
                     return CoordinatedEvent::try_batch(events, requirement).map(Some);
                 }
                 PullOutcome::End => {
-                    if self.downstream_committed_at.is_some() {
+                    if self.delivery_committed {
                         self.finish_success().await?;
                     }
                     return Ok(None);
@@ -589,7 +653,7 @@ where
     /// 会话已提交、已有待提交结果或执行失败时返回错误
     pub async fn collect_uncommitted(&mut self) -> Result<Vec<ProviderEvent>, EngineError> {
         self.resume_finalization().await;
-        if self.downstream_committed_at.is_some() || self.delivery_pending {
+        if self.delivery_committed || self.delivery_pending {
             return Err(EngineError::InvalidDeliveryState);
         }
         if self.is_finalized() {
@@ -628,14 +692,15 @@ where
         &mut self,
         client_status_code: Option<u16>,
     ) -> Result<(), EngineError> {
-        if !self.delivery_pending || self.downstream_committed_at.is_some() || self.is_finalized() {
+        if !self.delivery_pending || self.delivery_committed || self.is_finalized() {
             return Err(EngineError::InvalidDeliveryState);
         }
-        let committed_at = SystemTime::now();
-        self.trace.record(
-            "downstream.committed",
-            json!({"status": client_status_code}),
-        );
+        self.response_commit.record(client_status_code);
+        let committed_at = self
+            .response_commit
+            .committed_at()
+            .ok_or(EngineError::InvalidDeliveryState)?;
+        let client_status_code = self.response_commit.status_code();
         if self.request_persisted {
             best_effort_store_write(
                 "mark_downstream_committed",
@@ -648,7 +713,7 @@ where
             )
             .await;
         }
-        self.downstream_committed_at = Some(committed_at);
+        self.delivery_committed = true;
         self.client_status_code = client_status_code;
         self.delivery_pending = false;
         if self.upstream_complete {
@@ -661,13 +726,14 @@ where
     /// 原始 Provider facts 已经观察，不回滚计量，也不把丢弃误记为客户端 commit
     pub fn discard_pending_delivery(&mut self) -> Result<(), EngineError> {
         if !self.delivery_pending
-            || self.downstream_committed_at.is_some()
+            || self.delivery_committed
             || self.pending_terminal_failure.is_some()
             || self.is_finalized()
         {
             return Err(EngineError::InvalidDeliveryState);
         }
         self.delivery_pending = false;
+        self.replay_barrier_reached = false;
         Ok(())
     }
 
@@ -683,7 +749,10 @@ where
         if self.client_status_code.is_some() {
             return Err(EngineError::InvalidDeliveryState);
         }
-        if self.request_persisted {
+        let committed_status = self.response_commit.status_code();
+        let client_status_code = committed_status.unwrap_or(client_status_code);
+        // 保活后的失败终结已写入实际 HTTP 状态，不能再触发仅补空值的 Store 更新
+        if self.request_persisted && !(self.is_finalized() && committed_status.is_some()) {
             best_effort_store_write(
                 "record_client_status",
                 &self.request_id,
@@ -893,7 +962,13 @@ where
                         .translate_native_response(event, terminal);
                     match translated {
                         Ok(events) if events.is_empty() => continue,
-                        Ok(events) => return Ok(PullOutcome::Events(events)),
+                        Ok(events) => {
+                            // 成功终态交付后客户端即可续发工具结果，不能等流 EOF 或异步观测再清理
+                            if terminal && let Some(guard) = &mut self.client_retry {
+                                guard.success().await;
+                            }
+                            return Ok(PullOutcome::Events(events));
+                        }
                         Err(error) => {
                             self.finish_provider_error(&error).await?;
                             return Err(provider_engine_error(error));
@@ -1040,6 +1115,7 @@ where
         }
         let context = AttemptContext::new(
             RequestAttemptContext::new(self.request_id.clone(), self.client_api_key_ref.clone())
+                .with_lease_metadata(Arc::clone(&self.lease_metadata))
                 .with_response_control(self.response_control.clone())
                 .with_request_profile(self.request_profiles.get(candidate.provider()).cloned())
                 .with_fast_mode(self.plan.fast_mode())
@@ -1151,6 +1227,17 @@ where
                             retry_allowed: continuation_retry || candidate_retry,
                         })
                         .await?;
+                    attempt_trace.record("retry.decided", json!({
+                        "phase": "prepare", "retryable": retryable,
+                        "continuationRetry": continuation_retry, "candidateRetry": candidate_retry,
+                        "retryProhibited": error.retry_is_prohibited(),
+                        "sendState": error.send_state().as_str(),
+                        "requestSendState": self.current_send_state().as_str(),
+                        "continuation": format!("{:?}", self.continuation_attempt),
+                        "accountRotations": self.account_rotations,
+                        "maxAccountRotations": self.plan.account_selection_policy().max_account_rotations(),
+                        "remainingRoutingAttempts": self.plan.max_attempts().get().saturating_sub(self.routing_attempts),
+                    }));
                     if retryable {
                         return Ok(Some(PullOutcome::AttemptDiscarded));
                     }
@@ -1158,6 +1245,7 @@ where
                         error.kind(),
                         ProviderErrorKind::AccountCapacityUnavailable
                             | ProviderErrorKind::NoEligibleAccount
+                            | ProviderErrorKind::SessionPolicyRestricted
                             | ProviderErrorKind::QuotaExhausted
                             | ProviderErrorKind::ConcurrencyQueueFull
                             | ProviderErrorKind::ConcurrencyQueueTimeout
@@ -1181,6 +1269,7 @@ where
                         error.kind(),
                         ProviderErrorKind::AccountCapacityUnavailable
                             | ProviderErrorKind::NoEligibleAccount
+                            | ProviderErrorKind::SessionPolicyRestricted
                             | ProviderErrorKind::QuotaExhausted
                             | ProviderErrorKind::ProviderInfrastructureUnavailable
                             | ProviderErrorKind::ConcurrencyQueueFull
@@ -1316,11 +1405,11 @@ where
             ));
         }
         let attempt_record = AttemptRecord {
+            account_snapshot: metadata.account_snapshot().cloned(),
             request_id: self.request_id.clone(),
             attempt_count: next_attempt,
             trigger,
             provider_kind: metadata.provider().clone(),
-            provider_account_id: Some(metadata.provider_account_id().clone()),
             provider_account_ref: Some(metadata.provider_account_id().clone()),
             upstream_model_id: metadata.upstream_model().cloned(),
             upstream_transport: metadata.transport().as_str().to_owned(),
@@ -1497,7 +1586,7 @@ where
         let account_rotation_retry = !execution_effect_observed
             && self.account_selection.required_account().is_none()
             && self.continuation_attempt == ContinuationAttempt::None
-            && self.downstream_committed_at.is_none()
+            && !self.replay_barrier_reached
             && !self.delivery_pending
             && attempt_send_state != UpstreamSendState::Ambiguous
             && matches!(
@@ -1517,7 +1606,7 @@ where
             Some(crate::error::PreDeliveryRetry::SameAccountConnectionRetry { transport })
                 if !execution_effect_observed
                     && !self.connection_budget.exhausted()
-                    && self.downstream_committed_at.is_none()
+                    && !self.replay_barrier_reached
                     && !self.delivery_pending
                     && attempt_send_state == UpstreamSendState::NotSent
                     && self.current_send_state() == UpstreamSendState::NotSent
@@ -1535,7 +1624,7 @@ where
                 delay,
             }) if !execution_effect_observed
                 && !self.connection_budget.exhausted()
-                && self.downstream_committed_at.is_none()
+                && !self.replay_barrier_reached
                 && !self.delivery_pending =>
             {
                 Some((AttemptTransport::Retry(retry_index), delay))
@@ -1543,7 +1632,7 @@ where
             Some(crate::error::PreDeliveryRetry::SameAccountTransportFallback)
                 if !execution_effect_observed
                     && !self.connection_budget.exhausted()
-                    && self.downstream_committed_at.is_none()
+                    && !self.replay_barrier_reached
                     && !self.delivery_pending =>
             {
                 Some((
@@ -1558,27 +1647,37 @@ where
             && !execution_effect_observed
             && self.account_selection.required_account().is_none()
             && self.continuation_attempt == ContinuationAttempt::None
-            && self.downstream_committed_at.is_none()
+            && !self.replay_barrier_reached
             && !self.delivery_pending
             && attempt_send_state != UpstreamSendState::Ambiguous
             && provider_proved_replay_safe
             && self.routing_attempts < self.plan.max_attempts().get();
+        let suppress_transient_retry = is_return_error_retry(&error)
+            && self
+                .client_retry
+                .as_ref()
+                .is_some_and(ClientRetryGuard::has_failure);
         let transient_retry = match error.pre_delivery_retry() {
             Some(crate::error::PreDeliveryRetry::SameAccountTransientRetry {
                 max_retries,
                 initial_delay,
                 max_delay,
-            }) if ordinary_retry => {
+                jitter,
+                ..
+            }) if ordinary_retry && !suppress_transient_retry => {
                 let retries = self
                     .transient_retry_counts
                     .entry(current.metadata.provider_account_id().clone())
                     .or_default();
                 if *retries < max_retries.get() {
                     let multiplier = 1_u32.checked_shl(*retries).unwrap_or(u32::MAX);
-                    // 服务器建议优先于本地退避，不能被本地上限缩短或再次指数放大
-                    let delay = error
-                        .retry_after()
-                        .unwrap_or_else(|| initial_delay.saturating_mul(multiplier).min(max_delay));
+                    // 服务器建议优先于本地退避，不截断、不放大，也不叠加随机等待
+                    let delay = error.retry_after().unwrap_or_else(|| {
+                        initial_delay
+                            .saturating_mul(multiplier)
+                            .min(max_delay)
+                            .saturating_add(jitter)
+                    });
                     *retries = retries.saturating_add(1);
                     Some(delay)
                 } else {
@@ -1590,7 +1689,7 @@ where
         let same_account_retry = !execution_effect_observed
             && error.retries_same_account()
             && provider_proved_replay_safe
-            && self.downstream_committed_at.is_none()
+            && !self.replay_barrier_reached
             && !self.delivery_pending
             && attempt_send_state != UpstreamSendState::Ambiguous
             && self.routing_attempts < self.plan.max_attempts().get()
@@ -1601,9 +1700,11 @@ where
         // 同一排除分支。换号预算只在这里消耗；同账号分支（瞬态退避、传输恢复、
         // 凭据恢复重放、continuation 精确重连）不消耗。不能直接把预算门写进
         // ordinary_retry：它是同账号瞬态退避的前置条件，会被连带误伤
+        // RetryThenReturnError 耗尽后直接交付错误，不能落入 ordinary_retry 的换号兜底
         let rotation_retry = !continuation_retry
             && !same_account_retry
             && transient_retry.is_none()
+            && !is_return_error_retry(&error)
             && transport_recovery.is_none()
             && (ordinary_retry || account_rotation_retry)
             && self.account_rotations
@@ -1645,17 +1746,31 @@ where
         };
 
         self.trace.attempt(current.index.get()).record("retry.decided", json!({
+            "phase": "execute",
             "retryable": retryable, "continuationRetry": continuation_retry,
             "sameAccountRetry": same_account_retry, "accountRotationRetry": account_rotation_retry,
             "ordinaryRetry": ordinary_retry, "transportRecovery": transport_recovery.is_some(),
             "transientRetry": transient_retry.is_some(),
+            "clientRetrySuppressed": suppress_transient_retry,
             "rotationRetry": rotation_retry, "accountRotations": self.account_rotations,
             "connectionRetry": connection_retry_requested,
             "connectionRetries": self.connection_retries,
             "connectionBudgetRemainingMs": self.connection_budget.remaining().map(duration_ms),
             "executionEffectObserved": execution_effect_observed,
             "delayMs": transient_retry.or(transport_recovery.map(|(_, delay)| delay)).map(duration_ms),
-            "downstreamCommitted": self.downstream_committed_at.is_some(),
+            "downstreamCommitted": self.response_commit.committed_at().is_some(),
+            "replayBarrierReached": self.replay_barrier_reached,
+            "deliveryPending": self.delivery_pending,
+            "providerProvedReplaySafe": provider_proved_replay_safe,
+            "retryProhibited": error.retry_is_prohibited(),
+            "requiredAccount": self.account_selection.required_account().map(|account| account.as_str()),
+            "continuation": format!("{:?}", self.continuation_attempt),
+            "connectionBudgetExhausted": self.connection_budget.exhausted(),
+            "remainingRoutingAttempts": self.plan.max_attempts().get().saturating_sub(self.routing_attempts),
+            "maxAccountRotations": self.plan.account_selection_policy().max_account_rotations(),
+            "transientRetriesUsed": self.transient_retry_counts.get(current.metadata.provider_account_id()).copied().unwrap_or_default(),
+            "credentialRecoveryAttempted": self.credential_recovery_attempted_accounts.contains(current.metadata.provider_account_id()),
+            "hasRetryPolicy": self.request_policy.is_some(),
             "sendState": format!("{attempt_send_state:?}"),
         }));
         if retryable {
@@ -1701,6 +1816,7 @@ where
                     self.engine
                         .store()
                         .record_intermediate_failure(IntermediateFailure {
+                            account_snapshot: current.metadata.account_snapshot().cloned(),
                             request_id: self.request_id.clone(),
                             attempt_index: current.index,
                             trigger: current.trigger,
@@ -1754,6 +1870,7 @@ where
             && !self.cancellation.is_cancelled()
             && !self.execution_effect_observed();
         let allowed = facts.retry_allowed;
+        let attempt_index = facts.attempt_index;
         let decision = {
             let cancellation = self.cancellation.clone();
             let cancelled = cancellation.cancelled().fuse();
@@ -1766,6 +1883,16 @@ where
                 decision = decision => Ok(decision),
             }
         }?;
+        self.trace.attempt(attempt_index.get()).record(
+            "retry.policy",
+            json!({
+                "hostAllowed": allowed,
+                "policyStopped": decision == super::policy::RetryDecision::Stop,
+                "executionEffectObserved": self.execution_effect_observed(),
+                "cancelled": self.cancellation.is_cancelled(),
+                "deadlineElapsed": self.deadline.is_elapsed(),
+            }),
+        );
         // 策略只收窄宿主已允许的恢复，返回后仍复核期限和外部副作用
         Ok(allowed
             && decision != super::policy::RetryDecision::Stop
@@ -1813,7 +1940,7 @@ where
     ) -> bool {
         if self.account_selection.required_account().is_some()
             || self.continuation_attempt == ContinuationAttempt::None
-            || self.downstream_committed_at.is_some()
+            || self.replay_barrier_reached
             || self.delivery_pending
             || send_state == UpstreamSendState::Ambiguous
             || !provider_proved_replay_safe
@@ -1927,6 +2054,9 @@ where
         if self.is_finalized() {
             return Ok(());
         }
+        if let Some(guard) = &mut self.client_retry {
+            guard.success().await;
+        }
         let completed_at = SystemTime::now();
         self.observation.finish();
         let upstream_request_id = self
@@ -1952,8 +2082,11 @@ where
             outcome: ExecutionOutcome::Succeeded,
             send_state: UpstreamSendState::Sent,
             attempt_count: self.attempts,
-            downstream_committed_at: self.downstream_committed_at,
-            client_status_code: self.client_status_code,
+            downstream_committed_at: self.response_commit.committed_at(),
+            client_status_code: self
+                .response_commit
+                .status_code()
+                .or(self.client_status_code),
             upstream_status_code,
             client_response_id: self.observation.client_response_id.clone(),
             upstream_request_id,
@@ -1998,10 +2131,11 @@ where
         error: &ProviderError,
         send_state: UpstreamSendState,
     ) -> Result<(), EngineError> {
+        self.record_client_retry_failure(error).await;
         let send_state = self.raise_send_watermark(send_state);
         let outcome = if error.kind() == ProviderErrorKind::Cancelled {
             ExecutionOutcome::Cancelled
-        } else if self.downstream_committed_at.is_some() {
+        } else if self.response_commit.committed_at().is_some() {
             ExecutionOutcome::Incomplete
         } else {
             ExecutionOutcome::Failed
@@ -2025,14 +2159,32 @@ where
         .await
     }
 
+    async fn record_client_retry_failure(&mut self, error: &ProviderError) {
+        // 只记录本策略的终态失败，不让其他错误改变客户端轮次的退避预算
+        if self.attempts > 0
+            && is_return_error_retry(error)
+            && let Some(guard) = &mut self.client_retry
+        {
+            guard.failure().await;
+        }
+    }
+
     async fn finish_interruption(&mut self, error: &EngineError) -> Result<(), EngineError> {
+        // 结算 I/O 可能继续等待，先冻结交付事实以保持终态与实际 HTTP 状态一致
+        self.response_commit.finish();
         let (outcome, gateway_error) = match error {
             EngineError::Cancelled => (
                 ExecutionOutcome::Cancelled,
-                GatewayError::new(GatewayErrorKind::Cancelled, "request was cancelled"),
+                GatewayError::new(
+                    GatewayErrorKind::Cancelled,
+                    self.cancellation
+                        .reason()
+                        .unwrap_or(crate::lifecycle::CancellationReason::Requested)
+                        .message(),
+                ),
             ),
             EngineError::Deadline => (
-                if self.downstream_committed_at.is_some() {
+                if self.response_commit.committed_at().is_some() {
                     ExecutionOutcome::Incomplete
                 } else {
                     ExecutionOutcome::Failed
@@ -2046,7 +2198,7 @@ where
         };
         let send_state = if self.attempts == 0 {
             UpstreamSendState::NotSent
-        } else if self.downstream_committed_at.is_some()
+        } else if self.delivery_committed
             || self
                 .current
                 .as_ref()
@@ -2117,8 +2269,11 @@ where
             outcome: finalization.outcome,
             send_state: finalization.send_state,
             attempt_count: self.attempts,
-            downstream_committed_at: self.downstream_committed_at,
-            client_status_code: self.client_status_code,
+            downstream_committed_at: self.response_commit.committed_at(),
+            client_status_code: self
+                .response_commit
+                .status_code()
+                .or(self.client_status_code),
             upstream_status_code: finalization.upstream_status_code.or(observed_status_code),
             client_response_id: self.observation.client_response_id.clone(),
             upstream_request_id: finalization.upstream_request_id.or(upstream_request_id),
@@ -2151,6 +2306,7 @@ where
     }
 
     async fn persist_finalization(&mut self, finalization: ModelRequestFinalization) {
+        self.response_commit.finish();
         self.finalized_at = Some(finalization.completed_at);
         let observed_provider = self
             .current
@@ -2305,6 +2461,16 @@ where
     fn record_provider_failure(&mut self, provider_kind: crate::identity::ProviderKind) {
         self.last_observed_provider = Some(provider_kind);
     }
+}
+
+fn is_return_error_retry(error: &ProviderError) -> bool {
+    matches!(
+        error.pre_delivery_retry(),
+        Some(crate::error::PreDeliveryRetry::SameAccountTransientRetry {
+            policy: crate::error::TransientRetryPolicy::RetryThenReturnError,
+            ..
+        })
+    )
 }
 
 async fn best_effort_store_write<T>(

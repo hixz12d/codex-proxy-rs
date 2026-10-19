@@ -30,8 +30,7 @@ use futures::future::BoxFuture;
 use gateway_admin::model::AdminError;
 use gateway_core::{account::OutboundProxy, lifecycle::CancellationToken};
 use gateway_host::outbound::{HttpClient, NetworkPolicy};
-use gateway_plugin_sdk::{CallContext, ErrorCode, PluginFault};
-use tokio::time::Instant;
+use gateway_plugin_sdk::{CallContext, ErrorCode, PluginFault, client::CallDeadline};
 
 use crate::{CallbackHandler, RpcReply};
 pub(crate) use accounts::PluginAccountPortSlot;
@@ -82,6 +81,7 @@ impl PluginCallbackPorts {
 
 pub(crate) struct PluginCallbacks {
     services: Arc<services::ServicePorts>,
+    service_actor: gateway_admin::model::usage_data::UsageActor,
     accounts: Arc<accounts::PluginAccounts>,
     resources: Arc<resources::PluginResources>,
     data: Arc<data::PluginData>,
@@ -109,6 +109,11 @@ impl PluginCallbacks {
     ) -> Result<Self, AdminError> {
         Ok(Self {
             services: ports.services,
+            service_actor: gateway_admin::model::usage_data::UsageActor::Plugin {
+                publisher: manifest.publisher.clone(),
+                name: manifest.name.clone(),
+                instance_id: instance.id.clone(),
+            },
             resources: Arc::new(resources::PluginResources::new(instance, ports.resources)),
             data: Arc::new(data::PluginData::new(
                 ports.accounts.clone(),
@@ -183,6 +188,7 @@ impl PluginCallbacks {
                 | gateway_plugin_sdk::Stage::Attempt
                 | gateway_plugin_sdk::Stage::Routing
                 | gateway_plugin_sdk::Stage::Scheduling
+                | gateway_plugin_sdk::Stage::Retry
         ) {
             return Err(denied());
         }
@@ -228,11 +234,15 @@ impl PluginCallbacks {
         &self,
         context: &CallContext,
         proxy: Option<OutboundProxy>,
+        request: Option<Arc<gateway_core::engine::extensions::RequestContext>>,
     ) -> Result<Arc<CallbackScope>, PluginFault> {
-        if !matches!(context.stage, gateway_plugin_sdk::Stage::Management) {
+        if !matches!(
+            context.stage,
+            gateway_plugin_sdk::Stage::Management | gateway_plugin_sdk::Stage::PublicManagement
+        ) {
             return Err(denied());
         }
-        self.prepare_scope(context, proxy)
+        self.prepare_scope(context, proxy, request)
     }
 
     pub(crate) fn prepare_command_line(
@@ -242,12 +252,13 @@ impl PluginCallbacks {
         if context.stage != gateway_plugin_sdk::Stage::CommandLine {
             return Err(denied());
         }
-        self.prepare_scope(context, None)
+        self.prepare_scope(context, None, None)
     }
 
     pub(crate) fn prepare_frontend_authentication(
         &self,
         context: &CallContext,
+        request: Option<Arc<gateway_core::engine::extensions::RequestContext>>,
     ) -> Result<Arc<CallbackScope>, PluginFault> {
         if context.stage != gateway_plugin_sdk::Stage::Authentication
             || context.account_id.is_some()
@@ -256,7 +267,7 @@ impl PluginCallbacks {
         {
             return Err(denied());
         }
-        self.prepare_scope(context, None)
+        self.prepare_scope(context, None, request)
     }
 
     pub(crate) async fn save_command_account(
@@ -275,11 +286,16 @@ impl PluginCallbacks {
         &self,
         context: &CallContext,
         proxy: Option<OutboundProxy>,
+        request: Option<Arc<gateway_core::engine::extensions::RequestContext>>,
     ) -> Result<Arc<CallbackScope>, PluginFault> {
-        self.register_scope(context, CallbackScope::new(context, proxy))
+        let mut scope = CallbackScope::new(context, proxy);
+        if let Some(request) = request {
+            scope.extension_scope = scope.extension_scope.with_request(request);
+        }
+        self.register_scope(context, scope)
     }
 
-    pub(crate) fn prepare_observation(
+    pub(crate) fn prepare_extensions(
         &self,
         context: &CallContext,
         extension_scope: gateway_core::engine::extensions::ExtensionCallScope,
@@ -329,7 +345,7 @@ impl PluginCallbacks {
 }
 
 impl CallbackHandler for PluginCallbacks {
-    fn begin(&self, context: &CallContext) {
+    fn begin(&self, context: &CallContext, deadline: &CallDeadline) {
         let scope = self
             .scopes
             .lock()
@@ -347,19 +363,8 @@ impl CallbackHandler for PluginCallbacks {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
                 context.call_id,
-                Arc::new(CallResources::new(context, scope, middleware)),
+                Arc::new(CallResources::new(context, deadline, scope, middleware)),
             );
-    }
-
-    fn streaming(&self, context: &CallContext) {
-        if let Some(call) = self
-            .calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&context.call_id)
-        {
-            call.set_streaming(context.resource_stream);
-        }
     }
 
     fn finish(&self, context: &CallContext) {
@@ -398,6 +403,7 @@ impl CallbackHandler for PluginCallbacks {
         let models = self.models.clone();
         let affinity = self.affinity.clone();
         let services = self.services.clone();
+        let service_actor = self.service_actor.clone();
         Box::pin(async move {
             let call = call.ok_or_else(denied)?;
             let scope = &call.scope;
@@ -406,7 +412,7 @@ impl CallbackHandler for PluginCallbacks {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.closed || (!state.resource_stream && Instant::now() >= call.deadline) {
+                if state.closed || call.deadline.is_elapsed() {
                     return Err(denied());
                 }
                 if method == "host.log" {
@@ -444,7 +450,7 @@ impl CallbackHandler for PluginCallbacks {
             }
             if method == gateway_plugin_sdk::call::services::CALL_METHOD {
                 return services
-                    .call(&context, scope, call.cancellation.clone(), params, &payload)
+                    .call(&context, &call, service_actor, params, &payload)
                     .await;
             }
             if is_private_state {

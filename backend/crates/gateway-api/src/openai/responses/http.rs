@@ -1,8 +1,10 @@
 //! OpenAI Responses HTTP 与 SSE adapter
 
+use crate::request_context::request_client_context;
+
 use std::collections::VecDeque;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ use axum::{
     extract::{Extension, State, connect_info::ConnectInfo},
     http::{
         HeaderMap, HeaderName, HeaderValue, StatusCode,
-        header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT},
+        header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     },
     response::Response,
 };
@@ -141,6 +143,7 @@ pub(crate) async fn execute_prepared_responses(
     let cancellation = prepared.cancellation();
     let started_request_id = Arc::new(OnceLock::new());
     let terminal_request_id = Arc::clone(&started_request_id);
+    let (admitted, keepalive) = tokio::sync::oneshot::channel();
     let mut middleware_headers = headers.clone();
     // 中间件正文已经由入口按上限解压；传输编码和旧长度不能与改写后的正文混用
     middleware_headers.remove(CONTENT_ENCODING);
@@ -213,37 +216,45 @@ pub(crate) async fn execute_prepared_responses(
                     .session
                     .trace()
                     .capture("client.request.body", &request_body);
+                let _ = admitted.send(started.session.response_commit());
                 execution_middleware_response(started, connection_guard, terminal_validation).await
             })
         }),
     );
-    let middleware = if let Some(authorization) = authorization.as_ref() {
-        match await_with_authorization(middleware, authorization, &cancellation).await {
-            Ok(result) => result,
-            Err(error) => Err(MiddlewareError::Gateway(error)),
+    let response = async move {
+        let middleware = if let Some(authorization) = authorization.as_ref() {
+            match await_with_authorization(middleware, authorization, &cancellation).await {
+                Ok(result) => result,
+                Err(error) => Err(MiddlewareError::Gateway(error)),
+            }
+        } else {
+            middleware.await
+        };
+        let expected = if stream {
+            ExpectedBody::Sse
+        } else {
+            ExpectedBody::SingleJson
+        };
+        match middleware {
+            Ok(response) => {
+                let response = if let Some(authorization) = authorization {
+                    authorized_middleware_response(response, authorization, cancellation)
+                } else {
+                    response
+                };
+                into_http_response(
+                    validated_middleware_response(response, validation, stream),
+                    expected,
+                )
+                .await
+            }
+            Err(error) => error_response(error),
         }
-    } else {
-        middleware.await
     };
-    let expected = if stream {
-        ExpectedBody::Sse
+    let response = if stream {
+        super::keepalive::response(response, keepalive).await
     } else {
-        ExpectedBody::SingleJson
-    };
-    let response = match middleware {
-        Ok(response) => {
-            let response = if let Some(authorization) = authorization {
-                authorized_middleware_response(response, authorization, cancellation)
-            } else {
-                response
-            };
-            into_http_response(
-                validated_middleware_response(response, validation, stream),
-                expected,
-            )
-            .await
-        }
-        Err(error) => error_response(error),
+        response.await
     };
     super::super::with_model_request_id(response, started_request_id.get().unwrap_or(&request_id))
 }
@@ -365,55 +376,6 @@ impl MiddlewareBody for AuthorizedResponseBody {
     }
 }
 
-/// 从 socket 与标准转发头提取旧 Usage 页面使用的诊断事实
-pub(crate) fn request_client_context(
-    headers: &HeaderMap,
-    peer_address: Option<SocketAddr>,
-) -> (Option<IpAddr>, Option<String>) {
-    let client_ip = ["cf-connecting-ip", "x-real-ip"]
-        .into_iter()
-        .find_map(|name| header_ip(headers, name))
-        .or_else(|| forwarded_client_ip(headers))
-        .or_else(|| peer_address.map(|address| address.ip()));
-    let user_agent = headers
-        .get(USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    (client_ip, user_agent)
-}
-
-fn header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .and_then(|value| value.parse().ok())
-}
-
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    let addresses = headers
-        .get("x-forwarded-for")?
-        .to_str()
-        .ok()?
-        .split(',')
-        .filter_map(|value| value.trim().parse::<IpAddr>().ok())
-        .collect::<Vec<_>>();
-    addresses
-        .iter()
-        .copied()
-        .find(|address| !is_private_or_loopback(*address))
-        .or_else(|| addresses.first().copied())
-}
-
-const fn is_private_or_loopback(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => address.is_private() || address.is_loopback(),
-        IpAddr::V6(address) => address.is_unique_local() || address.is_loopback(),
-    }
-}
-
 async fn execution_middleware_response(
     started: StartedExecution,
     connection_guard: Option<Box<dyn ConnectionGuard>>,
@@ -519,16 +481,24 @@ pub async fn stream_execution_response(
     session: Box<dyn ExecutionSession>,
     connection_guard: Option<Box<dyn ConnectionGuard>>,
 ) -> Response {
-    match streaming_execution_middleware_response(
-        session,
-        connection_guard,
-        ResponseValidationFacts::default(),
+    let (admitted, keepalive) = tokio::sync::oneshot::channel();
+    let _ = admitted.send(session.response_commit());
+    super::keepalive::response(
+        async move {
+            match streaming_execution_middleware_response(
+                session,
+                connection_guard,
+                ResponseValidationFacts::default(),
+            )
+            .await
+            {
+                Ok(response) => into_http_response(response, ExpectedBody::Sse).await,
+                Err(error) => error_response(error),
+            }
+        },
+        keepalive,
     )
     .await
-    {
-        Ok(response) => into_http_response(response, ExpectedBody::Sse).await,
-        Err(error) => error_response(error),
-    }
 }
 
 fn validated_middleware_response(

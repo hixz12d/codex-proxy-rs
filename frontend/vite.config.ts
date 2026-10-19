@@ -21,6 +21,7 @@ export default defineConfig(({ mode }) => {
         '/dev': {
           target: 'http://127.0.0.1:8080',
           changeOrigin: true,
+          cookiePathRewrite: { '/api/auth': '/dev/api/auth' },
           rewrite: path => path.replace(/^\/dev/, ''),
         },
       },
@@ -28,6 +29,7 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: sourceUi ? 'node_modules/.vite/source-dist' : 'dist',
       assetsDir: 'assets',
+      license: { fileName: 'THIRD_PARTY_LICENSES.md' },
       chunkSizeWarningLimit: 600,
       rolldownOptions: {
         checks: {

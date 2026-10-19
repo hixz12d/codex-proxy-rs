@@ -143,10 +143,11 @@ impl CodexBackendClient {
 
     pub(super) fn request_headers_for_http_response(
         &self,
+        profile: &CodexWireProfile,
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.response_headers(request, context)?;
+        let mut headers = self.response_headers(profile, request, context)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         insert_optional_protocol_header(
@@ -159,16 +160,11 @@ impl CodexBackendClient {
 
     pub(super) fn request_headers_for_websocket_response(
         &self,
+        profile: &CodexWireProfile,
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.response_headers(request, context)?;
-        if !headers.contains_key("x-responsesapi-include-timing-metrics") {
-            headers.insert(
-                HeaderName::from_static("x-responsesapi-include-timing-metrics"),
-                HeaderValue::from_static("true"),
-            );
-        }
+        let mut headers = self.response_headers(profile, request, context)?;
         headers.insert(
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses_websockets=2026-02-06"),
@@ -179,10 +175,11 @@ impl CodexBackendClient {
     /// HTTP 和 WS 共用的 Core 会话字段；传输专属字段由各自入口生成
     fn response_headers(
         &self,
+        profile: &CodexWireProfile,
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.model_request_headers(&self.profile.snapshot(), context)?;
+        let mut headers = self.model_request_headers(profile, context)?;
         headers.insert(
             HeaderName::from_static("x-client-request-id"),
             HeaderValue::from_str(context.request_id)?,

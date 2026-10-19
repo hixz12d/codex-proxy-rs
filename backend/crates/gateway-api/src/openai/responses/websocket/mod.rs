@@ -2,6 +2,7 @@
 
 pub mod connection;
 mod forward;
+mod interrupt;
 mod protocol;
 
 use std::{
@@ -42,8 +43,7 @@ use crate::{
 };
 
 use super::{
-    http::request_client_context, request::OpenAiRequestHeaders,
-    validation::ResponseValidationFacts,
+    request::OpenAiRequestHeaders, request_client_context, validation::ResponseValidationFacts,
 };
 use connection::{ConnectionEvent, FramePhase, ResponsesWebSocketConnection, WriteContext};
 use forward::{

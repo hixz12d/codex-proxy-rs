@@ -9,6 +9,10 @@ export interface PrivacyRule {
   id: string
   name: string
   enabled: boolean
+  steps: PrivacyStep[]
+}
+
+export interface PrivacyStep {
   scope: PrivacyScope
   selector: string
   action: PrivacyAction
@@ -36,7 +40,11 @@ export interface PrivacyPreviewResult extends PrivacySample {
   outcomes: { ruleId: string, matches: number, status: string, reason: string | null }[]
 }
 
-export function previewPrivacyPolicy(data: PrivacySample & { policy: CodexPrivacyPolicy }, options: RequestOptions = {}) {
+interface PrivacyPreviewParam extends PrivacySample {
+  policy: CodexPrivacyPolicy
+}
+
+export function previewPrivacyPolicy(data: PrivacyPreviewParam, options: RequestOptions = {}) {
   return request<PrivacyPreviewResult>({
     url: '/api/admin/settings/privacy/preview',
     method: 'POST',

@@ -14,11 +14,12 @@ use crate::{
     CallContext, ErrorCode, Frame, FrameError, Handshake, Message, PROTOCOL_VERSION, PluginFault,
 };
 
-use super::super::frame::{read_frame, validate_frame, write_frame};
+use super::super::frame::{EncodedFrame, read_frame, write_frame};
 use super::{
-    CallCancellation, HostClient, PluginCall, PluginHandler, SessionConfig, SessionError,
+    CallCancellation, CallDeadline, HostClient, PluginCall, PluginHandler, SessionConfig,
+    SessionError,
     credit::CreditWindow,
-    lifecycle::{CancellationSource, LifecycleHooks, wait_deadline},
+    lifecycle::{CancellationSource, LifecycleHooks},
     output::{Output, writer_loop},
     registry::CallbackRegistry,
     stream::validate_stream_chunk,
@@ -90,6 +91,7 @@ where
             .config
             .maximum_calls
             .checked_add(self.config.maximum_callbacks)
+            .and_then(|capacity| capacity.checked_add(self.config.maximum_calls))
             .ok_or(SessionError::Configuration)?;
         let control_reserve = self
             .config
@@ -104,7 +106,10 @@ where
             sender: outbound,
             data_slots: Arc::new(Semaphore::new(data_capacity)),
         };
-        let callbacks = Arc::new(CallbackRegistry::new(self.config.maximum_callbacks));
+        let callbacks = Arc::new(CallbackRegistry::new(
+            self.config.maximum_callbacks,
+            self.config.maximum_calls,
+        ));
         let handler: Arc<dyn PluginHandler> = Arc::new(handler);
         let lifecycle = LifecycleHooks::new(Arc::clone(&handler), control_reserve)?;
         write_frame(
@@ -340,13 +345,12 @@ impl SessionDriver {
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(context.timeout_ms))
             .ok_or(SessionError::Protocol)?;
-        let deadline = Some(deadline);
-        let (deadline_source, callback_deadline) = tokio::sync::watch::channel(deadline);
+        let deadline = CallDeadline::new(deadline);
         let credits = Arc::new(CreditWindow::default());
         let (cancellation, cancellation_signal) = CancellationSource::new();
         let host = HostClient {
             parent_id: id,
-            deadline: callback_deadline,
+            deadline: deadline.clone(),
             cancellation: cancellation_signal.clone(),
             callbacks: Arc::clone(&self.callbacks),
             output: self.output.clone(),
@@ -379,7 +383,6 @@ impl SessionDriver {
                 output,
                 lifecycle,
                 deadline,
-                deadline_source,
                 maximum_stream_chunk_bytes,
                 maximum_chunks,
             )
@@ -453,8 +456,7 @@ async fn run_call(
     credits: Arc<CreditWindow>,
     output: Output,
     lifecycle: LifecycleHooks,
-    deadline: Option<Instant>,
-    deadline_source: tokio::sync::watch::Sender<Option<Instant>>,
+    deadline: CallDeadline,
     maximum_stream_chunk_bytes: usize,
     maximum_chunks: usize,
 ) -> Result<(), SessionError> {
@@ -463,7 +465,7 @@ async fn run_call(
     let response = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Ok(()),
-        () = wait_deadline(deadline) => {
+        () = deadline.wait() => {
             lifecycle.cancel(context.clone());
             output.send_control(fault_frame(
                 id,
@@ -478,10 +480,10 @@ async fn run_call(
         Err(error) => {
             let _ = send_initial(
                 &output,
-                bounded_fault_frame(id, error),
+                bounded_fault_frame(id, error)?,
                 &context,
                 &lifecycle,
-                deadline,
+                &deadline,
                 &cancellation,
             )
             .await?;
@@ -495,29 +497,29 @@ async fn run_call(
         },
         payload: reply.payload,
     };
-    if validate_frame(&initial).is_err() {
-        output.send_control(fault_frame(
-            id,
-            PluginFault::new(
-                ErrorCode::InvalidInput,
-                "plugin response metadata exceeds its limit",
-            ),
-        ))?;
-        return Ok(());
-    }
+    let initial = match EncodedFrame::new(initial) {
+        Ok(initial) => initial,
+        Err(_) => {
+            output.send_control(fault_frame(
+                id,
+                PluginFault::new(ErrorCode::InvalidInput, "plugin response cannot be encoded"),
+            ))?;
+            return Ok(());
+        }
+    };
     let Some(mut stream) = reply.stream.take() else {
         let _ = send_initial(
             &output,
             initial,
             &context,
             &lifecycle,
-            deadline,
+            &deadline,
             &cancellation,
         )
         .await?;
         return Ok(());
     };
-    let window_bytes = match credits.initial_window(deadline, &cancellation).await {
+    let window_bytes = match credits.initial_window(&deadline, &cancellation).await {
         Ok(window) => window,
         Err(SessionError::Timeout) => {
             lifecycle.cancel(context.clone());
@@ -541,25 +543,22 @@ async fn run_call(
         initial,
         &context,
         &lifecycle,
-        deadline,
+        &deadline,
         &cancellation,
     )
     .await?
     {
         return Ok(());
     }
-    let deadline = if context.resource_stream {
-        None
-    } else {
-        deadline
-    };
-    deadline_source.send_replace(deadline);
+    if context.resource_stream {
+        deadline.clear();
+    }
     let mut sequence = 0_u64;
     loop {
         let item = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Ok(()),
-            () = wait_deadline(deadline) => {
+            () = deadline.wait() => {
                 lifecycle.cancel(context.clone());
                 output.send_control(end_frame(
                     id,
@@ -576,7 +575,7 @@ async fn run_call(
         let payload = match item {
             Ok(payload) => payload,
             Err(fault) => {
-                output.send_control(bounded_end_frame(id, fault))?;
+                output.send_encoded_control(bounded_end_frame(id, fault)?)?;
                 return Ok(());
             }
         };
@@ -587,7 +586,7 @@ async fn run_call(
             return Ok(());
         }
         match credits
-            .take(payload.len() as u64, deadline, &cancellation)
+            .take(payload.len() as u64, &deadline, &cancellation)
             .await
         {
             Ok(()) => {}
@@ -615,7 +614,7 @@ async fn run_call(
             id,
             &context,
             &lifecycle,
-            deadline,
+            &deadline,
             &cancellation,
         )
         .await?
@@ -628,10 +627,10 @@ async fn run_call(
 
 async fn send_initial(
     output: &Output,
-    frame: Frame,
+    frame: EncodedFrame,
     context: &CallContext,
     lifecycle: &LifecycleHooks,
-    deadline: Option<Instant>,
+    deadline: &CallDeadline,
     cancellation: &CallCancellation,
 ) -> Result<bool, SessionError> {
     match output.send_data_until(frame, deadline, cancellation).await {
@@ -655,10 +654,13 @@ async fn send_stream_data(
     id: u64,
     context: &CallContext,
     lifecycle: &LifecycleHooks,
-    deadline: Option<Instant>,
+    deadline: &CallDeadline,
     cancellation: &CallCancellation,
 ) -> Result<bool, SessionError> {
-    match output.send_data_until(frame, deadline, cancellation).await {
+    match output
+        .send_data_until(EncodedFrame::new(frame)?, deadline, cancellation)
+        .await
+    {
         Ok(()) => Ok(true),
         Err(SessionError::Cancelled) => Ok(false),
         Err(SessionError::Timeout) => {
@@ -684,29 +686,27 @@ fn end_frame(id: u64, error: Option<PluginFault>) -> Frame {
     Frame::control(Message::End { id, error })
 }
 
-fn bounded_fault_frame(id: u64, error: PluginFault) -> Frame {
-    let frame = fault_frame(id, error);
-    if validate_frame(&frame).is_ok() {
-        frame
-    } else {
-        fault_frame(
-            id,
-            PluginFault::new(ErrorCode::Fault, "plugin error metadata exceeds its limit"),
-        )
-    }
+fn bounded_fault_frame(id: u64, error: PluginFault) -> Result<EncodedFrame, SessionError> {
+    EncodedFrame::new(fault_frame(id, error))
+        .or_else(|_| {
+            EncodedFrame::new(fault_frame(
+                id,
+                PluginFault::new(ErrorCode::Fault, "plugin error metadata exceeds its limit"),
+            ))
+        })
+        .map_err(SessionError::from)
 }
 
-fn bounded_end_frame(id: u64, error: PluginFault) -> Frame {
-    let frame = end_frame(id, Some(error));
-    if validate_frame(&frame).is_ok() {
-        frame
-    } else {
-        end_frame(
-            id,
-            Some(PluginFault::new(
-                ErrorCode::Fault,
-                "plugin stream error metadata exceeds its limit",
-            )),
-        )
-    }
+fn bounded_end_frame(id: u64, error: PluginFault) -> Result<EncodedFrame, SessionError> {
+    EncodedFrame::new(end_frame(id, Some(error)))
+        .or_else(|_| {
+            EncodedFrame::new(end_frame(
+                id,
+                Some(PluginFault::new(
+                    ErrorCode::Fault,
+                    "plugin stream error metadata exceeds its limit",
+                )),
+            ))
+        })
+        .map_err(SessionError::from)
 }

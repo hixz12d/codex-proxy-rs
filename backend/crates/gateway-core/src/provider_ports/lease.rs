@@ -47,15 +47,26 @@ impl ProviderSchedulingState {
     }
 }
 
+/// 并发占用关联的入口事实；不含密钥原文或请求正文
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderLeaseMetadata {
+    pub request_id: String,
+    pub client_key_id: ClientApiKeyId,
+    pub client_key_name: Option<String>,
+    pub model: Option<String>,
+    pub client_ip: Option<std::net::IpAddr>,
+    pub started_at: std::time::SystemTime,
+}
+
 /// 请求级账号 lease 的全部中立事实
 #[derive(Debug, Clone)]
 pub struct ProviderSchedulingLeaseRequest {
+    metadata: Option<std::sync::Arc<ProviderLeaseMetadata>>,
     provider_kind: ProviderKind,
     account_id: ProviderAccountId,
     credential_revision: CredentialRevision,
     max_concurrent: AccountConcurrency,
     concurrency_pool: ProviderConcurrencyPool,
-    request_interval: Duration,
     deadline: crate::lifecycle::Deadline,
     cancellation: crate::lifecycle::CancellationToken,
 }
@@ -67,19 +78,32 @@ impl ProviderSchedulingLeaseRequest {
         account_id: ProviderAccountId,
         credential_revision: CredentialRevision,
         max_concurrent: impl Into<AccountConcurrency>,
-        request_interval: Duration,
         deadline: impl Into<crate::lifecycle::Deadline>,
     ) -> Self {
         Self {
+            metadata: None,
             provider_kind,
             account_id,
             credential_revision,
             max_concurrent: max_concurrent.into(),
             concurrency_pool: ProviderConcurrencyPool::Shared,
-            request_interval,
             deadline: deadline.into(),
             cancellation: crate::lifecycle::CancellationToken::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_metadata(
+        mut self,
+        metadata: Option<std::sync::Arc<ProviderLeaseMetadata>>,
+    ) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> Option<&ProviderLeaseMetadata> {
+        self.metadata.as_deref()
     }
 
     #[must_use]
@@ -125,11 +149,6 @@ impl ProviderSchedulingLeaseRequest {
     }
 
     #[must_use]
-    pub const fn request_interval(&self) -> Duration {
-        self.request_interval
-    }
-
-    #[must_use]
     pub const fn deadline(&self) -> crate::lifecycle::Deadline {
         self.deadline
     }
@@ -166,7 +185,7 @@ pub enum ProviderLeaseRequest {
 }
 
 pub trait ProviderLeasePort: Send + Sync {
-    /// 按目标容量池读取在途数，账号最小请求间隔仍跨池共享
+    /// 按目标容量池读取在途数，最近调度时间仍跨池共享
     fn load_state<'a>(
         &'a self,
         client_api_key_id: &'a ClientApiKeyId,

@@ -412,12 +412,31 @@ async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
         "gpt-6-sol",
         "gpt-6-luna",
     ] {
-        let usage = OpenAiBillingUsage::new(100, 10, 20, 15);
-        let inherited = openai_billing_breakdown(model, usage, None).unwrap();
-        let copied =
-            openai_billing_breakdown_with_override(model, usage, None, Some(&prices[model]))
+        let ultrafast_supported = matches!(model, "gpt-6-astra" | "gpt-6.1-sol");
+        for band in ["ultrafast", "long_ultrafast"] {
+            assert_eq!(prices[model].bands.contains_key(band), ultrafast_supported);
+        }
+        for tier in [None, Some("ultrafast")] {
+            if tier.is_some() && !ultrafast_supported {
+                continue;
+            }
+            for input in [100, 272_001] {
+                let usage = OpenAiBillingUsage::new(input, 10, 20, 15);
+                let inherited = openai_billing_breakdown(model, usage, tier).unwrap();
+                let copied = openai_billing_breakdown_with_override(
+                    model,
+                    usage,
+                    tier,
+                    Some(&prices[model]),
+                )
                 .unwrap();
-        assert_eq!(inherited.total_amount(), copied.total_amount(), "{model}");
+                assert_eq!(
+                    inherited.total_amount(),
+                    copied.total_amount(),
+                    "{model} {tier:?} {input}"
+                );
+            }
+        }
     }
 }
 
@@ -464,8 +483,8 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
             service_tier: None,
             input_tokens: Some(1_000_000),
             output_tokens: Some(0),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "2.5".parse().expect("amount"),
@@ -482,8 +501,8 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
             service_tier: Some("priority".to_owned()),
             input_tokens: Some(1_000_000),
             output_tokens: Some(0),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "4.25".parse().expect("fast amount"),
@@ -510,8 +529,8 @@ async fn openai_legacy_billing_should_not_infer_long_context_flag() {
             service_tier: None,
             input_tokens: Some(300_000),
             output_tokens: Some(0),
-            cached_tokens: Some(0),
-            cache_write_tokens: Some(0),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
             total: CurrencyCost {
                 currency: "USD".to_owned(),
                 amount: "1.5".parse().expect("stored total"),
@@ -1635,7 +1654,7 @@ fn initialized_provider_request(operation: Operation, account_id: &str) -> Provi
     let account_scope = initialized_account_scope(account_id);
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("revision"),
-        gateway_core::settings::SettingsValues::new(2, 10, "smart", Default::default(), None, None),
+        gateway_core::settings::SettingsValues::new(2, "smart", Default::default(), None, None),
         vec![provider.clone()],
         vec![ProviderModel::new(
             provider,
@@ -1737,6 +1756,7 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        outbound_proxy_enabled: true,
         notes: None,
         model_access: Default::default(),
         outbound_proxy: None,
@@ -2756,4 +2776,41 @@ impl gateway_core::diagnostics::OperationalDiagnostics for RecordingDiagnostics 
         self.0.lock().unwrap().push(failure);
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn usage_quote_reuses_native_override_and_reports_incomplete_input() {
+    use gateway_admin::ports::provider::ProviderUsagePricingInput;
+    use gateway_core::metering::{ModelPriceOverride, Usage};
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let admin = bundle.admin_provider();
+    let mut input = ProviderUsagePricingInput {
+        upstream_model_id: "gpt-6-sol".into(),
+        service_tier: None,
+        usage: Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(100_000),
+            cached_input_tokens: Some(200_000),
+            cache_write_input_tokens: Some(0),
+            image_input_tokens: Some(0),
+            image_output_tokens: Some(0),
+            ..Default::default()
+        },
+    };
+    let custom:ModelPriceOverride=serde_json::from_value(json!({"multiplierBps":10000,"bands":{"standard":{"input":"2","output":"10","cacheRead":"0.5","cacheWrite":"2"},"long_standard":{"input":"2","output":"10","cacheRead":"0.5","cacheWrite":"2"}}})).unwrap();
+    let price = admin
+        .evaluate_usage_pricing(&input, Some(&custom))
+        .unwrap()
+        .unwrap();
+    assert_eq!(price.total_amount().amount().canonical(), "2.7");
+    input.usage.cached_input_tokens = None;
+    assert!(
+        admin
+            .evaluate_usage_pricing(&input, Some(&custom))
+            .unwrap()
+            .is_none()
+    );
 }

@@ -239,11 +239,7 @@ impl SelectorFixture {
             UpstreamModelId::new(upstream_model).expect("model"),
             excluded,
             required_account,
-            AccountSelectionPolicy::new(
-                strategy,
-                std::num::NonZeroU32::new(2).expect("limit"),
-                Duration::ZERO,
-            ),
+            AccountSelectionPolicy::new(strategy, std::num::NonZeroU32::new(2).expect("limit")),
             SystemTime::now() + Duration::from_secs(30),
             Arc::new(FrozenAccountScope::new(
                 Arc::new(RuntimeAccountDirectory::new(accounts)),
@@ -1096,11 +1092,8 @@ fn queue_request(fixture: &SelectorFixture, timeout: Duration) -> GrokSessionSel
                 timeout,
             })
             .with_smart_scheduling(
-                gateway_core::account::SmartSchedulingConfig::new(
-                    [1.0, 0.8, 1.0, 0.5, 1.0, 1.0],
-                    false,
-                )
-                .unwrap(),
+                gateway_core::account::SmartSchedulingConfig::new([1.0, 0.8, 1.0, 0.5, 1.0, 1.0])
+                    .unwrap(),
             ),
         request.deadline(),
         request.account_scope().clone(),
@@ -1139,10 +1132,14 @@ async fn smart_queue_weight_changes_the_selected_wait_queue_and_respects_require
                         timeout: Duration::from_secs(2),
                     })
                     .with_smart_scheduling(
-                        gateway_core::account::SmartSchedulingConfig::new(
-                            [0.0, 0.0, 1.0, 0.0, 0.0, queue_weight],
-                            false,
-                        )
+                        gateway_core::account::SmartSchedulingConfig::new([
+                            0.0,
+                            0.0,
+                            1.0,
+                            0.0,
+                            0.0,
+                            queue_weight,
+                        ])
                         .unwrap(),
                     ),
                 request.deadline(),
@@ -1317,7 +1314,6 @@ async fn model_access_excludes_a_required_xai_account_before_acquiring_a_lease()
             AccountSelectionPolicy::new(
                 RotationStrategy::Smart,
                 std::num::NonZeroU32::new(2).expect("limit"),
-                Duration::ZERO,
             )
             .with_queue(gateway_core::concurrency::ConcurrencyQueuePolicy {
                 max_waiting: 1,

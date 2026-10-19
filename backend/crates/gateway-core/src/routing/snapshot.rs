@@ -29,6 +29,7 @@ type ModelCatalogAccounts = BTreeMap<ProviderKind, BTreeMap<String, BTreeSet<Pro
 /// Store 读取到的一个启用 Client API Key 策略事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotClientPolicyFacts {
+    name_snapshot: Option<String>,
     request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     key_id: ClientApiKeyId,
     plaintext_key: PlaintextClientApiKey,
@@ -37,6 +38,12 @@ pub struct SnapshotClientPolicyFacts {
 }
 
 impl SnapshotClientPolicyFacts {
+    #[must_use]
+    pub fn with_name_snapshot(mut self, name: Option<String>) -> Self {
+        self.name_snapshot = name;
+        self
+    }
+
     #[must_use]
     pub fn with_request_profiles(
         mut self,
@@ -55,6 +62,7 @@ impl SnapshotClientPolicyFacts {
     ) -> Self {
         Self {
             key_id,
+            name_snapshot: None,
             request_profiles: BTreeMap::new(),
             plaintext_key,
             group_ids,
@@ -66,6 +74,7 @@ impl SnapshotClientPolicyFacts {
 /// Store 读取到的账号分组事实
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotAccountGroupFacts {
+    allow_image_generation: bool,
     fast_mode: FastMode,
     id: AccountGroupId,
     name: String,
@@ -73,6 +82,12 @@ pub struct SnapshotAccountGroupFacts {
 }
 
 impl SnapshotAccountGroupFacts {
+    #[must_use]
+    pub const fn with_image_generation(mut self, allowed: bool) -> Self {
+        self.allow_image_generation = allowed;
+        self
+    }
+
     #[must_use]
     pub const fn with_fast_mode(mut self, fast_mode: FastMode) -> Self {
         self.fast_mode = fast_mode;
@@ -85,6 +100,7 @@ impl SnapshotAccountGroupFacts {
             id,
             name,
             enabled,
+            allow_image_generation: true,
             fast_mode: FastMode::Default,
         }
     }
@@ -209,8 +225,6 @@ pub enum RuntimeSnapshotCompileError {
     RevisionChanged,
     #[error("runtime snapshot contains invalid frozen data")]
     InvalidData,
-    #[error("extension model aliases conflict with the provider catalog or model mappings")]
-    InvalidExtensionModels,
     #[error("provider model catalog changed while the snapshot was compiling")]
     CatalogChanged,
 }
@@ -268,7 +282,7 @@ impl RuntimeSnapshotCompiler {
 
     /// 读取一个 revision，并为已注册 Provider 查询实时模型目录
     pub async fn compile(&self) -> Result<RuntimeSnapshot, RuntimeSnapshotCompileError> {
-        self.compile_inner(None).await
+        self.compile_inner(None, true).await
     }
 
     /// 配置提交复用同一扩展集合的已发布目录，目录留待对账刷新
@@ -276,12 +290,21 @@ impl RuntimeSnapshotCompiler {
         &self,
         previous: &RuntimeSnapshot,
     ) -> Result<RuntimeSnapshot, RuntimeSnapshotCompileError> {
-        self.compile_inner(Some(previous)).await
+        self.compile_inner(Some(previous), false).await
+    }
+
+    /// 刷新目录，单个 Provider 读取失败时保留同一扩展集合的已知模型归属
+    pub(crate) async fn compile_with_catalog_fallback(
+        &self,
+        previous: &RuntimeSnapshot,
+    ) -> Result<RuntimeSnapshot, RuntimeSnapshotCompileError> {
+        self.compile_inner(Some(previous), true).await
     }
 
     async fn compile_inner(
         &self,
         previous: Option<&RuntimeSnapshot>,
+        refresh_catalog: bool,
     ) -> Result<RuntimeSnapshot, RuntimeSnapshotCompileError> {
         // 同一配置 revision 的重试复用扩展候选，保留插件策略的发布一致性
         let mut prepared_extensions: Option<(
@@ -330,6 +353,7 @@ impl RuntimeSnapshotCompiler {
                 catalogs.as_ref(),
                 provider_kinds,
                 cached,
+                refresh_catalog,
                 self.privacy_compiler.clone(),
             )
             .await?;
@@ -346,13 +370,12 @@ impl RuntimeSnapshotCompiler {
                     return Err(RuntimeSnapshotCompileError::RevisionChanged);
                 }
                 let snapshot = snapshot
-                    .with_provider_catalog_generations(if cached.is_some() {
+                    .with_provider_catalog_generations(if cached.is_some() && !refresh_catalog {
                         BTreeMap::new()
                     } else {
                         observed_generations
                     })
                     .with_extensions(extensions);
-                snapshot.validate_extension_models()?;
                 return Ok(snapshot);
             }
         }
@@ -365,14 +388,20 @@ async fn compile_runtime_snapshot(
     catalogs: &dyn ProviderCatalogPort,
     provider_kinds: Vec<ProviderKind>,
     previous: Option<&RuntimeSnapshot>,
+    refresh_catalog: bool,
     privacy_compiler: Option<Arc<dyn crate::settings::privacy::PrivacyPolicyCompiler>>,
 ) -> Result<RuntimeSnapshot, RuntimeSnapshotCompileError> {
-    // 只有成功取得的完整目录能证明模型缺项；发现型目录和查询失败均交由上游验证
+    // 目录读取失败不能抹掉已知归属；成功返回空目录则仍是权威的模型撤回
     let mut provider_models = Vec::new();
     let mut catalog_accounts = BTreeMap::new();
     let mut exhaustive_provider_catalogs = BTreeSet::new();
     for provider in &provider_kinds {
-        if let Some(previous) = previous {
+        let models = if refresh_catalog || previous.is_none() {
+            catalogs.query_model_capabilities(provider).await.ok()
+        } else {
+            None
+        };
+        if let Some(previous) = previous.filter(|_| models.is_none()) {
             if let Some(accounts) = previous.model_catalog_accounts.get(provider) {
                 catalog_accounts.insert(provider.clone(), accounts.clone());
             }
@@ -395,7 +424,7 @@ async fn compile_runtime_snapshot(
             }
             continue;
         }
-        let Ok(models) = catalogs.query_model_capabilities(provider).await else {
+        let Some(models) = models else {
             continue;
         };
         if catalogs.model_catalog_is_exhaustive(provider) {
@@ -475,6 +504,7 @@ async fn compile_runtime_snapshot(
     let mut client_policies = Vec::with_capacity(facts.client_policies.len());
     for policy in facts.client_policies {
         let mut fast_mode = FastMode::Default;
+        let mut allow_image_generation = true;
         let account_scope = if policy.group_ids.is_empty() {
             FrozenAccountScope::new(
                 Arc::clone(&account_directory),
@@ -491,8 +521,9 @@ async fn compile_runtime_snapshot(
                 let group = groups
                     .get(&group_id)
                     .ok_or(RuntimeSnapshotCompileError::InvalidData)?;
-                // 禁用分组仅影响选号；Key 仍绑定其 Fast 策略
+                // 停用只影响选号，仍绑定的分组继续贡献请求策略
                 fast_mode = fast_mode.merge(group.fast_mode);
+                allow_image_generation &= group.allow_image_generation;
                 bound_groups.push(RoutingGroupSnapshot::new(
                     group.id.clone(),
                     group.name.clone(),
@@ -509,17 +540,21 @@ async fn compile_runtime_snapshot(
                     .map_err(|_| RuntimeSnapshotCompileError::InvalidData)?,
             )
         };
-        client_policies.push(ClientPolicy::new(
-            policy.key_id,
-            policy.plaintext_key,
-            Arc::new(
-                account_scope
-                    .with_fast_mode(fast_mode)
-                    .with_request_profiles(policy.request_profiles),
-            ),
-            true,
-            policy.limits,
-        ));
+        client_policies.push(
+            ClientPolicy::new(
+                policy.key_id,
+                policy.plaintext_key,
+                Arc::new(
+                    account_scope
+                        .with_image_generation(allow_image_generation)
+                        .with_fast_mode(fast_mode)
+                        .with_request_profiles(policy.request_profiles),
+                ),
+                true,
+                policy.limits,
+            )
+            .with_name_snapshot(policy.name_snapshot),
+        );
     }
 
     RuntimeSnapshot::new_with_privacy_compiler(
@@ -615,45 +650,6 @@ impl RuntimeSnapshot {
         self.model_aliases()
             .iter()
             .find(|alias| alias.id.as_str() == model)
-    }
-
-    fn validate_extension_models(&self) -> Result<(), RuntimeSnapshotCompileError> {
-        let mut ids = BTreeSet::new();
-        for alias in self.model_aliases() {
-            let valid = ids.insert(&alias.id)
-                && self.providers.contains(&alias.provider)
-                && !self
-                    .settings
-                    .values
-                    .model_mappings
-                    .contains_key(alias.id.as_str())
-                && !self
-                    .settings
-                    .values
-                    .model_mappings
-                    .contains_key(alias.target.as_str())
-                && !self
-                    .settings
-                    .values
-                    .model_mappings
-                    .values()
-                    .any(|target| target == alias.id.as_str())
-                && self.model_alias(alias.target.as_str()).is_none()
-                && !self.provider_models.values().any(|models| {
-                    models
-                        .keys()
-                        .any(|model| model.as_str() == alias.id.as_str())
-                })
-                && self
-                    .provider_models
-                    .get(&alias.provider)
-                    .is_some_and(|models| models.contains_key(&alias.target));
-            if !valid {
-                tracing::warn!(owner = %alias.owner, model = %alias.id, "插件模型别名与宿主目录或映射冲突，拒绝发布候选快照");
-                return Err(RuntimeSnapshotCompileError::InvalidExtensionModels);
-            }
-        }
-        Ok(())
     }
 
     #[must_use]
@@ -935,7 +931,7 @@ impl RuntimeSnapshot {
             .collect()
     }
 
-    /// 完整目录按映射后的模型判定；发现型或不可用目录不作为能力白名单
+    /// 已知模型只属于明确声明它的 Provider；未知模型仍可由非完整目录透传
     #[must_use]
     pub fn contains_public_model_for_provider(
         &self,
@@ -951,13 +947,22 @@ impl RuntimeSnapshot {
         {
             return false;
         }
-        if !self.exhaustive_provider_catalogs.contains(provider) {
-            return true;
-        }
-        let upstream_model = self.mapped_model(public_model.as_str());
+        let Ok(upstream_model) =
+            UpstreamModelId::from_client_wire(self.mapped_model(public_model.as_str()))
+        else {
+            return false;
+        };
         self.provider_models
             .get(provider)
-            .is_some_and(|models| models.keys().any(|model| model.as_str() == upstream_model))
+            .is_some_and(|models| models.contains_key(&upstream_model))
+            || (!self.exhaustive_provider_catalogs.contains(provider)
+                && !self.is_known_upstream_model(&upstream_model))
+    }
+
+    fn is_known_upstream_model(&self, upstream_model: &UpstreamModelId) -> bool {
+        self.provider_models
+            .values()
+            .any(|models| models.contains_key(upstream_model))
     }
 
     #[must_use]
@@ -1095,6 +1100,23 @@ impl RuntimeSnapshot {
             return Err(RoutingError::EmptyAccountScope);
         }
 
+        let requested_model = public_model.as_str();
+        let mapped_model = self.mapped_model(requested_model);
+        let upstream_model = if self
+            .settings
+            .values
+            .model_mappings
+            .contains_key(requested_model)
+            || self.model_alias(requested_model).is_some()
+        {
+            UpstreamModelId::new(mapped_model)
+        } else {
+            UpstreamModelId::from_client_wire(mapped_model)
+        }
+        .map_err(|_| RoutingError::InvalidIdentifier)?;
+        // 归属先于账号范围、能力与路由约束判定，原 Provider 被排除不能变成跨平台透传
+        let known_model = self.is_known_upstream_model(&upstream_model);
+
         let providers = context.required_provider.as_ref().map_or_else(
             || account_scope.provider_kinds().clone(),
             |provider| BTreeSet::from([provider.clone()]),
@@ -1117,38 +1139,26 @@ impl RuntimeSnapshot {
             {
                 continue;
             }
-            let requested_model = public_model.as_str();
-            let mapped_model = self.mapped_model(requested_model);
-            let upstream_model = if self
-                .settings
-                .values
-                .model_mappings
-                .contains_key(requested_model)
-                || self.model_alias(requested_model).is_some()
-            {
-                UpstreamModelId::new(mapped_model)
-            } else {
-                UpstreamModelId::from_client_wire(mapped_model)
-            }
-            .map_err(|_| RoutingError::InvalidIdentifier)?;
             // 强制 Provider 路由也不能扩大 Key 授权；管理诊断的目标账号由探测入口固定
             if enforce_account_model_policy
                 && !account_scope.allows_provider_model(provider, upstream_model.as_str())
             {
                 continue;
             }
-            let emulated_features = match self
+            let capabilities = self
                 .provider_models
                 .get(provider)
-                .and_then(|models| models.get(&upstream_model))
-            {
+                .and_then(|models| models.get(&upstream_model));
+            let emulated_features = match capabilities {
                 Some(capabilities) => {
                     let Some(emulated) = capabilities.match_requirements(&requirements) else {
                         continue;
                     };
                     emulated
                 }
-                None if self.exhaustive_provider_catalogs.contains(provider) => continue,
+                None if known_model || self.exhaustive_provider_catalogs.contains(provider) => {
+                    continue;
+                }
                 None => BTreeSet::new(),
             };
             candidates.push(ProviderCandidate {
@@ -1158,9 +1168,16 @@ impl RuntimeSnapshot {
                     .get(provider)
                     .and_then(|models| models.get(&upstream_model))
                     .cloned(),
-                upstream_model: Some(upstream_model),
+                upstream_model: Some(upstream_model.clone()),
                 emulated_features,
                 account_scope: Arc::clone(&account_scope),
+            });
+        }
+
+        // 冷启动或目录不可读时不能按 Provider 名称猜测模型归属
+        if !known_model && candidates.len() > 1 {
+            return Err(RoutingError::NoCapableProvider {
+                model: public_model.as_str().to_owned(),
             });
         }
 

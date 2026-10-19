@@ -50,7 +50,6 @@ fn update_body() -> Value {
         "refreshMarginSeconds": 1800,
         "refreshConcurrency": 4,
         "maxConcurrentPerAccount": 5,
-        "requestIntervalMs": 25,
         "maxWaitingPerKey": 0,
         "maxWaitingPerAccount": 0,
         "openaiGuardianReservedConcurrency": 0,
@@ -63,7 +62,7 @@ fn update_body() -> Value {
         "smartScheduling": gateway_core::account::SmartSchedulingConfig::default(),
         "minCodexDesktopVersion": "26.825.6671",
         "minCodexCliVersion": "0.40.0",
-        "usageRetentionDays": 32,
+        "usageRetentionDays": 31,
         "opsEventRetentionDays": 31,
         "auditRetentionDays": 91,
         "accountAutoFreezeEnabled": true,
@@ -75,8 +74,57 @@ fn update_body() -> Value {
         "accountAutoFreezeAdaptiveConcurrency": true,
         "accountWarmupEnabled": false,
         "accountWarmupScheduleTime": "08:00",
-        "accountWarmupModel": null
+        "accountWarmupModel": null,
+        "resetCreditLeadMinutes": 10,
+        "resetCreditMaxWeeklyRemainingPercent": null
     })
+}
+
+#[tokio::test]
+async fn location_detection_requires_auth_and_leaves_saved_settings_unchanged() {
+    let fixture = AdminTestFixture::new().await;
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/location/detect",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    fixture.auth.insert_session("valid-session");
+    let before = response_json(
+        app(fixture.state())
+            .oneshot(request(Method::GET, "/api/admin/settings", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/location/detect",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["data"],
+        json!({
+            "status": "detected",
+            "location": {"country": "JP", "region": "Tokyo", "city": "Tokyo", "timezone": "Asia/Tokyo"}
+        })
+    );
+    let after = response_json(
+        app(fixture.state())
+            .oneshot(request(Method::GET, "/api/admin/settings", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(before, after);
 }
 
 #[tokio::test]
@@ -85,9 +133,10 @@ async fn privacy_save_requires_provider_validation_and_preview_requires_admin_au
     fixture.auth.insert_session("valid-session");
     let mut body = update_body();
     let policy = json!({"enabled":true,"onError":"reject_request","rules":[{
-        "id":"auth","name":"自定义认证头","enabled":true,"scope":"request_header",
-        "selector":"authorization","action":"remove_field","pattern":null,
-        "replacement":"","value":null,"replaceAll":true,"caseInsensitive":false,"multiLine":false
+        "id":"auth","name":"自定义认证头","enabled":true,"steps":[{
+            "scope":"request_header","selector":"authorization","action":"remove_field","pattern":null,
+            "replacement":"","value":null,"replaceAll":true,"caseInsensitive":false,"multiLine":false
+        }]
     }]});
     body["codexPrivacyPolicy"] = policy.clone();
     let response = app(fixture.state())
@@ -141,7 +190,7 @@ async fn smart_settings_round_trip_and_invalid_updates_leave_the_saved_value_int
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     let mut body = update_body();
-    let custom = json!({"loadWeight": 2.0, "quotaWeight": 0.0, "healthWeight": 1.0, "latencyWeight": 0.5, "resetWeight": 1.2, "queueWeight": 2.3, "preferHigherWeight": true});
+    let custom = json!({"loadWeight": 2.0, "quotaWeight": 0.0, "healthWeight": 1.0, "latencyWeight": 0.5, "resetWeight": 1.2, "queueWeight": 2.3});
     body["smartScheduling"] = custom.clone();
     let response = app(fixture.state())
         .oneshot(request(
@@ -161,8 +210,8 @@ async fn smart_settings_round_trip_and_invalid_updates_leave_the_saved_value_int
     let mut invalid_values = vec![
         json!(null),
         json!({}),
-        json!({"loadWeight":0,"quotaWeight":0,"healthWeight":0,"latencyWeight":0,"resetWeight":0,"queueWeight":0,"preferHigherWeight":true}),
-        json!({"loadWeight":0.01,"quotaWeight":1,"healthWeight":1,"latencyWeight":1,"resetWeight":0,"queueWeight":0,"preferHigherWeight":false}),
+        json!({"loadWeight":0,"quotaWeight":0,"healthWeight":0,"latencyWeight":0,"resetWeight":0,"queueWeight":0}),
+        json!({"loadWeight":0.01,"quotaWeight":1,"healthWeight":1,"latencyWeight":1,"resetWeight":0,"queueWeight":0}),
     ];
     for field in ["resetWeight", "queueWeight"] {
         for value in [json!(-0.1), json!(10.1), json!(0.01), json!(null)] {
@@ -214,6 +263,56 @@ fn settings_request_should_reject_unknown_rotation_strategy() {
         serde_json::from_value(body).expect("decode settings");
 
     assert_eq!(request.validate().unwrap_err().field(), "rotationStrategy");
+}
+
+#[tokio::test]
+async fn short_request_retention_round_trips_and_invalid_days_do_not_replace_it() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let mut body = update_body();
+    for days in [1, 3, 7, 15, 30, 31] {
+        body["usageRetentionDays"] = json!(days);
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = response_json(response).await;
+        assert_eq!(saved["data"]["usageRetentionDays"], days);
+        body["configRevision"] = saved["data"]["configRevision"].clone();
+    }
+    for (days, expected_status) in [
+        (json!(0), StatusCode::BAD_REQUEST),
+        (json!(32), StatusCode::BAD_REQUEST),
+        (json!(u32::MAX), StatusCode::BAD_REQUEST),
+        (json!(-1), StatusCode::UNPROCESSABLE_ENTITY),
+        (json!(1.5), StatusCode::UNPROCESSABLE_ENTITY),
+        (json!(null), StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        body["usageRetentionDays"] = days;
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+    }
+    let response = app(fixture.state())
+        .oneshot(request(Method::GET, "/api/admin/settings", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["data"]["usageRetentionDays"],
+        31
+    );
 }
 
 #[test]
@@ -287,7 +386,6 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             refresh_margin_seconds: 1800,
             refresh_concurrency: 4,
             max_concurrent_per_account: 5,
-            request_interval_ms: 25,
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
@@ -299,7 +397,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             smart_scheduling: gateway_core::account::SmartSchedulingConfig::default(),
             min_codex_desktop_version: Some("26.825.6671".to_owned()),
             min_codex_cli_version: Some("0.40.0".to_owned()),
-            usage_retention_days: 32,
+            usage_retention_days: 31,
             ops_event_retention_days: 31,
             audit_retention_days: 91,
             account_auto_freeze_enabled: true,
@@ -312,6 +410,8 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             account_warmup_enabled: false,
             account_warmup_schedule_time: "08:00".to_owned(),
             account_warmup_model: None,
+            reset_credit_lead_minutes: 10,
+            reset_credit_max_weekly_remaining_percent: None,
         },
     };
 
@@ -337,7 +437,6 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "refreshMarginSeconds": 1800,
             "refreshConcurrency": 4,
             "maxConcurrentPerAccount": 5,
-            "requestIntervalMs": 25,
             "maxWaitingPerKey": 0,
             "maxWaitingPerAccount": 0,
             "openaiGuardianReservedConcurrency": 0,
@@ -351,7 +450,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "smartSchedulingDefaults": gateway_core::account::SmartSchedulingConfig::default(),
             "minCodexDesktopVersion": "26.825.6671",
             "minCodexCliVersion": "0.40.0",
-            "usageRetentionDays": 32,
+            "usageRetentionDays": 31,
             "opsEventRetentionDays": 31,
             "auditRetentionDays": 91,
             "accountAutoFreezeEnabled": true,
@@ -364,6 +463,8 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
                 "accountWarmupEnabled": false,
                 "accountWarmupScheduleTime": "08:00",
                 "accountWarmupModel": null,
+                "resetCreditLeadMinutes": 10,
+                "resetCreditMaxWeeklyRemainingPercent": null,
                 "updatedAt": "2026-08-02T10:30:00Z",
                 "updatedAtDisplay": "2026-08-02 18:30:00"
         })
@@ -415,7 +516,6 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
             refresh_concurrency: u32::try_from(request.values.refresh_concurrency).expect("u32"),
             max_concurrent_per_account: u32::try_from(request.values.max_concurrent_per_account)
                 .expect("u32"),
-            request_interval_ms: request.values.request_interval_ms,
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
@@ -441,6 +541,8 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
             account_warmup_enabled: false,
             account_warmup_schedule_time: "08:00".to_owned(),
             account_warmup_model: None,
+            reset_credit_lead_minutes: 10,
+            reset_credit_max_weekly_remaining_percent: None,
         },
     };
 
@@ -1521,5 +1623,65 @@ async fn account_affinity_and_rotation_budget_round_trip_and_reject_invalid_valu
             .await
             .unwrap();
         assert_eq!(response.status(), expected_status, "{field}");
+    }
+}
+
+#[test]
+fn reset_credit_lead_minutes_requires_an_integer_within_one_day() {
+    for (value, valid) in [
+        (0, false),
+        (1, true),
+        (10, true),
+        (1440, true),
+        (1441, false),
+    ] {
+        let mut body = update_body();
+        body["resetCreditLeadMinutes"] = json!(value);
+        let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
+        let result = request.validate();
+        if valid {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err().field(), "resetCreditLeadMinutes");
+        }
+    }
+}
+
+#[test]
+fn reset_credit_weekly_threshold_accepts_unset_and_zero_to_one_hundred() {
+    let mut omitted = update_body();
+    omitted
+        .as_object_mut()
+        .unwrap()
+        .remove("resetCreditMaxWeeklyRemainingPercent");
+    let request: UpdateRuntimeSettingsRequest = serde_json::from_value(omitted).unwrap();
+    request.validate().unwrap();
+    assert!(
+        request
+            .values
+            .reset_credit_max_weekly_remaining_percent
+            .is_none()
+    );
+    for value in [json!(null), json!(0), json!(70), json!(100)] {
+        let mut body = update_body();
+        body["resetCreditMaxWeeklyRemainingPercent"] = value.clone();
+        let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
+        request.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(request.values.reset_credit_max_weekly_remaining_percent).unwrap(),
+            value
+        );
+    }
+    let mut body = update_body();
+    body["resetCreditMaxWeeklyRemainingPercent"] = json!(101);
+    let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        request.validate().unwrap_err().field(),
+        "resetCreditMaxWeeklyRemainingPercent"
+    );
+    for value in [json!(-1), json!(70.5), json!("70")] {
+        let mut body = update_body();
+        body["resetCreditMaxWeeklyRemainingPercent"] = value;
+        assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(body).is_err());
     }
 }

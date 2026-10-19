@@ -536,12 +536,8 @@ pub struct ProviderResponseTimings {
     pub upstream_response_ms: Option<u64>,
     /// 上游排除引擎与客户端工具时间后的 API 耗时
     pub upstream_api_overhead_ms: Option<f64>,
-    /// 上游响应级引擎耗时；以下专项指标保留毫秒小数及各自内部计量层级
+    /// 上游响应级引擎耗时，保留毫秒小数
     pub upstream_engine_ms: Option<f64>,
-    pub upstream_engine_iapi_ttft_ms: Option<f64>,
-    pub upstream_engine_service_ttft_ms: Option<f64>,
-    pub upstream_engine_iapi_tbt_ms: Option<f64>,
-    pub upstream_engine_service_tbt_ms: Option<f64>,
 }
 
 /// Provider 已筛选的响应观测 JSON
@@ -834,6 +830,7 @@ pub struct ProviderEvent {
     observation: Option<Box<ProviderResponseObservation>>,
     session_update: Option<Box<ProviderSessionState>>,
     middleware_transformed: bool,
+    replayable_prelude: bool,
     middleware_origin_wire: Option<Arc<ProtocolWireEvent>>,
 }
 
@@ -847,6 +844,7 @@ impl ProviderEvent {
             observation: None,
             session_update: None,
             middleware_transformed: false,
+            replayable_prelude: false,
             middleware_origin_wire: None,
         }
     }
@@ -867,6 +865,7 @@ impl ProviderEvent {
             observation: None,
             session_update: None,
             middleware_transformed: false,
+            replayable_prelude: false,
             middleware_origin_wire: None,
         }
     }
@@ -880,6 +879,7 @@ impl ProviderEvent {
             observation: None,
             session_update: None,
             middleware_transformed: false,
+            replayable_prelude: false,
             middleware_origin_wire: None,
         }
     }
@@ -893,8 +893,22 @@ impl ProviderEvent {
             observation: Some(Box::new(observation)),
             session_update: None,
             middleware_transformed: false,
+            replayable_prelude: false,
             middleware_origin_wire: None,
         }
+    }
+
+    /// Provider 确认该事件仅为可替换的前导信息，客户端支持后续 attempt 的新前导事件
+    /// 此证明不代替错误分类、发送状态、预算或续接恢复检查
+    #[must_use]
+    pub fn with_replayable_prelude(mut self) -> Self {
+        self.replayable_prelude = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_replayable_prelude(&self) -> bool {
+        self.replayable_prelude && !self.middleware_transformed
     }
 
     /// 返回协议表达是否由中间件替换、展开或丢弃映射产生
@@ -970,6 +984,7 @@ impl ProviderEvent {
     /// 仅替换客户端协议表达；canonical facts、响应观察和会话状态保持原始事实
     pub fn replace_wire(&mut self, wire: Option<ProtocolWireEvent>) {
         self.wire = wire.map(Box::new);
+        self.replayable_prelude = false;
     }
 
     /// 取出仅供 Core 持久化的响应观察

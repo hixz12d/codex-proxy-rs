@@ -31,9 +31,9 @@ use crate::{
 };
 
 use super::{
-    PgRuntimeSettingsRepository, RuntimeSettingsRepository, account_summary_from_row,
-    append_admin_audit_event_in_transaction, bump_config_revision_in_transaction,
-    completed_usage_fact_predicate,
+    ObservabilityQueryBudget, PgRuntimeSettingsRepository, RuntimeSettingsRepository,
+    account_summary_from_row, append_admin_audit_event_in_transaction,
+    bump_config_revision_in_transaction,
 };
 
 const ENTITY: &str = "account group";
@@ -43,13 +43,15 @@ const ENTITY: &str = "account group";
 pub struct PgAccountGroupRepository {
     timezone: gateway_core::time::DeploymentTimeZone,
     pool: PgPool,
+    query_budget: ObservabilityQueryBudget,
 }
 
 impl PgAccountGroupRepository {
     #[must_use]
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool, query_budget: ObservabilityQueryBudget) -> Self {
         Self {
             pool,
+            query_budget,
             timezone: Default::default(),
         }
     }
@@ -74,9 +76,14 @@ impl PgAccountGroupRepository {
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?
             .ok_or_else(|| not_found(id.as_str()))?;
-        let costs = group_costs(&self.pool, &[id.as_str().to_owned()], self.timezone)
-            .await
-            .map_err(|error| admin_store_error(ENTITY, error))?;
+        let costs = group_costs(
+            &self.pool,
+            &self.query_budget,
+            &[id.as_str().to_owned()],
+            self.timezone,
+        )
+        .await
+        .map_err(|error| admin_store_error(ENTITY, error))?;
         if let Some(usage) = costs.get(id.as_str()) {
             record.usage = usage.clone();
         }
@@ -152,7 +159,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
             .iter()
             .map(|record| record.id.as_str().to_owned())
             .collect::<Vec<_>>();
-        let costs = group_costs(&self.pool, &group_ids, self.timezone)
+        let costs = group_costs(&self.pool, &self.query_budget, &group_ids, self.timezone)
             .await
             .map_err(|error| admin_store_error(ENTITY, error))?;
         for record in &mut items {
@@ -219,7 +226,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
             .map(|group_id| group_id.as_str().to_owned())
             .collect::<Vec<_>>();
         let rows = sqlx::query(
-            "select proxy.auto_location, proxy.detected_location_json, proxy.location_country, proxy.location_region, proxy.location_city, proxy.location_timezone, membership.account_group_id,
+            "select coalesce(proxy.enabled, true) as outbound_proxy_enabled, coalesce(proxy.max_websocket_connections, 0) as outbound_proxy_max_websocket_connections, proxy.auto_location, proxy.detected_location_json, proxy.location_country, proxy.location_region, proxy.location_city, proxy.location_timezone, membership.account_group_id,
                     account.id, account.provider_kind, account.name, account.notes, account.email,
                     account.upstream_user_id, account.upstream_account_id, account.plan_type,
                     account.authentication_kind, account.credential_revision, account.outbound_proxy_url,
@@ -296,6 +303,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
                 "name".to_owned(),
                 "description".to_owned(),
                 "fast_mode".to_owned(),
+                "allow_image_generation".to_owned(),
             ],
         );
         let revision = self
@@ -328,6 +336,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
                 "name".to_owned(),
                 "description".to_owned(),
                 "fast_mode".to_owned(),
+                "allow_image_generation".to_owned(),
             ],
         );
         let revision = self
@@ -335,7 +344,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
                 Box::pin(async move {
                     let result = sqlx::query(
                         "update account_groups
-                 set name = $2, description = $3, color = $4, fast_mode = coalesce($5, fast_mode), updated_at = now()
+                 set name = $2, description = $3, color = $4, fast_mode = coalesce($5, fast_mode), allow_image_generation = coalesce($6, allow_image_generation), updated_at = now()
                  where id = $1",
                     )
                     .bind(command.id.as_str())
@@ -343,6 +352,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
                     .bind(command.description)
                     .bind(command.color.as_str())
                     .bind(command.fast_mode.map(FastMode::as_str))
+                    .bind(command.allow_image_generation)
                     .execute(&mut **transaction)
                     .await
                     .map_err(|error| map_group_write_error(error, command.id.as_str()))?;
@@ -447,7 +457,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
 
 fn group_select() -> QueryBuilder<Postgres> {
     QueryBuilder::new(
-        "select g.id, g.name, g.description, g.color, g.enabled, g.fast_mode, g.created_at, g.updated_at,
+        "select g.id, g.name, g.description, g.color, g.enabled, g.fast_mode, g.allow_image_generation, g.created_at, g.updated_at,
                 coalesce(members.member_count, 0)::bigint as member_count,
                 coalesce(keys.client_key_count, 0)::bigint as client_key_count,
                 coalesce(members.provider_counts, '{}'::jsonb) as provider_counts
@@ -525,6 +535,9 @@ fn group_record(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRecord> 
     let provider_counts = serde_json::from_value::<BTreeMap<String, u64>>(provider_counts)
         .map_err(|source| invalid("invalid provider counts").with_source(source))?;
     Ok(AccountGroupRecord {
+        allow_image_generation: row
+            .try_get("allow_image_generation")
+            .map_err(|source| invalid("invalid image generation policy").with_source(source))?,
         fast_mode: FastMode::parse(
             row.try_get("fast_mode")
                 .map_err(|source| invalid("invalid fast_mode").with_source(source))?,
@@ -601,71 +614,23 @@ fn group_ref(row: &sqlx::postgres::PgRow) -> StoreResult<AccountGroupRef> {
 
 async fn group_costs(
     pool: &PgPool,
+    budget: &ObservabilityQueryBudget,
     group_ids: &[String],
     timezone: gateway_core::time::DeploymentTimeZone,
 ) -> StoreResult<BTreeMap<String, AccountGroupUsage>> {
     if group_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let completed_usage = completed_usage_fact_predicate("mr");
-    // 用量按实际完成请求的账号统计：账号属于多个分组时计入每个所属分组，
-    // 不再按 Client Key 绑定分组快照归属，避免多分组 Key 的费用重复出现在未承接请求的分组上
-    let statement = format!(
-        "with requested_groups(group_id) as (
-           select unnest($1::text[])
-         )
-         select requested_groups.group_id,
-                coalesce(sum(mr.cost_amount) filter (
-                  where mr.started_at >= $2
-                ), 0)::text as today_usd,
-                coalesce(sum(mr.cost_amount), 0)::text as retained_total_usd
-         from requested_groups
-         cross join runtime_settings settings
-         left join account_group_accounts membership
-           on membership.account_group_id = requested_groups.group_id
-         left join model_requests mr
-           on mr.provider_account_ref = membership.provider_account_id
-          and mr.started_at >= now() - make_interval(days => settings.usage_retention_days::int)
-          and {completed_usage}
-          and mr.cost_currency = 'USD'
-          and mr.cost_amount is not null
-         where settings.id = 1
-         group by requested_groups.group_id"
-    );
-    // 动态片段仅为共享的固定 usage-fact predicate；group IDs 仍使用 bind
-    let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
-        .bind(group_ids)
-        .bind(
-            timezone
-                .day_start(chrono::Utc::now())
-                .ok_or_else(|| invalid("invalid business date"))?,
+    budget
+        .run(
+            pool,
+            "load account group costs",
+            |mut connection| async move {
+                super::observability::account_group_usage(&mut connection, group_ids, timezone)
+                    .await
+            },
         )
-        .fetch_all(pool)
         .await
-        .map_err(|source| unavailable("load account group costs", source))?;
-    rows.into_iter()
-        .map(|row| {
-            let group_id: String = row
-                .try_get("group_id")
-                .map_err(|source| invalid("invalid group ID").with_source(source))?;
-            let today = row
-                .try_get::<String, _>("today_usd")
-                .map_err(|source| invalid("invalid today cost").with_source(source))?;
-            let retained_total = row
-                .try_get::<String, _>("retained_total_usd")
-                .map_err(|source| invalid("invalid retained total cost").with_source(source))?;
-            Ok((
-                group_id,
-                AccountGroupUsage {
-                    today_usd: DecimalAmount::from_str(&today)
-                        .map_err(|source| invalid("invalid today cost").with_source(source))?,
-                    retained_total_usd: DecimalAmount::from_str(&retained_total).map_err(
-                        |source| invalid("invalid retained total cost").with_source(source),
-                    )?,
-                },
-            ))
-        })
-        .collect()
 }
 
 fn count_value(row: &sqlx::postgres::PgRow, field: &str) -> StoreResult<u64> {
@@ -761,14 +726,15 @@ pub(crate) async fn insert_account_group_in_transaction(
         .map_err(|source| invalid("invalid account group fields").with_source(source))?;
     sqlx::query(
         "insert into account_groups
-         (id, name, description, color, fast_mode, enabled, created_at, updated_at)
-         values ($1, $2, $3, $4, $5, true, now(), now())",
+         (id, name, description, color, fast_mode, allow_image_generation, enabled, created_at, updated_at)
+         values ($1, $2, $3, $4, $5, $6, true, now(), now())",
     )
     .bind(command.id.as_str())
     .bind(&command.name)
     .bind(&command.description)
     .bind(command.color.as_str())
     .bind(command.fast_mode.as_str())
+    .bind(command.allow_image_generation)
     .execute(&mut **transaction)
     .await
     .map_err(|error| map_group_write_error(error, command.id.as_str()))?;

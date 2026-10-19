@@ -1,5 +1,6 @@
 //! 验证真实插件 HTTP 中间件的请求改写、流式转换与短路响应
 
+mod capacity;
 mod dispatch;
 mod websocket;
 
@@ -28,6 +29,19 @@ async fn http_plugin_with_limits(
     ExtensionSetReference,
     gateway_core::engine::middleware::FrozenMiddlewarePlan,
 ) {
+    http_plugin_with_policy(mode, limits, PluginFailurePolicy::Reject).await
+}
+
+async fn http_plugin_with_policy(
+    mode: &str,
+    limits: RpcLimits,
+    failure_policy: PluginFailurePolicy,
+) -> (
+    tempfile::TempDir,
+    PluginRuntime,
+    ExtensionSetReference,
+    gateway_core::engine::middleware::FrozenMiddlewarePlan,
+) {
     let worker = std::fs::read(env!("CARGO_BIN_EXE_gateway-plugin-test-middleware")).unwrap();
     let package = crate::support::package_with_contributions(
         &worker,
@@ -42,12 +56,7 @@ async fn http_plugin_with_limits(
         vec![InstanceFixture {
             id: "http-plugin",
             configuration: serde_json::json!({"http":true,"mode":mode}),
-            bindings: vec![binding(
-                MIDDLEWARE_CONTRIBUTION,
-                "http",
-                0,
-                PluginFailurePolicy::Reject,
-            )],
+            bindings: vec![binding(MIDDLEWARE_CONTRIBUTION, "http", 0, failure_policy)],
         }],
         package,
         limits,
@@ -527,14 +536,7 @@ async fn http_onion_performance_baseline() {
         let plan = runtime.execution_registry().middleware(&generation);
         let snapshot = gateway_core::routing::RuntimeSnapshot::new(
             ConfigRevision::new(1).unwrap(),
-            gateway_core::settings::SettingsValues::new(
-                1,
-                0,
-                "smart",
-                Default::default(),
-                None,
-                None,
-            ),
+            gateway_core::settings::SettingsValues::new(1, "smart", Default::default(), None, None),
             vec![],
             vec![],
             vec![],
@@ -542,11 +544,21 @@ async fn http_onion_performance_baseline() {
         .unwrap();
         let settings =
             gateway_core::routing::request_settings::RequestSettings::new(Arc::new(snapshot));
-        for size in [64 * 1024, 2 * 1024 * 1024] {
+        for (size, header_bytes) in [64 * 1024, 2 * 1024 * 1024].into_iter().flat_map(|size| {
+            [0, 32 * 1024]
+                .into_iter()
+                .map(move |headers| (size, headers))
+        }) {
             let payload = Bytes::from(vec![b'a'; size]);
             for _ in 0..5 {
-                benchmark_http_request(plan.as_ref(), &settings, payload.clone(), mode == "map")
-                    .await;
+                benchmark_http_request(
+                    plan.as_ref(),
+                    &settings,
+                    payload.clone(),
+                    header_bytes,
+                    mode == "map",
+                )
+                .await;
             }
             let mut first_frames = Vec::new();
             let mut totals = Vec::new();
@@ -555,6 +567,7 @@ async fn http_onion_performance_baseline() {
                     plan.as_ref(),
                     &settings,
                     payload.clone(),
+                    header_bytes,
                     mode == "map",
                 )
                 .await;
@@ -566,14 +579,20 @@ async fn http_onion_performance_baseline() {
             let started = std::time::Instant::now();
             for _ in 0..5 {
                 futures::future::join_all((0..8).map(|_| {
-                    benchmark_http_request(plan.as_ref(), &settings, payload.clone(), mode == "map")
+                    benchmark_http_request(
+                        plan.as_ref(),
+                        &settings,
+                        payload.clone(),
+                        header_bytes,
+                        mode == "map",
+                    )
                 }))
                 .await;
             }
             println!(
                 "{}",
                 serde_json::json!({
-                    "case":label,"bytes":size,"samples":50,"concurrency":8,
+                    "case":label,"bytes":size,"header_bytes":header_bytes,"samples":50,"concurrency":8,
                     "first_frame_p50_ms":first_frames[24],"first_frame_p95_ms":first_frames[47],
                     "complete_p50_ms":totals[24],"complete_p95_ms":totals[47],
                     "concurrent_mib_per_second":(size as f64 * 40.0 / 1048576.0) / started.elapsed().as_secs_f64(),
@@ -591,6 +610,7 @@ async fn benchmark_http_request(
     plan: Option<&gateway_core::engine::middleware::FrozenMiddlewarePlan>,
     settings: &gateway_core::routing::request_settings::RequestSettings,
     payload: Bytes,
+    header_bytes: usize,
     uppercase: bool,
 ) -> (Duration, Duration) {
     let length = payload.len();
@@ -608,9 +628,32 @@ async fn benchmark_http_request(
                 .boxed_unsync(),
         )
         .unwrap();
+    if header_bytes > 0 {
+        let value = ::http::HeaderValue::from_bytes(&vec![b'a'; header_bytes / 8]).unwrap();
+        for _ in 0..8 {
+            request.headers_mut().append("x-benchmark", value.clone());
+        }
+    }
     request.extensions_mut().insert(core::Settings {
         runtime: Some(settings.clone()),
         timeout: None,
+    });
+    let entry = Arc::new(gateway_core::engine::extensions::RequestContext {
+        method: request.method().to_string(),
+        uri: request.uri().to_string(),
+        http_version: format!("{:?}", request.version()),
+        headers: request
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                gateway_core::engine::middleware::MiddlewareHeader::new(
+                    name.as_str(),
+                    value.as_bytes().to_vec().into(),
+                )
+            })
+            .collect(),
+        peer_addr: None,
+        client_ip: None,
     });
     let next = compose(Vec::new(), |request: core::Request| {
         Box::pin(async { Ok(core::Response::new(request.into_body())) })
@@ -624,7 +667,8 @@ async fn benchmark_http_request(
                     request_id: "benchmark".into(),
                     call_id: "benchmark".into(),
                     parent_call_id: None,
-                    extensions: Default::default(),
+                    extensions: gateway_core::engine::extensions::ExtensionCallScope::default()
+                        .with_request(entry),
                     cancellation: CancellationToken::new(),
                     plan: Some(plan.clone()),
                 },
