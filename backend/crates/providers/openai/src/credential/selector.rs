@@ -736,6 +736,9 @@ impl CodexCredentialSelector {
                         SystemTime::now(),
                     )
                 });
+            // 根线程主账号已删除、停用、失效或额度耗尽时，后代线程不再等根线程迁移：
+            // 根线程常在等子代理结果，互相等待只会让子代理反复排队超时，改按普通会话请求选号并迁移绑定
+            let follow_only = follow_only && !affinity.bound_account_lost();
             let cyber_policy_scope = self
                 .prepare_cyber_policy_scope(cyber_policy_session_key)
                 .await;
