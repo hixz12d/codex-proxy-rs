@@ -21,6 +21,7 @@ pub(crate) struct CodexSessionAffinity {
     anchor: String,
     session_id: Option<String>,
     follow_only: bool,
+    carries_history: bool,
 }
 
 impl CodexSessionAffinity {
@@ -38,6 +39,7 @@ impl CodexSessionAffinity {
             anchor: String::new(),
             session_id: None,
             follow_only: root.is_some() || alias.follow_only,
+            carries_history: false,
             turn_alias: Some((turn, alias)),
         }
     }
@@ -65,6 +67,11 @@ impl CodexSessionAffinity {
     pub(crate) fn with_follow_only(mut self, follow_only: bool) -> Self {
         self.follow_only |= follow_only;
         self
+    }
+
+    /// 请求已携带上游生成的对话历史；strict 下这类请求不能落到会话主账号以外的账号
+    pub(crate) const fn carries_history(&self) -> bool {
+        self.carries_history
     }
 
     #[must_use]
@@ -134,7 +141,23 @@ pub(crate) fn derive_codex_session_affinity(
         Some(session_id.to_owned()),
         client_api_key_id,
     )
-    .map(|affinity| affinity.with_follow_only(request.client_account_follow_only))
+    .map(|affinity| {
+        let mut affinity = affinity.with_follow_only(request.client_account_follow_only);
+        affinity.carries_history = carries_conversation_history(request.body());
+        affinity
+    })
+}
+
+/// 只有用户、开发者或系统消息的输入是新对话；助手消息、推理、工具调用与压缩项都来自上游历史
+fn carries_conversation_history(body: &Map<String, Value>) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                let kind = item.get("type").and_then(Value::as_str).unwrap_or("message");
+                kind != "message" || item.get("role").and_then(Value::as_str) == Some("assistant")
+            })
+        })
 }
 
 /// 原生 JSON 端点与 Responses 共用绑定命名空间，Search id 是逻辑会话身份
@@ -243,6 +266,7 @@ fn session_affinity(
         anchor,
         session_id,
         follow_only: false,
+        carries_history: false,
     })
 }
 

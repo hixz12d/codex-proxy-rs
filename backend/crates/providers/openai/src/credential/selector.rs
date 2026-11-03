@@ -53,6 +53,8 @@ const SESSION_AFFINITY_TIMEOUT: Duration = Duration::from_millis(500);
 const CYBER_POLICY_TIMEOUT: Duration = Duration::from_millis(100);
 const CYBER_POLICY_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_ACCOUNT_SNAPSHOT_RETRIES: u32 = 3;
+// strict 会话主账号冷却超过该时长时不再让客户端等待，改为要求新开对话
+const STRICT_SESSION_COOLDOWN_WAIT: Duration = Duration::from_secs(5 * 60);
 const COOLDOWN_READ_CONCURRENCY: usize = 128;
 // 套餐权限可能变化，明确拒绝只作有界的账号模型排除，不冻结整个账号
 const MODEL_UNSUPPORTED_COOLDOWN: Duration = Duration::from_secs(30 * 60);
@@ -490,6 +492,7 @@ impl CodexCredentialSelector {
                     error,
                     CredentialSelectionError::SessionBound(_)
                         | CredentialSelectionError::ContinuationOwnerChanged
+                        | CredentialSelectionError::SessionAccountLost
                         | CredentialSelectionError::PolicyFiltered
                         | CredentialSelectionError::PolicyRejected
                         | CredentialSelectionError::PolicyUnavailable
@@ -821,6 +824,37 @@ impl CodexCredentialSelector {
                         SystemTime::now(),
                     )
                 });
+            // strict 会话不跨账号：历史里的加密推理和压缩项都出自主账号，迁移到别的账号会把这些账号关联起来；
+            // 主账号丢失或长时间冷却时要求客户端新开对话，绑定已过期的带历史请求同样不能落到新账号
+            let strict_session = !diagnostic && affinity_mode == AccountAffinity::Strict;
+            let bound_cooldown = binding
+                .as_ref()
+                .filter(|_| affinity.escape_reason == Some(AffinityEscapeReason::Cooldown))
+                .and_then(|binding| {
+                    candidates
+                        .iter()
+                        .find(|candidate| candidate.account.id() == binding.account_id())
+                })
+                .and_then(|candidate| candidate.signals.cooldown)
+                .map(|cooldown| {
+                    cooldown
+                        .until
+                        .duration_since(SystemTime::now())
+                        .unwrap_or_default()
+                });
+            if strict_session
+                && match binding.as_ref() {
+                    Some(_) => {
+                        affinity.bound_account_lost()
+                            || bound_cooldown.is_some_and(|wait| wait > STRICT_SESSION_COOLDOWN_WAIT)
+                    }
+                    None => request
+                        .session_affinity_observation
+                        .is_some_and(CodexSessionAffinity::carries_history),
+                }
+            {
+                return Err(CredentialSelectionError::SessionAccountLost);
+            }
             // 根线程主账号已删除、停用、失效或额度耗尽时，后代线程不再等根线程迁移：
             // 根线程常在等子代理结果，互相等待只会让子代理反复排队超时，改按普通会话请求选号并迁移绑定
             let follow_only = follow_only && !affinity.bound_account_lost();
@@ -1041,6 +1075,17 @@ impl CodexCredentialSelector {
                 };
                 affinity.observe_preferred_selection(selection.preferred());
                 let selected = selection.candidate();
+                // 主账号仍可恢复（本次重试已排除、短暂冷却或繁忙）时不换号，交回原失败或让客户端稍后重试
+                if strict_session
+                    && let Some(bound) = binding.as_ref().map(ProviderSessionBinding::account_id)
+                    && selected.account.id() != bound
+                {
+                    return Err(CredentialSelectionError::SessionBound(Box::new(
+                        CredentialSelectionError::CapacityUnavailable {
+                            retry_after: minimum_duration(shortest_retry, bound_cooldown),
+                        },
+                    )));
+                }
                 let account = candidates
                     .iter()
                     .find(|candidate| candidate.account.id() == selected.account.id())
@@ -1895,6 +1940,8 @@ pub enum CredentialSelectionError {
     Cancelled,
     #[error("session account changed during native continuation")]
     ContinuationOwnerChanged,
+    #[error("strict session account is lost; the conversation must restart")]
+    SessionAccountLost,
     #[error("session account binding cannot be bypassed: {0}")]
     SessionBound(#[source] Box<CredentialSelectionError>),
     #[error(transparent)]

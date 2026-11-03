@@ -767,6 +767,8 @@ pub(super) fn map_request_error(error: CodexRequestEncodeError) -> ProviderError
     provider_error(kind, UpstreamSendState::NotSent)
 }
 
+const SESSION_ACCOUNT_LOST_MESSAGE: &str = "该账号智商出现了问题，辛苦佬新开一个对话。如果不希望损失信息：先在本窗口输入 /status 复制 Session ID，再在新对话里发送：请继续 ~/.codex/sessions 中 <Session ID> 会话（只看用户和助手的对话）并完成我的任务";
+
 pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderError {
     selection_failure(&error).with_source(error)
 }
@@ -796,6 +798,17 @@ fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
         CredentialSelectionError::ContinuationOwnerChanged => {
             continuation_replay_required_error("scope_unavailable")
         }
+        // 400 + invalid_request_error 才会被下游网关原样转给客户端，且不触发换上游或账号标记
+        CredentialSelectionError::SessionAccountLost => provider_error(
+            ProviderErrorKind::InvalidRequest,
+            UpstreamSendState::NotSent,
+        )
+        .with_retry_prohibited()
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            SESSION_ACCOUNT_LOST_MESSAGE,
+            Some("session_account_lost".to_owned()),
+            Some("invalid_request_error".to_owned()),
+        )),
         CredentialSelectionError::SessionBound(error) => {
             selection_failure(error).with_retry_prohibited()
         }
