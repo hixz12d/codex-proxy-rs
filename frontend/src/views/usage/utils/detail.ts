@@ -1,10 +1,11 @@
 import type { UsageRecordDetail } from '@/api'
+import { t } from '@/i18n'
 import { isRecord } from '@/utils/data'
 
 // 详情弹窗共享的字段展示约定：占位符、标签/值样式，供弹窗与其子组件复用。
-export const fieldLabelClass = 'text-cp-xs leading-none font-bold text-cp-text-quaternary'
+export const fieldLabelClass = 'text-z-xs leading-none font-bold text-z-text-quaternary'
 export const fieldValueBaseClass
-  = 'mt-1.5 mb-0 min-w-0 truncate text-cp-sm leading-none font-bold text-cp-text'
+  = 'mt-1.5 mb-0 min-w-0 truncate text-z-sm leading-none font-bold text-z-text'
 
 export function displayValue(value: unknown) {
   if (value === undefined || value === null || value === '')
@@ -13,7 +14,10 @@ export function displayValue(value: unknown) {
 }
 
 export function fieldValueClass(mono?: boolean) {
-  return [fieldValueBaseClass, mono ? 'font-mono tabular-nums' : undefined]
+  return [
+    fieldValueBaseClass,
+    mono ? 'font-mono tabular-nums' : undefined,
+  ]
 }
 
 export function isErrorUsageRecord(record: Pick<UsageRecordDetail, 'logicalOutcome'> | null) {
@@ -22,21 +26,21 @@ export function isErrorUsageRecord(record: Pick<UsageRecordDetail, 'logicalOutco
 
 export function attemptOutcomeText(outcome: string) {
   const labels: Record<string, string> = {
-    succeeded: '成功',
-    failed: '失败',
-    cancelled: '取消',
-    incomplete: '未完成',
-    running: '进行中',
+    succeeded: t('common.status.success'),
+    failed: t('common.status.failed'),
+    cancelled: t('usage.status.cancelled'),
+    incomplete: t('usage.health.notCompleted'),
+    running: t('usage.request.inProgress'),
   }
   return labels[outcome] ?? outcome
 }
 
 export function attemptOutcomeClass(outcome: string) {
   if (outcome === 'succeeded')
-    return 'text-cp-success-text'
+    return 'text-z-success-text'
   if (outcome === 'failed')
-    return 'text-cp-error-text'
-  return 'text-cp-text-secondary'
+    return 'text-z-error-text'
+  return 'text-z-text-secondary'
 }
 
 export function visibleRequestText(record: UsageRecordDetail) {
@@ -78,7 +82,9 @@ function extractInputText(body: unknown) {
       return content.flatMap((part) => {
         const value = asRecord(part)
         const text = stringProperty(value, 'text')
-        return value?.type === 'input_text' && text ? [text] : []
+        return value?.type === 'input_text' && text
+          ? [text]
+          : []
       })
     })
     .filter(Boolean)
@@ -97,7 +103,9 @@ function extractOutputText(body: unknown) {
         return []
       return content.flatMap((part) => {
         const text = stringProperty(asRecord(part), 'text')
-        return text ? [text] : []
+        return text
+          ? [text]
+          : []
       })
     })
     .filter(Boolean)
@@ -105,10 +113,14 @@ function extractOutputText(body: unknown) {
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return isRecord(value) ? value : undefined
+  return isRecord(value)
+    ? value
+    : undefined
 }
 
 function stringProperty(value: Record<string, unknown> | undefined, key: string) {
   const valueAtKey = value?.[key]
-  return typeof valueAtKey === 'string' ? valueAtKey : undefined
+  return typeof valueAtKey === 'string'
+    ? valueAtKey
+    : undefined
 }

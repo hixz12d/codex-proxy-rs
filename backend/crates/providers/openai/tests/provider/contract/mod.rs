@@ -1,12 +1,15 @@
 //! OpenAI 执行合同测试入口，以及协议转换与发送前校验测试
 
+mod account_eligibility;
 mod account_isolation;
 mod capacity;
 mod cookies;
+mod correlation;
 mod error_details;
-mod image_account_eligibility;
 mod image_model_access;
 mod model_account_eligibility;
+mod outbound;
+pub(super) use outbound::outbound_context;
 mod passthrough;
 mod precommit;
 mod privacy;
@@ -17,6 +20,7 @@ mod search_model_access;
 mod selection_retry;
 mod session_binding;
 mod timing;
+mod turn_state;
 mod upstream_adapter;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,7 +62,6 @@ use gateway_core::operation::{
     OperationKind, ProtocolPayload, ProviderSessionState, RawJsonPayload, StandaloneSearchRequest,
 };
 use gateway_core::policy::ClientApiKeyId;
-use gateway_core::provider_ports::ProviderLeasePort;
 use gateway_core::routing::extensions::{ExtensionSetId, ExtensionSetLease, ExtensionSetReference};
 use gateway_core::routing::{
     ClientRoutingScope, ConfigRevision, FrozenAccountScope, ModelCapabilities, ModelServiceTier,
@@ -143,7 +146,7 @@ async fn account_client_preparation_keeps_ca_read_cause_without_exposing_path() 
     assert!(diagnostic.as_str().contains("OS cause:"));
     assert!(!diagnostic.as_str().contains("PRIVATE_"));
     let gateway = gateway_core::error::GatewayError::from_provider(&snapshot);
-    assert_eq!(gateway.safe_message(), "upstream service is unavailable");
+    assert_eq!(gateway.safe_message(), "Upstream service is unavailable.");
     assert_eq!(gateway.diagnostic(), Some(diagnostic));
 }
 
@@ -615,7 +618,7 @@ async fn attempt_middleware_can_change_reasoning_before_native_encoding() {
 }
 
 #[tokio::test]
-async fn responses_bill_sent_model_and_observe_unpriced_response_without_rewriting_it() {
+async fn responses_bill_sent_model_and_preserve_returned_model() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
     let server = MockServer::start().await;
@@ -652,7 +655,6 @@ async fn responses_bill_sent_model_and_observe_unpriced_response_without_rewriti
         )
         .await
         .unwrap();
-    let mut observed = None;
     let mut returned = None;
     let mut costs = Vec::new();
     while let Some(event) = stream.next().await {
@@ -661,9 +663,6 @@ async fn responses_bill_sent_model_and_observe_unpriced_response_without_rewriti
             if let GatewayEvent::CalculatedCost(cost) = fact {
                 costs.push(cost.total().amount().scaled());
             }
-        }
-        if let Some(observation) = event.response_observation() {
-            observed = observation.upstream_response_model().map(str::to_owned);
         }
         if let Some(wire) = event.wire_event()
             && wire.data().get("type").and_then(Value::as_str) == Some("response.completed")
@@ -678,12 +677,11 @@ async fn responses_bill_sent_model_and_observe_unpriced_response_without_rewriti
     let requests = server.received_requests().await.expect("upstream requests");
     assert_eq!(captured_request_body(&requests[0])["model"], "gpt-5.4");
     assert_eq!(costs, vec![3_437_500]);
-    assert_eq!(observed.as_deref(), Some("gpt-6-sol"));
-    assert_eq!(returned, observed);
+    assert_eq!(returned.as_deref(), Some("gpt-6-sol"));
 }
 
 #[tokio::test]
-async fn websocket_bills_sent_model_and_observes_internal_model_report() {
+async fn websocket_bills_sent_model_and_preserves_response_metadata() {
     for metadata_type in ["response.metadata", "codex.response.metadata"] {
         let store = Arc::new(MemoryAccountStore::default());
         create_account(&store, "acct_provider_contract").await;
@@ -726,7 +724,6 @@ async fn websocket_bills_sent_model_and_observes_internal_model_report() {
             )
             .await
             .expect("provider stream");
-        let mut observed = None;
         let mut returned = None;
         let mut costs = Vec::new();
         while let Some(event) = stream.next().await {
@@ -735,9 +732,6 @@ async fn websocket_bills_sent_model_and_observes_internal_model_report() {
                 if let GatewayEvent::CalculatedCost(cost) = fact {
                     costs.push(cost.total().amount().scaled());
                 }
-            }
-            if let Some(observation) = event.response_observation() {
-                observed = observation.upstream_response_model().map(str::to_owned);
             }
             if let Some(wire) = event.wire_event()
                 && wire.data().get("type").and_then(Value::as_str) == Some("response.completed")
@@ -751,11 +745,6 @@ async fn websocket_bills_sent_model_and_observes_internal_model_report() {
         }
         server.await.expect("server task");
         assert_eq!(costs, vec![3_437_500]);
-        assert_eq!(
-            observed.as_deref(),
-            Some("gpt-server-report"),
-            "{metadata_type}"
-        );
         assert_eq!(returned.as_deref(), Some("gpt-6-astra"));
     }
 }
@@ -1124,6 +1113,7 @@ fn wire_profile() -> CodexWireProfileState {
         terminal: "provider-contract".to_owned(),
         exact_user_agent: None,
         residency: None,
+        account_routing_override: None,
         verified_at: Utc::now(),
     })
 }
@@ -1256,8 +1246,7 @@ fn provider_and_quota_with_runtime_ports(
         profile.clone(),
         http.clone(),
         base_url.clone(),
-        cooldowns,
-        Arc::clone(&leases) as Arc<dyn ProviderLeasePort>,
+        cooldowns.clone(),
         policy,
     ));
     let account_feedback = Arc::new(AccountFeedbackStats::default());
@@ -1268,6 +1257,8 @@ fn provider_and_quota_with_runtime_ports(
         session_affinity,
         Arc::new(MemorySessionExclusions::default()),
         Arc::clone(&quota),
+        Arc::clone(&catalog),
+        cooldowns,
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().expect("cookie policy"),
     ));
@@ -1551,12 +1542,17 @@ impl MiddlewarePlan for TranslationMiddleware {
         assert_eq!(context.mount(), MiddlewareMount::Attempt);
         assert!(context.account_id().is_some());
         *self.translations.lock().unwrap() += 1;
-        let (_, headers, _) = request.into_parts();
-        next.run(MiddlewareRequest::new(
-            "openai",
-            headers,
-            Bytes::from(serde_json::to_vec(&self.target).unwrap()),
-        ))
+        let headers = request.headers().to_vec();
+        next.run(
+            request
+                .replace_parts(
+                    "openai".into(),
+                    headers,
+                    Bytes::from(serde_json::to_vec(&self.target).unwrap()),
+                    None,
+                )
+                .unwrap(),
+        )
     }
 }
 
@@ -1590,16 +1586,21 @@ impl MiddlewarePlan for RecordingMiddleware {
     ) -> BoxFuture<'static, Result<MiddlewareResponse, MiddlewareError>> {
         assert_eq!(context.mount(), MiddlewareMount::Attempt);
         assert_eq!(request.protocol(), "openai");
-        let (protocol, mut headers, bytes) = request.into_parts();
+        let (protocol, mut headers, bytes) = request.clone().into_parts();
         let mut body: Map<String, Value> = serde_json::from_slice(&bytes).unwrap();
         self.observed.lock().unwrap().push(body.clone());
         body.insert(self.replacement.0.clone(), self.replacement.1.clone());
         headers.extend(self.request_headers.clone());
-        next.run(MiddlewareRequest::new(
-            protocol,
-            headers,
-            Bytes::from(serde_json::to_vec(&body).unwrap()),
-        ))
+        next.run(
+            request
+                .replace_parts(
+                    protocol,
+                    headers,
+                    Bytes::from(serde_json::to_vec(&body).unwrap()),
+                    None,
+                )
+                .unwrap(),
+        )
     }
 }
 
@@ -1872,7 +1873,7 @@ async fn provider_should_send_the_request_snapshot_location_to_the_upstream() {
         "model": "gpt-5.4",
         "input": [{
             "role": "user",
-            "content": [{"type": "input_text", "text": "<environment_context><timezone>UTC</timezone></environment_context>"}],
+            "content": [{"type": "input_text", "text": "<environment_context><current_date>2026-10-22</current_date><timezone>UTC</timezone></environment_context>"}],
             "internal_chat_message_metadata_passthrough": {
                 "content_item_kinds": ["environments.environment_context"],
                 "create_time": 1789293131.822
@@ -1898,7 +1899,7 @@ async fn provider_should_send_the_request_snapshot_location_to_the_upstream() {
     assert_eq!(
         body.pointer("/input/0/content/0/text"),
         Some(&json!(
-            "<environment_context><timezone>Pacific/Auckland</timezone></environment_context>"
+            "<environment_context><current_date>2026-10-22</current_date><timezone>Pacific/Auckland</timezone></environment_context>"
         ))
     );
     assert_eq!(
@@ -1924,8 +1925,8 @@ async fn provider_should_override_unclassified_time_contexts_over_websocket() {
         }).to_string().into())).await.expect("complete response");
         body
     });
-    let environment = "<environment_context><cwd>/home/example/项目</cwd><timezone>Asia/Shanghai</timezone></environment_context>";
-    let desktop = "<codex_apps_client_time_context><timezone>Asia/Shanghai</timezone></codex_apps_client_time_context>";
+    let environment = "<environment_context><cwd>/home/example/项目</cwd><current_date>2026-10-22</current_date><timezone>Asia/Shanghai</timezone></environment_context>";
+    let desktop = "<codex_apps_client_time_context><timezone>Asia/Shanghai</timezone><current_date>2026-10-21</current_date></codex_apps_client_time_context>";
     let payload = ProtocolPayload::json_object(
         "openai",
         json!({
@@ -3550,14 +3551,13 @@ async fn standalone_search_preserves_wire_and_scopes_turn_metadata_to_the_select
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
     let server = MockServer::start().await;
-    let request_body = br#"{ "id":"search-session", "model":"gpt-future", "commands":{"search_query":[{"q":"private query","future":9007199254740993}]}, "future":1, "future":2 }"#;
+    let request_body = br#"{ "id":"search-session", "future_session":"search-session", "model":"gpt-future", "commands":{"search_query":[{"q":"private query","future":9007199254740993}]}, "future":1, "future":2 }"#;
     let response_body = br#"{ "encrypted_output":"ciphertext", "output":"search result", "results":[{"type":"text_result","ref_id":"turn0search0","future":9007199254740993}] }"#;
     Mock::given(method("POST"))
         .and(path("/codex/alpha/search"))
         .and(header("originator", "codex_cli_rs"))
         .and(header("version", "0.144.0"))
         .and(header("accept", "*/*"))
-        .and(body_bytes(request_body.to_vec()))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/json")
@@ -3624,13 +3624,13 @@ async fn standalone_search_preserves_wire_and_scopes_turn_metadata_to_the_select
     assert_eq!(raw_response.as_deref(), Some(response_body.as_slice()));
     let requests = server.received_requests().await.expect("received requests");
     let request = requests.first().expect("single search request");
-    assert_eq!(request.body.as_slice(), request_body);
+    assert_scoped_search_body(&request.body, request_body);
     let metadata_values = captured_header_values(request, "x-codex-turn-metadata");
     assert_eq!(metadata_values.len(), 1);
     let metadata: Value = serde_json::from_slice(&metadata_values[0]).expect("turn metadata JSON");
-    assert_eq!(metadata.get("session_id"), Some(&json!("session")));
-    assert_eq!(metadata.get("thread_id"), Some(&json!("thread")));
-    assert_eq!(metadata.get("turn_id"), Some(&json!("turn")));
+    assert_scoped_id(metadata["session_id"].as_str().unwrap(), "session");
+    assert_scoped_id(metadata["thread_id"].as_str().unwrap(), "thread");
+    assert_eq!(metadata["turn_id"], "turn");
     assert_eq!(metadata.get("future"), Some(&json!(true)));
     assert!(metadata.get("account_id").is_none());
     assert_ne!(
@@ -3650,7 +3650,6 @@ async fn standalone_search_returns_the_exact_upstream_error_response() {
     let response_body = br#"{ "error":{"message":"future search validation","type":"search_error","code":"future_code"}, "future":9007199254740993 }"#;
     Mock::given(method("POST"))
         .and(path("/codex/alpha/search"))
-        .and(body_bytes(request_body.to_vec()))
         .respond_with(
             ResponseTemplate::new(422)
                 .insert_header("content-type", "application/problem+json")
@@ -4105,10 +4104,6 @@ async fn websocket_fast_path_miss_uses_http_and_keeps_background_preconnect() {
                     );
                 }
                 assert_eq!(metadata["upstreamStatus"], 200);
-                assert_eq!(
-                    metadata["upstreamReportedModel"],
-                    "gpt-reported-by-upstream"
-                );
                 assert!(metadata["requestSummary"].is_object());
                 assert!(metadata["upstreamTraceHeaders"].is_array());
                 first_decision = metadata
@@ -4252,6 +4247,7 @@ async fn websocket_midstream_error_frame_surfaces_upstream_message_after_deliver
     create_account(&store, ACCOUNT_ID).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (release_error, error_released) = oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept WebSocket");
         let mut websocket = accept_codex_test_websocket(stream).await;
@@ -4283,7 +4279,9 @@ async fn websocket_midstream_error_frame_surfaces_upstream_message_after_deliver
             ))
             .await
             .expect("send response.in_progress");
-        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        error_released
+            .await
+            .expect("prelude delivered to the client");
         websocket
             .send(Message::Text(
                 json!({
@@ -4312,6 +4310,16 @@ async fn websocket_midstream_error_frame_surfaces_upstream_message_after_deliver
         )
         .await
         .expect("prepare midstream-failure stream");
+    for kind in ["response.created", "response.in_progress"] {
+        let event = timeout(
+            Duration::from_secs(2),
+            precommit::next_client_event(&mut stream),
+        )
+        .await
+        .expect("upstream prelude must reach the client");
+        assert_eq!(event.wire_event().unwrap().event_type(), Some(kind));
+    }
+    release_error.send(()).unwrap();
     let mut failure = loop {
         match stream.next().await {
             Some(Ok(_)) => {}
@@ -4426,130 +4434,6 @@ async fn websocket_idle_timeout_diagnosis_survives_ambiguous_send_wrapping() {
         error.diagnostic().map(|diagnostic| diagnostic.as_str()),
         Some("OpenAI WebSocket receive idle timeout after 300s"),
     );
-}
-
-#[tokio::test]
-async fn websocket_pong_timeout_diagnosis_survives_ambiguous_send_wrapping() {
-    for reuse in [false, true] {
-        const ACCOUNT_ID: &str = "acct_abrupt_disconnect";
-        let store = Arc::new(MemoryAccountStore::default());
-        create_account(&store, ACCOUNT_ID).await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let (ping_seen_tx, ping_seen_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut websocket = accept_codex_test_websocket(stream).await;
-            websocket.next().await.unwrap().unwrap();
-            if reuse {
-                websocket
-                    .send(Message::Text(
-                        json!({
-                            "type": "response.completed",
-                            "response": {
-                                "id": "resp_warmup",
-                                "model": "gpt-5.4",
-                                "status": "completed",
-                                "output": [],
-                                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-                            }
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await
-                    .unwrap();
-                websocket.next().await.unwrap().unwrap();
-            }
-            for event in [
-                json!({"type": "response.created", "response": {"id": "resp_pong", "model": "gpt-5.4"}}),
-                json!({"type": "response.output_text.delta", "delta": "private-response-body"}),
-            ] {
-                websocket
-                    .send(Message::Text(event.to_string().into()))
-                    .await
-                    .unwrap();
-            }
-            std::assert_matches!(websocket.next().await.unwrap().unwrap(), Message::Ping(_));
-            ping_seen_tx.send(()).unwrap();
-            // 停止 poll，避免 tungstenite 自动回 Pong，复现本地保活超时
-            futures::future::pending::<()>().await;
-        });
-        let operation = Operation::Generate(generate_with_persisted_session_context(
-            ACCOUNT_ID,
-            "conversation-pong-timeout",
-            "session-pong-timeout",
-            "turn-pong-timeout",
-        ));
-        let provider = provider_with_base_url(&store, base_url);
-        if reuse {
-            let mut warmup = Arc::clone(&provider)
-                .execute(
-                    planned_request("openai", operation.clone()),
-                    context("req_pong_warmup", CancellationToken::new()),
-                )
-                .await
-                .unwrap();
-            while let Some(event) = warmup.next().await {
-                event.unwrap();
-            }
-        }
-        let mut stream = provider
-            .execute(
-                planned_request("openai", operation),
-                context("req_pong_timeout", CancellationToken::new()),
-            )
-            .await
-            .unwrap();
-        let mut pool_kind = None;
-        loop {
-            let event = stream.next().await.unwrap().unwrap();
-            if let Some(observation) = event.response_observation() {
-                pool_kind = observation.websocket_pool().or(pool_kind);
-            }
-            if event.has_client_event() {
-                break;
-            }
-        }
-        assert_eq!(
-            pool_kind,
-            Some(if reuse {
-                WebSocketPoolKind::Reuse
-            } else {
-                WebSocketPoolKind::New
-            })
-        );
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(25)).await;
-        ping_seen_rx.await.unwrap();
-        tokio::time::advance(Duration::from_secs(31)).await;
-        let error = loop {
-            match stream.next().await {
-                Some(Ok(_)) => {}
-                Some(Err(error)) => break error,
-                None => panic!("Pong timeout must surface a provider error"),
-            }
-        };
-        server.abort();
-        tokio::time::resume();
-        assert_eq!(error.send_state(), UpstreamSendState::Ambiguous);
-        assert!(!error.replay_is_safe());
-        assert_eq!(error.pre_delivery_retry(), None);
-        assert_eq!(error.kind(), ProviderErrorKind::Transport);
-        assert_eq!(
-            error.connection_observation().unwrap().exit_reason(),
-            "pong_timeout"
-        );
-        let diagnostic = error.diagnostic().unwrap();
-        assert_eq!(diagnostic.code(), Some("pong_timeout"));
-        assert_eq!(diagnostic.stage(), Some("receive"));
-        assert_eq!(
-            diagnostic.as_str(),
-            "OpenAI WebSocket stream ended before a terminal response (pong_timeout); local keepalive timeout after 30s; last event type: response.output_text.delta",
-        );
-        assert!(error.raw_upstream_error().is_none());
-        assert!(error.client_visible_upstream_error().is_none());
-    }
 }
 
 #[tokio::test]
@@ -5271,6 +5155,8 @@ async fn oversized_http_threshold_counts_utf8_and_json_escaping() {
     let requests = server.received_requests().await.unwrap();
     let mut frame = captured_request_body(&requests[0]);
     frame["type"] = json!("response.create");
+    // 发送前阈值按本地请求副本计量，账号域映射在实际出站时执行
+    frame["session_id"] = body["session_id"].clone();
     let baseline_len = serde_json::to_vec(&frame).unwrap().len();
 
     for (payload_len, expected) in [(THRESHOLD - 1, "websocket"), (THRESHOLD, "http_sse")] {
@@ -5885,7 +5771,6 @@ async fn websocket_opening_account_rejection_keeps_replay_safe_without_transport
         "before-payload rejection is replay safe"
     );
     // 回放安全的账号级拒绝必须把换号决策留给 Core，不得钉死同账号传输重试
-    // （旧行为会携带小时级 retry-after 的同账号重试标记，请求必然超时）
     assert_eq!(error.pre_delivery_retry(), None);
 }
 
@@ -6125,7 +6010,7 @@ async fn opaque_provider_options_do_not_change_openai_account_selection() {
 }
 
 #[tokio::test]
-async fn http_account_scoping_drops_downstream_installation_header() {
+async fn http_account_scoping_replaces_downstream_installation_header() {
     for owner in ["acct_scope_same", "acct_scope_old"] {
         let raw = r#"{"installation_id":"client-installation","future":true}"#;
         let request = capture_scoped_http_request(
@@ -6166,7 +6051,10 @@ async fn http_account_scoping_drops_downstream_installation_header() {
         assert_ne!(installation_id, "client-installation");
         assert!(uuid::Uuid::parse_str(installation_id).is_ok());
         assert_eq!(body["installation_id"], installation_id);
-        assert!(captured_header_values(&request, "x-codex-installation-id").is_empty());
+        assert_eq!(
+            captured_header_values(&request, "x-codex-installation-id"),
+            vec![installation_id.as_bytes().to_vec()]
+        );
         let headers = captured_header_values(&request, "x-codex-turn-metadata");
         assert_eq!(headers.len(), 1);
         for encoded in [
@@ -6184,7 +6072,7 @@ async fn http_account_scoping_drops_downstream_installation_header() {
 }
 
 #[tokio::test]
-async fn websocket_account_scoping_drops_downstream_installation_header() {
+async fn websocket_account_scoping_replaces_downstream_installation_header() {
     for owner in ["acct_scope_same", "acct_scope_old"] {
         let raw = r#"{"installation_id":"client-installation","future":true}"#;
         let store = Arc::new(MemoryAccountStore::default());
@@ -6263,7 +6151,7 @@ async fn websocket_account_scoping_drops_downstream_installation_header() {
         assert_ne!(installation_id, "client-installation");
         assert!(uuid::Uuid::parse_str(installation_id).is_ok());
         assert_eq!(body["installation_id"], installation_id);
-        assert!(!header.contains_key("x-codex-installation-id"));
+        assert_eq!(header["x-codex-installation-id"], installation_id);
         for encoded in [
             header["x-codex-turn-metadata"]
                 .to_str()
@@ -6335,7 +6223,10 @@ async fn same_account_scope_preserves_future_protocol_shapes() {
         body.pointer("/client_metadata/x-codex-installation-id")
     );
     assert!(body.pointer("/client_metadata/installation_id").is_none());
-    assert!(captured_header_values(&request, "x-codex-installation-id").is_empty());
+    assert_eq!(
+        request.headers["x-codex-installation-id"].to_str().unwrap(),
+        body["client_metadata"]["x-codex-installation-id"]
+    );
 }
 
 #[tokio::test]
@@ -6364,9 +6255,9 @@ async fn cross_account_scope_removes_only_account_bound_body_fields() {
 
     assert!(body.get("authorization").is_none());
     assert!(body.get("conversation").is_none());
-    assert_eq!(
-        body.get("conversation_id"),
-        Some(&json!("client-correlation"))
+    assert_scoped_id(
+        body["conversation_id"].as_str().unwrap(),
+        "client-correlation",
     );
     assert_eq!(
         body.get("client_metadata"),
@@ -6729,6 +6620,8 @@ async fn missing_affinity_continuation_should_require_client_replay_without_an_u
 
 #[tokio::test]
 async fn missing_affinity_full_request_should_clear_unowned_turn_state() {
+    let trace = gateway_core::diagnostics::TraceContext::new("req_unknown_turn_state");
+    let input = json!((0..520).map(|index| json!({"role":"user", "content":format!("{index}:{}", "private-transcript".repeat(60))})).collect::<Vec<_>>());
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_unknown_turn_state").await;
     let server = MockServer::start().await;
@@ -6747,7 +6640,9 @@ async fn missing_affinity_full_request_should_clear_unowned_turn_state() {
             "openai",
             Map::from_iter([
                 ("model".to_owned(), json!("gpt-5.4")),
-                ("input".to_owned(), json!("full transcript")),
+                ("input".to_owned(), input.clone()),
+                ("instructions".to_owned(), json!("private-instructions")),
+                ("tools".to_owned(), json!([{"type":"function", "name":"private_tool", "parameters":{"type":"object"}}])),
             ]),
         )
         .expect("OpenAI payload")
@@ -6761,7 +6656,21 @@ async fn missing_affinity_full_request_should_clear_unowned_turn_state() {
     let mut stream = provider_with_base_url(&store, server.uri())
         .execute(
             planned_request("openai", Operation::Generate(generation)),
-            context("req_unknown_turn_state", CancellationToken::new()),
+            AttemptContext::new(
+                RequestAttemptContext::new(
+                    ModelRequestId::new("req_unknown_turn_state").unwrap(),
+                    ClientApiKeyId::new("key_openai_contract").unwrap(),
+                )
+                .with_trace(trace.clone())
+                .with_request_location(Some(global_request_location())),
+                NonZeroU32::new(1).unwrap(),
+                SystemTime::now() + Duration::from_secs(30),
+                account_policy(),
+                AccountAttemptContext::new(BTreeSet::<ProviderAccountId>::new(), None, None)
+                    .with_account_scope(contract_account_scope()),
+                None,
+                CancellationToken::new(),
+            ),
         )
         .await
         .expect("prepare full replay stream");
@@ -6774,6 +6683,30 @@ async fn missing_affinity_full_request_should_clear_unowned_turn_state() {
         .expect("captured full replay request");
 
     assert!(captured_header_values(&requests[0], "x-codex-turn-state").is_empty());
+    assert_eq!(captured_request_body(&requests[0])["input"], input);
+    let snapshot = trace.snapshot().unwrap();
+    let events = snapshot["events"].as_array().unwrap();
+    let evidence =
+        |stage: &str| &events.iter().find(|event| event["stage"] == stage).unwrap()["data"];
+    let before = evidence("provider.request.input");
+    let outbound = evidence("provider.request.outbound");
+    assert_eq!(before["input"], outbound["input"]);
+    assert_eq!(before["input"]["omittedItems"], 8);
+    for field in ["instructions", "tools"] {
+        assert_eq!(before["fields"][field], outbound["fields"][field]);
+    }
+    let scope = evidence("provider.request.account_scope");
+    assert_eq!(scope["scope"], "unknown");
+    assert!(scope["before"]["turnState"].is_object());
+    assert!(scope["after"]["turnState"].is_null());
+    for private in [
+        "private-transcript",
+        "private-instructions",
+        "private_tool",
+        "unowned-turn-state",
+    ] {
+        assert!(!snapshot.to_string().contains(private));
+    }
 }
 
 #[tokio::test]
@@ -7272,6 +7205,7 @@ async fn affinity_quota_switch_should_clear_old_turn_state_without_a_provider_st
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            expected_connection: None,
             plan_type: None,
             account_id: first_account.id().clone(),
             expected_revision: first_account.revision(),
@@ -8260,6 +8194,7 @@ async fn official_usage_limit_failure_persists_fact_without_fabricating_usage() 
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
             expected_revision: account.revision(),
@@ -8636,8 +8571,7 @@ async fn request_rejections_should_not_retry_or_cool_down_accounts() {
         } else {
             http_generate_operation()
         };
-        let (provider, _) =
-            provider_with_capacity_tracking(&store, server.uri(), Arc::clone(&cooldowns));
+        let (provider, _) = provider_with_cooldowns(&store, server.uri(), Arc::clone(&cooldowns));
         let mut stream = provider
             .execute(
                 planned_request("openai", operation),
@@ -8709,7 +8643,7 @@ fn capacity_websocket_operation() -> Operation {
     )
 }
 
-fn provider_with_capacity_tracking(
+fn provider_with_cooldowns(
     store: &Arc<MemoryAccountStore>,
     base_url: String,
     cooldowns: Arc<MemoryCooldownPort>,
@@ -8721,118 +8655,82 @@ fn provider_with_capacity_tracking(
         Arc::new(TestLeaseCoordinator::default()),
         0,
         cooldowns,
-        crate::support::StaticFreezePolicy::policy_port(
-            gateway_core::provider_ports::ProviderFreezePolicy::try_new(
-                true, 12, 600, 7_200, true, None, true,
-            )
-            .expect("freeze policy"),
-        ),
+        crate::support::runtime_policy(),
     );
     (provider, pool)
 }
 
 #[tokio::test]
-async fn capacity_feedback_only_counts_overload_rejections_and_excludes_diagnostic_probes() {
-    use gateway_core::provider_ports::ProviderCooldownPort as _;
-
+async fn http_and_websocket_rejections_preserve_original_protection_fields() {
     for websocket in [false, true] {
-        for (status, code, capacity) in [
-            (429, "slow_down", true),
-            (503, "server_is_overloaded", true),
-            (500, "server_error", false),
-            (502, "server_error", false),
-            (503, "service_unavailable_error", false),
+        for (status, code) in [
+            (400, "invalid_prompt"),
+            (429, "slow_down"),
+            (503, "server_is_overloaded"),
+            (500, "server_error"),
         ] {
-            for diagnostic in [false, true] {
-                let store = Arc::new(MemoryAccountStore::default());
-                let account_id = "acct_provider_contract";
-                create_account(&store, account_id).await;
-                let account = store.account(account_id).expect("account");
-                let cooldowns = Arc::new(MemoryCooldownPort::new());
-                let server = MockServer::start().await;
-                Mock::given(method(if websocket { "GET" } else { "POST" }))
-                    .and(path("/codex/responses"))
-                    .respond_with(
-                        ResponseTemplate::new(status).set_body_json(json!({"error": {
-                            "code": code,
-                            "message": "Upstream temporarily unavailable"
-                        }})),
-                    )
-                    .expect(2)
-                    .mount(&server)
-                    .await;
-                let (provider, _) =
-                    provider_with_capacity_tracking(&store, server.uri(), Arc::clone(&cooldowns));
-                // 同时验证窗口证据已过期与尚未过期：探测不能重建峰值，也不能改写原计数
-                for existing_evidence in [None, Some((4, 20))] {
-                    if let Some((count, peak)) = existing_evidence {
-                        for _ in 0..count {
-                            cooldowns
-                                .record_capacity_failure(
-                                    account.id(),
-                                    Duration::from_secs(600),
-                                    peak,
-                                )
-                                .await
-                                .expect("seed normal-request evidence");
-                        }
-                    }
-                    let before = cooldowns.capacity_evidence(account.id());
-                    let attempt = if diagnostic {
-                        diagnostic_context("req_capacity_feedback_probe", account_id)
-                    } else {
-                        context("req_capacity_feedback_business", CancellationToken::new())
-                    };
-                    let operation = if websocket {
-                        capacity_websocket_operation()
-                    } else {
-                        http_generate_operation()
-                    };
-                    let mut stream = Arc::clone(&provider)
-                        .execute(planned_request("openai", operation), attempt)
-                        .await
-                        .expect("prepare upstream attempt");
-                    let error = loop {
-                        match stream.next().await {
-                            Some(Ok(_)) => {}
-                            Some(Err(error)) => break error,
-                            None => panic!("expected upstream rejection"),
-                        }
-                    };
-                    assert_eq!(
-                        error.upstream_status(),
-                        Some(status),
-                        "unexpected upstream error: {error:?}"
-                    );
-                    let after = cooldowns.capacity_evidence(account.id());
-                    if diagnostic || !capacity {
-                        assert_eq!(
-                            after, before,
-                            "only explicit overload from ordinary requests may change capacity evidence: {status}/{code}"
-                        );
-                    } else {
-                        assert_eq!(
-                            after.map(|(count, _)| count),
-                            Some(before.map_or(1, |(count, _)| count + 1))
-                        );
-                    }
+            let store = Arc::new(MemoryAccountStore::default());
+            create_account(&store, "acct_provider_contract").await;
+            let server = MockServer::start().await;
+            Mock::given(method(if websocket { "GET" } else { "POST" }))
+                .and(path("/codex/responses"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(json!({"error": {
+                        "code": code, "type": "explicit_type", "message": "original message"
+                    }})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (provider, pool) =
+                provider_with_cooldowns(&store, server.uri(), Arc::new(MemoryCooldownPort::new()));
+            let operation = if websocket {
+                capacity_websocket_operation()
+            } else {
+                http_generate_operation()
+            };
+            let mut stream = provider
+                .execute(
+                    planned_request("openai", operation),
+                    context("req_original_fields", CancellationToken::new()),
+                )
+                .await
+                .expect("attempt");
+            assert_eq!(
+                stream.metadata().credential_revision(),
+                Some(store.account("acct_provider_contract").unwrap().revision())
+            );
+            let error = loop {
+                match stream.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => break error,
+                    None => panic!("upstream rejection"),
                 }
-            }
+            };
+            assert_eq!(
+                error.upstream_failure_fields(),
+                Some(&gateway_core::upstream::UpstreamFailureFields {
+                    status: Some(status),
+                    code: Some(code.to_owned()),
+                    error_type: Some("explicit_type".to_owned()),
+                    message: Some("original message".to_owned()),
+                })
+            );
+            drop(stream);
+            pool.shutdown().await;
         }
     }
 }
 
 #[tokio::test]
-async fn local_websocket_connection_cancellation_does_not_supply_capacity_evidence() {
+async fn local_websocket_connection_cancellation_has_no_upstream_failure_fields() {
     let store = Arc::new(MemoryAccountStore::default());
     let account_id = "acct_provider_contract";
     create_account(&store, account_id).await;
-    let account = store.account(account_id).expect("account");
     let cooldowns = Arc::new(MemoryCooldownPort::new());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let base_url = format!("http://{}", listener.local_addr().expect("address"));
-    let (provider, pool) =
-        provider_with_capacity_tracking(&store, base_url, Arc::clone(&cooldowns));
+    let (provider, pool) = provider_with_cooldowns(&store, base_url, Arc::clone(&cooldowns));
     let operation = capacity_websocket_operation();
     let mut stream = provider
         .execute(
@@ -8867,7 +8765,7 @@ async fn local_websocket_connection_cancellation_does_not_supply_capacity_eviden
         error.diagnostic().and_then(|diagnostic| diagnostic.code()),
         Some("shared_connect_failed")
     );
-    assert_eq!(cooldowns.capacity_evidence(account.id()), None);
+    assert!(error.upstream_failure_fields().is_none());
     pool.shutdown().await;
 }
 
@@ -8908,9 +8806,7 @@ async fn websocket_usage_limit_rejection_preserves_quota_state_for_account_rotat
 }
 
 #[tokio::test]
-async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
-    use gateway_core::provider_ports::{ProviderCooldownKind, ProviderCooldownPort as _};
-
+async fn stream_failures_preserve_error_fields_independent_of_retry_classification() {
     for (use_websocket, (code, message, expected_kind, scored)) in
         [false, true].into_iter().flat_map(|websocket| {
             [
@@ -8939,6 +8835,12 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
                     false,
                 ),
                 (
+                    "unsupported_parameter",
+                    "Hosted tool 'web_search' requires authorization and metering that are not supported by rustponsesapi.",
+                    ProviderErrorKind::InvalidRequest,
+                    false,
+                ),
+                (
                     "invalid_prompt",
                     "Invalid prompt: we've limited access to this content for safety reasons.",
                     ProviderErrorKind::InvalidRequest,
@@ -8963,16 +8865,7 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
         for semantic_output in [false, true] {
             let store = Arc::new(MemoryAccountStore::default());
             create_account(&store, "acct_provider_contract").await;
-            let account = store.account("acct_provider_contract").expect("account");
             let cooldowns = Arc::new(MemoryCooldownPort::new());
-            // 距离冻结阈值只差一次，验证非容量错误不会把可调度账号推入冷却
-            for _ in 0..11 {
-                cooldowns
-                    .record_capacity_failure(account.id(), Duration::from_secs(600), 20)
-                    .await
-                    .expect("seed capacity evidence");
-            }
-            let before = cooldowns.capacity_evidence(account.id());
             let mut events = vec![
                 json!({"type": "response.created", "response": {"id": "resp_capacity", "model": "gpt-5.4"}}),
             ];
@@ -8980,9 +8873,21 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
                 events.push(json!({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "hello"}));
             }
             let mut original = json!({"type": "response.failed", "response": {"id": "resp_capacity", "error": {"code": code, "message": message}}});
+            if code == "unsupported_parameter" {
+                original = json!({"type":"error","status":400,"error":{
+                    "type":"invalid_request_error","code":code,"message":message,"param":"tools"
+                }});
+            }
             if code == "turn_rate_limit_exceeded" {
                 original["response"]["error"]["headers"] = json!({"retry-after": "7"});
             }
+            let expected_status = original["status"]
+                .as_u64()
+                .map(|status| u16::try_from(status).expect("valid upstream status"));
+            let expected_error_type = original.get("error").unwrap_or(&original["response"]["error"])
+                ["type"]
+                .as_str()
+                .map(str::to_owned);
             events.push(original.clone());
             let (base_url, _http_server, websocket_server) = if use_websocket {
                 let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
@@ -9026,7 +8931,7 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
                 http_generate_operation()
             };
             let (provider, pool) =
-                provider_with_capacity_tracking(&store, base_url, Arc::clone(&cooldowns));
+                provider_with_cooldowns(&store, base_url, Arc::clone(&cooldowns));
             let mut stream = provider
                 .execute(
                     planned_request("openai", operation),
@@ -9046,6 +8951,7 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
                     None => panic!("expected upstream failure"),
                 }
             };
+            assert!(error.continuation_recovery_disposition().is_none());
             let capacity = expected_kind == ProviderErrorKind::UpstreamCapacityUnavailable;
             assert_eq!(
                 error.kind(),
@@ -9053,7 +8959,7 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
                 "unexpected error for {code}, websocket={use_websocket}, semantic_output={semantic_output}: {error:?}"
             );
             assert_eq!(error.replay_is_safe(), capacity && !semantic_output);
-            assert_eq!(error.upstream_status(), None);
+            assert_eq!(error.upstream_status(), expected_status);
             if code == "turn_rate_limit_exceeded" {
                 assert!(error.retry_is_prohibited());
                 assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
@@ -9066,29 +8972,15 @@ async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
                 provider_openai::openai_failure_affects_account_score(&error),
                 scored
             );
-            let cooldown = cooldowns.read(account.id()).await.expect("read cooldown");
-            if capacity {
-                assert_eq!(
-                    cooldowns
-                        .capacity_evidence(account.id())
-                        .map(|(count, _)| count),
-                    Some(12)
-                );
-                assert_eq!(
-                    cooldown.expect("capacity cooldown").kind(),
-                    ProviderCooldownKind::CapacityFreezeProbe
-                );
-            } else {
-                assert_eq!(
-                    cooldowns.capacity_evidence(account.id()),
-                    before,
-                    "non-capacity error {code} changed capacity evidence"
-                );
-                assert!(
-                    cooldown.is_none(),
-                    "non-capacity error {code} froze the account"
-                );
-            }
+            assert_eq!(
+                error.upstream_failure_fields(),
+                Some(&gateway_core::upstream::UpstreamFailureFields {
+                    status: expected_status,
+                    code: Some(code.to_owned()),
+                    error_type: expected_error_type,
+                    message: Some(message.to_owned()),
+                })
+            );
             assert_eq!(
                 serde_json::from_str::<Value>(
                     error.raw_upstream_error().expect("raw error").as_str()
@@ -9892,6 +9784,7 @@ async fn quota_limited_account_diagnostic_uses_upstream() {
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
             expected_revision: account.revision(),
@@ -10203,6 +10096,183 @@ fn request_observation_preserves_the_raw_reasoning_effort() {
         let client_key_id = ClientApiKeyId::new("key_openai_observation").unwrap();
         let observation = provider(&store).request_observation(&operation, &client_key_id);
         assert_eq!(observation.reasoning_effort.as_deref(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn reasoning_effort_observation_follows_configuration_updates_across_continuations() {
+    fn completed(index: usize) -> Value {
+        json!({"type":"response.completed","response":{
+            "id":format!("resp_effort_{index}"),"model":"gpt-5.4","status":"completed",
+            "output":[],"reasoning":{"effort":if index == 4 { "high" } else { "medium" }},
+            "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+        }})
+    }
+
+    for use_websocket in [false, true] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_provider_contract").await;
+        let http = MockServer::start().await;
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(move |_: &wiremock::Request| {
+                let index = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {}\n\n", completed(index)))
+            })
+            .mount(&http)
+            .await;
+        let (base_url, websocket_server) = if use_websocket {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = accept_codex_test_websocket(socket).await;
+                let mut frames = Vec::new();
+                for index in 0..5 {
+                    let message = websocket.next().await.unwrap().unwrap();
+                    let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    assert_eq!(frame["type"], "response.create");
+                    frames.push(frame);
+                    websocket
+                        .send(Message::Text(completed(index).to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                frames
+            });
+            (base_url, Some(server))
+        } else {
+            (http.uri(), None)
+        };
+        let provider = provider_with_base_url(&store, base_url);
+        let client_key = ClientApiKeyId::new("key_openai_contract").unwrap();
+        let mut session_state = Some(
+            ProviderSessionState::new(
+                "openai",
+                json!({
+                    "account_id":"acct_provider_contract",
+                    "conversation_id":"effort-observation",
+                    "continuation_scope":if use_websocket { "connection_local" } else { "persisted" },
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )
+            .unwrap(),
+        );
+        let mut originals = Vec::new();
+        for (index, (baseline, update, expected)) in [
+            ("medium", Some("high"), "high"),
+            ("medium", None, "high"),
+            ("medium", Some("low"), "low"),
+            ("medium", None, "medium"),
+            ("high", None, "high"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut input = Vec::new();
+            if let Some(effort) = update {
+                input.push(json!({"type":"configuration_update","reasoning":{"effort":effort}}));
+            }
+            input.push(json!({"type":"message","role":"user","content":"next turn"}));
+            let mut body = json!({
+                "model":"gpt-5.4","input":input,"reasoning":{"effort":baseline},
+                "session_id":"effort-observation","store":!use_websocket,
+            });
+            let previous = (index > 0 && index != 3).then(|| format!("resp_effort_{}", index - 1));
+            if let Some(previous) = &previous {
+                body["previous_response_id"] = json!(previous);
+            }
+            let mut protocol_context =
+                Map::from_iter([("use_websocket".to_owned(), json!(use_websocket))]);
+            if use_websocket {
+                protocol_context.insert(
+                    "downstream_websocket_connection_id".to_owned(),
+                    json!("ws_effort"),
+                );
+            }
+            let mut generate = GenerateRequest::from_protocol_payload(
+                ProtocolPayload::json_object("openai", body.as_object().unwrap().clone())
+                    .unwrap()
+                    .with_context(protocol_context),
+            );
+            if let Some(state) = session_state.take() {
+                generate = generate.with_provider_session_state(state);
+            }
+            let operation = Operation::Generate(generate);
+            let observation = provider.request_observation(&operation, &client_key);
+            assert_eq!(observation.reasoning_effort.as_deref(), Some(expected));
+            let binding = previous.as_ref().map(|previous| {
+                ContinuationBinding::Pinned(NativeContinuationPin::new(
+                    PreviousResponseId::new(previous),
+                    PreviousResponseId::new(previous),
+                    client_key.clone(),
+                    ProviderKind::new("openai").unwrap(),
+                    ProviderAccountId::new("acct_provider_contract").unwrap(),
+                ))
+            });
+            let context = AttemptContext::new(
+                RequestAttemptContext::new(
+                    ModelRequestId::new(format!("req_effort_{index}")).unwrap(),
+                    client_key.clone(),
+                ),
+                NonZeroU32::new(1).unwrap(),
+                SystemTime::now() + Duration::from_secs(30),
+                account_policy(),
+                AccountAttemptContext::new(BTreeSet::new(), None, None)
+                    .with_account_scope(contract_account_scope()),
+                binding,
+                CancellationToken::new(),
+            )
+            .with_continuation_attempt(if previous.is_some() {
+                ContinuationAttempt::Native
+            } else {
+                ContinuationAttempt::None
+            });
+            let mut stream = Arc::clone(&provider)
+                .execute(planned_request("openai", operation), context)
+                .await
+                .unwrap();
+            while let Some(event) = timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+            {
+                let event = event.unwrap_or_else(|error| {
+                    panic!("use_websocket={use_websocket}, turn={index}: {error:?}")
+                });
+                if let Some(update) = event.session_update() {
+                    session_state = Some(update.clone());
+                }
+            }
+            assert!(session_state.is_some());
+            originals.push(body);
+        }
+        let forwarded = if let Some(server) = websocket_server {
+            timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            http.received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(captured_request_body)
+                .collect()
+        };
+        assert_eq!(forwarded.len(), originals.len());
+        for (forwarded, original) in forwarded.iter().zip(&originals) {
+            assert_eq!(forwarded["input"], original["input"]);
+            assert_eq!(forwarded["reasoning"], original["reasoning"]);
+            assert_eq!(
+                forwarded.get("previous_response_id"),
+                original.get("previous_response_id")
+            );
+        }
     }
 }
 
@@ -11008,7 +11078,7 @@ async fn api_key_native_endpoints_preserve_bodies_headers_and_own_base_url() {
 }
 
 #[tokio::test]
-async fn api_key_responses_forward_lite_memgen_and_native_compaction_without_catalog_gates() {
+async fn api_key_responses_forward_lite_memgen_and_native_compaction_with_catalog_eligibility() {
     let upstream = MockServer::start().await;
     let store = Arc::new(MemoryAccountStore::default());
     store
@@ -11020,9 +11090,7 @@ async fn api_key_responses_forward_lite_memgen_and_native_compaction_without_cat
         .await;
     Mock::given(method("GET"))
         .and(path("/models"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"different-model"}]})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"gpt-5.4"}]})))
         .expect(1)
         .mount(&upstream)
         .await;
@@ -11077,8 +11145,6 @@ const API_KEY_DOWNSTREAM_HEADERS: &[&str] = &[
     "referer",
     "sec-ch-ua",
     "sec-fetch-site",
-    "x-grok-turn-idx",
-    "x-xai-future-field",
     "session_id",
     "x-openai-actor-authorization",
     "authorization",
@@ -11087,6 +11153,8 @@ const API_KEY_DOWNSTREAM_HEADERS: &[&str] = &[
 ];
 
 const API_KEY_BUSINESS_HEADERS: &[&str] = &[
+    "x-grok-turn-idx",
+    "x-xai-future-field",
     "session-id",
     "thread-id",
     "x-codex-future",
@@ -11201,7 +11269,11 @@ async fn api_key_default_http_uses_own_prefix_plain_json_and_only_own_authentica
         }
         assert_eq!(request.headers["x-business-extension"], "keep");
         for name in API_KEY_BUSINESS_HEADERS {
-            assert_eq!(request.headers[*name], "downstream-value", "lost {name}");
+            if matches!(*name, "session-id" | "thread-id") {
+                assert_scoped_id(request.headers[*name].to_str().unwrap(), "downstream-value");
+            } else {
+                assert_eq!(request.headers[*name], "downstream-value", "lost {name}");
+            }
         }
         for header in ["cookie", "chatgpt-account-id"] {
             assert!(!request.headers.contains_key(header), "unexpected {header}");
@@ -11430,7 +11502,14 @@ async fn api_key_websocket_uses_api_path_and_bearer_without_oauth_identity() {
                 }
                 assert_eq!(request.headers()["x-business-extension"], "keep");
                 for name in API_KEY_BUSINESS_HEADERS {
-                    assert_eq!(request.headers()[*name], "downstream-value", "lost {name}");
+                    if matches!(*name, "session-id" | "thread-id") {
+                        assert_scoped_id(
+                            request.headers()[*name].to_str().unwrap(),
+                            "downstream-value",
+                        );
+                    } else {
+                        assert_eq!(request.headers()[*name], "downstream-value", "lost {name}");
+                    }
                 }
             })
             .await;
@@ -11454,6 +11533,88 @@ async fn api_key_websocket_uses_api_path_and_bearer_without_oauth_identity() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn api_key_websocket_search_activation_reuses_original_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_api_key(
+            "acct_provider_contract",
+            base,
+            provider_openai::credential::ResponsesTransport::PreferWebsocket,
+        )
+        .await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = crate::transport::accept_codex_test_websocket(stream).await;
+        for search in [false, true] {
+            let frame = websocket.next().await.unwrap().unwrap();
+            let payload: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(
+                payload["tools"].as_array().unwrap().len(),
+                usize::from(search)
+            );
+            websocket
+                .send(Message::Text(
+                    crate::transport::completed_websocket_response("resp_api_search", 1, 1).into(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+    let provider = provider(&store);
+    let session_state = ProviderSessionState::new(
+        "openai",
+        Map::from_iter([
+            ("account_id".into(), json!("acct_provider_contract")),
+            ("conversation_id".into(), json!("api-search-session")),
+            ("continuation_scope".into(), json!("connection_local")),
+        ]),
+    )
+    .unwrap();
+    for tools in [json!([]), json!([{"type":"web_search"}])] {
+        let operation = Operation::Generate(
+            GenerateRequest::from_protocol_payload(
+                ProtocolPayload::json_object(
+                    "openai",
+                    json!({
+                        "model":"gpt-5.4", "input":"hello", "store":false,
+                        "session_id":"api-search-session", "tools":tools
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                )
+                .unwrap()
+                .with_context(Map::from_iter([
+                    ("use_websocket".into(), json!(true)),
+                    (
+                        "downstream_websocket_connection_id".into(),
+                        json!("api-search-lane"),
+                    ),
+                ])),
+            )
+            .with_provider_session_state(session_state.clone()),
+        );
+        timeout(Duration::from_secs(3), async {
+            let mut stream = Arc::clone(&provider)
+                .execute(
+                    planned_request("openai", operation),
+                    diagnostic_context("req_api_search", "acct_provider_contract"),
+                )
+                .await
+                .unwrap();
+            while let Some(event) = stream.next().await {
+                event.expect("API Key search activation should keep the same socket");
+            }
+        })
+        .await
+        .unwrap();
+    }
+    server.await.unwrap();
 }
 
 fn quota_continuation_operation(use_websocket: bool) -> Operation {
@@ -12503,130 +12664,40 @@ pub(crate) async fn assert_local_connection_capacity_is_not_an_upstream_failure(
     assert!(failure.pre_delivery_retry().is_none());
 }
 
-const GROK_PASSTHROUGH_HEADERS_CONTEXT_KEY: &str = "opaque_request_headers";
-
-fn grok_marked_context() -> Map<String, Value> {
-    Map::from_iter([(
-        GROK_PASSTHROUGH_HEADERS_CONTEXT_KEY.to_owned(),
-        json!([["X-Grok-Model-Override", "dGVzdA=="]]),
-    )])
-}
-
 #[tokio::test]
-async fn grok_marked_request_removes_only_exact_leading_instruction_identity() {
-    let original = "You are Grok released by xAI.\nKeep Grok tool names and xAI examples.";
-    for (content, expected) in [
-        (json!("You are Grok released by xAI."), json!("")),
-        (
+async fn downstream_client_markers_preserve_instruction_content() {
+    let original = "You are Grok released by xAI.\nKeep tool names and examples.";
+    for api_key in [false, true] {
+        for content in [
             json!(original),
-            json!("\nKeep Grok tool names and xAI examples."),
-        ),
-        (
             json!([
-                {"type": "input_text", "text": original, "future": "Grok"},
-                {"type": "input_text", "text": original}
+                {"type": "input_text", "text": original, "future": "keep"},
+                {"type": "input_text", "text": "Keep the second block."}
             ]),
-            json!([
-                {"type": "input_text", "text": "\nKeep Grok tool names and xAI examples.", "future": "Grok"},
-                {"type": "input_text", "text": original}
-            ]),
-        ),
-    ] {
-        let mut body = json!({
-            "instructions": "Keep top-level instructions.",
-            "input": [{"type": "message", "role": "developer", "content": content}],
-            "tools": [{"type": "function", "name": "grok", "description": original}]
-        })
-        .as_object()
-        .expect("request object")
-        .clone();
-        body = capture_grok_request(body, grok_marked_context(), false).await;
-        assert_eq!(body["input"][0]["content"], expected);
-        assert_eq!(body["instructions"], "Keep top-level instructions.");
-        assert_eq!(body["tools"][0]["description"], original);
-        let once = body.clone();
-        body = capture_grok_request(body, grok_marked_context(), false).await;
-        assert_eq!(body, once);
-    }
-}
-
-#[tokio::test]
-async fn grok_unrelated_text_and_unmarked_requests_are_preserved() {
-    let original = "You are Grok released by xAI. Be concise.";
-    for (role, content, context) in [
-        ("user", original, grok_marked_context()),
-        (
-            "developer",
-            "Quoted example: You are Grok released by xAI.",
-            grok_marked_context(),
-        ),
-        ("developer", original, Map::new()),
-        (
-            "developer",
-            original,
-            Map::from_iter([(
-                GROK_PASSTHROUGH_HEADERS_CONTEXT_KEY.to_owned(),
-                json!([["X-Grok-Future-Field", "dGVzdA=="]]),
-            )]),
-        ),
-        (
-            "developer",
-            original,
-            Map::from_iter([(
-                GROK_PASSTHROUGH_HEADERS_CONTEXT_KEY.to_owned(),
-                json!([["X-AuthenticateResponse", "dGVzdA=="]]),
-            )]),
-        ),
-    ] {
-        let mut body = json!({
-            "model": "gpt-5.4", "store": false, "stream": true,
-            "input": [{"type": "message", "role": role, "content": content}]
-        })
-        .as_object()
-        .expect("request object")
-        .clone();
-        let original_body = body.clone();
-        body = capture_grok_request(body, context, false).await;
-        assert_eq!(body, original_body);
-    }
-}
-
-#[tokio::test]
-async fn grok_downstream_identity_should_only_change_selected_codex_oauth_requests() {
-    let original = "You are Grok released by xAI. Be concise.";
-    let original_body = json!({
-        "model": "gpt-5.4",
-        "store": false,
-        "stream": true,
-        "instructions": "Preserve original instructions.",
-        "input": [{"type": "message", "role": "developer", "content": original}]
-    });
-    for (api_key, marked, expected) in [
-        (false, true, " Be concise."),
-        (false, false, original),
-        (true, true, original),
-    ] {
-        let sent = capture_grok_request(
-            original_body.as_object().expect("request object").clone(),
-            if marked {
-                grok_marked_context()
-            } else {
-                Map::new()
-            },
-            api_key,
-        )
-        .await;
-
-        assert_eq!(sent["input"][0]["content"], expected);
-        if !marked || api_key {
-            for (key, expected) in original_body.as_object().expect("request object") {
-                assert_eq!(sent.get(key), Some(expected), "client field: {key}");
-            }
+        ] {
+            let body = json!({
+                "model": "gpt-5.4", "store": false, "stream": true,
+                "instructions": original,
+                "input": [
+                    {"type": "message", "role": "developer", "content": content},
+                    {"type": "message", "role": "user", "content": original}
+                ],
+                "tools": [{"type": "function", "name": "echo", "description": original}]
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            let context = Map::from_iter([(
+                "opaque_request_headers".to_owned(),
+                json!([["X-Grok-Model-Override", STANDARD.encode(b"test")]]),
+            )]);
+            let sent = capture_client_request(body.clone(), context, api_key).await;
+            assert_eq!(sent, body);
         }
     }
 }
 
-async fn capture_grok_request(
+async fn capture_client_request(
     body: Map<String, Value>,
     mut protocol_context: Map<String, Value>,
     api_key: bool,
@@ -12667,7 +12738,7 @@ async fn capture_grok_request(
                 "openai",
                 Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
             ),
-            context("req_grok_boundary", CancellationToken::new()),
+            context("req_client_body", CancellationToken::new()),
         )
         .await
         .expect("request preparation");
@@ -12687,7 +12758,7 @@ async fn capture_grok_request(
 }
 
 #[tokio::test]
-async fn public_catalog_filters_each_api_account_before_union_without_gating_inference() {
+async fn public_catalog_filters_each_api_account_before_union_and_preserves_route_planning() {
     use gateway_core::account::{AccountModelAccess, AccountModelAccessMode};
     use gateway_core::engine::provider::{Provider, ProviderRegistry};
     use gateway_core::routing::snapshot::{
@@ -12812,7 +12883,7 @@ async fn public_catalog_filters_each_api_account_before_union_without_gating_inf
             let model = PublicModelId::new(id).unwrap();
             assert!(!snapshot.contains_public_model_for_scope(&model, &scope));
         }
-        // 目录来源只决定展示，发现型目录仍允许把请求交给政策合规的上游判断
+        // Core 按冻结政策编排路由，具体账号的目录资格由 Provider 在选号时检查
         for id in ["kimi-k2.5", "kimi-public", "not-yet-discovered"] {
             let model = PublicModelId::new(id).unwrap();
             assert_eq!(
@@ -12843,4 +12914,28 @@ async fn public_catalog_filters_each_api_account_before_union_without_gating_inf
             ["gpt-5.4", "gpt-public"]
         );
     }
+}
+
+fn assert_scoped_id(actual: &str, original: &str) {
+    assert_ne!(actual, original);
+    assert!(
+        uuid::Uuid::parse_str(actual).is_ok(),
+        "scoped ID must retain UUID format"
+    );
+}
+
+fn assert_scoped_search_body(actual: &[u8], original: &[u8]) {
+    let actual_json: Value = serde_json::from_slice(actual).unwrap();
+    let original_json: Value = serde_json::from_slice(original).unwrap();
+    let id = actual_json["id"].as_str().unwrap();
+    let original_id = original_json["id"].as_str().unwrap();
+    assert_scoped_id(id, original_id);
+    assert_eq!(
+        std::str::from_utf8(actual).unwrap(),
+        std::str::from_utf8(original).unwrap().replacen(
+            &serde_json::to_string(original_id).unwrap(),
+            &serde_json::to_string(id).unwrap(),
+            1
+        )
+    );
 }

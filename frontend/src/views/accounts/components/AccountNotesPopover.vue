@@ -2,11 +2,15 @@
 import { ZPopover, ZScrollbar } from '@codex-proxy/ui'
 
 import { useEventListener } from '@vueuse/core'
+
 import { computed, shallowRef, useId, useTemplateRef, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 const props = defineProps<{
   notes: string
 }>()
+
+const { t } = useI18n({ useScope: 'global' })
 
 const detailId = `account-notes-${useId()}`
 const notesTextRef = useTemplateRef<HTMLSpanElement>('notesText')
@@ -41,9 +45,8 @@ watch(() => props.notes, recheckOpen, { flush: 'post' })
     <template #reference>
       <button
         type="button"
-        class="inline-flex min-w-0 max-w-full touch-manipulation items-center rounded-cp-sm border-0 bg-transparent p-0 text-left text-cp-xs leading-4 text-cp-text-tertiary outline-none transition-colors hover:text-cp-primary-text focus-visible:ring-2 focus-visible:ring-cp-control-outline motion-reduce:transition-none"
-        :class="open ? 'text-cp-primary-text' : ''"
-        aria-label="查看账号备注"
+        class="inline-flex min-w-0 max-w-full cursor-default touch-manipulation items-center rounded-z-sm border-0 bg-transparent p-0 text-left font-mono text-z-xs leading-4 font-emphasis text-z-text-quaternary outline-none focus-visible:ring-2 focus-visible:ring-z-control-outline"
+        :aria-label="t('accounts.notes.viewAccountNotes')"
         aria-haspopup="dialog"
         :aria-expanded="open"
         :aria-controls="open ? detailId : undefined"
@@ -52,9 +55,9 @@ watch(() => props.notes, recheckOpen, { flush: 'post' })
       </button>
     </template>
 
-    <section :id="detailId" class="w-max max-w-[min(20rem,calc(100vw-1rem))] overflow-hidden rounded-cp-lg" role="dialog" aria-label="账号备注">
+    <section :id="detailId" class="w-max max-w-[min(20rem,calc(100vw-1rem))] overflow-hidden rounded-z-lg" role="dialog" :aria-label="t('accounts.notes.title')">
       <ZScrollbar max-height="min(240px, calc(100dvh - 2rem))">
-        <div class="px-3 py-2.5 text-cp-sm leading-5 whitespace-pre-wrap text-cp-text select-text wrap-anywhere">
+        <div class="px-3 py-2.5 text-z-sm leading-5 whitespace-pre-wrap text-z-text select-text wrap-anywhere">
           {{ notes }}
         </div>
       </ZScrollbar>

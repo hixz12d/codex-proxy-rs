@@ -3,6 +3,8 @@ import { ZIconButton, ZInputNumber, ZSlider } from '@codex-proxy/ui'
 
 import { RotateCcw } from '@lucide/vue'
 
+import { useI18n } from 'vue-i18n'
+
 defineProps<{
   label: string
   token: string
@@ -18,17 +20,19 @@ const emit = defineEmits<{
   change: [value: number]
   reset: []
 }>()
+
+const { t } = useI18n({ useScope: 'global' })
 </script>
 
 <template>
-  <div class="grid gap-3 rounded-cp-lg bg-cp-fill-quaternary px-3 py-3">
+  <div class="grid gap-3 rounded-z-lg bg-z-fill-quaternary px-3 py-3">
     <div class="flex items-start justify-between gap-3">
       <div class="min-w-0">
         <div class="flex items-center gap-2">
-          <strong class="text-cp-sm font-bold text-cp-text">{{ label }}</strong>
-          <span v-if="overridden" class="rounded-full bg-cp-primary-container px-1.5 py-0.5 text-[9px] font-heavy text-cp-primary-on-container">已修改</span>
+          <strong class="text-z-sm font-bold text-z-text">{{ label }}</strong>
+          <span v-if="overridden" class="rounded-full bg-z-primary-container px-1.5 py-0.5 text-[9px] font-heavy text-z-primary-on-container">{{ t('appearance.color.modified') }}</span>
         </div>
-        <code class="mt-1 block truncate font-mono text-[10px] text-cp-text-quaternary">{{ token }}</code>
+        <code class="mt-1 block truncate font-mono text-[10px] text-z-text-quaternary">{{ token }}</code>
       </div>
       <div class="flex items-center gap-1">
         <ZInputNumber
@@ -43,7 +47,7 @@ const emit = defineEmits<{
         />
         <ZIconButton
           v-if="overridden"
-          aria-label="恢复派生值"
+          :aria-label="t('appearance.color.restoreDerivedValue')"
           size="small"
           @click="emit('reset')"
         >

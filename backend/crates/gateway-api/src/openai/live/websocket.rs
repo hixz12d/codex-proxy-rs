@@ -128,15 +128,7 @@ async fn open_sideband(
         client_api_key_id: client.policy().key_id(),
         account_scope: client.policy().account_scope(),
         style,
-        protocol_headers: filter_protocol_headers(&headers)
-            .into_iter()
-            .map(|header| {
-                (
-                    header.name().to_ascii_lowercase(),
-                    String::from_utf8_lossy(header.value()).into_owned(),
-                )
-            })
-            .collect(),
+        protocol_headers: filter_protocol_headers(&headers),
         subprotocols: offered_subprotocols(&headers),
     });
     let result = tokio::select! {
@@ -157,7 +149,7 @@ fn upgrade_required_response() -> Response {
     let mut response = live_error_response(
         LiveErrorShape::Realtime,
         StatusCode::UPGRADE_REQUIRED,
-        "WebSocket upgrade required",
+        "WebSocket upgrade required.",
         "websocket_upgrade_required",
     );
     response.headers_mut().insert(

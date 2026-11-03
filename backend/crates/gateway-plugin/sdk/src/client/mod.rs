@@ -5,8 +5,8 @@ mod frame;
 mod http;
 mod keys;
 mod middleware;
+mod pending_read;
 mod plugin;
-mod read;
 mod resources;
 mod session;
 mod upstream_adapter;
@@ -19,10 +19,10 @@ pub use http::{HostHttpBody, HostHttpResponse};
 pub use middleware::{
     HttpBody, HttpCall, HttpFrame, HttpNext, HttpRequest, HttpResponse, MiddlewareBody,
     MiddlewareBodySender, MiddlewareCall, MiddlewareInput, MiddlewareNext, MiddlewareOutput,
-    MiddlewarePlugin, MiddlewareRequest, MiddlewareResponse, MiddlewareResult, RequestCall,
-    ServiceCall, ServiceNext, ServiceResponse, TypedServiceCall, WebSocketCall, WebSocketDirection,
-    WebSocketKind, WebSocketMessage, WebSocketNext, WebSocketPayload, WebSocketSender,
-    WebSocketSession,
+    MiddlewarePlugin, MiddlewareRequest, MiddlewareResponse, MiddlewareResult, OutboundCall,
+    OutboundNext, OutboundRequest, RequestCall, ServiceCall, ServiceNext, ServiceResponse,
+    TypedServiceCall, WebSocketCall, WebSocketDirection, WebSocketKind, WebSocketMessage,
+    WebSocketNext, WebSocketPayload, WebSocketSender, WebSocketSession,
 };
 pub use plugin::{
     AuthorError, ComposedPlugin, Empty, Method, PluginBuilder, TypedCall, TypedReply, methods,

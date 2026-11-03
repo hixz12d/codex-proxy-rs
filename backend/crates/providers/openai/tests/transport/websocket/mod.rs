@@ -7,9 +7,27 @@ use provider_openai::transport::{
 };
 
 mod breaker;
+mod cleanup;
 mod diagnostics;
 mod fingerprint;
 mod metadata;
+mod pool;
+
+#[test]
+fn outbound_websocket_diagnostics_do_not_expose_target_credentials() {
+    let connection = CodexWebSocketConnection::new(
+        "wss://user:password@upstream.example/responses?access_token=secret",
+        vec![("authorization".into(), "Bearer credential".into())],
+    );
+    assert_eq!(
+        connection.opening_audit_snapshot().request_line,
+        "GET /responses HTTP/1.1"
+    );
+    let debug = format!("{connection:?}");
+    for value in ["password", "access_token", "secret", "credential"] {
+        assert!(!debug.contains(value));
+    }
+}
 
 fn rate_limit_event(used_percent: u64) -> String {
     json!({
@@ -976,10 +994,6 @@ async fn websocket_execute_response_create_request_should_capture_internal_metad
     server.await.unwrap();
 
     assert_eq!(response.turn_state.as_deref(), Some("turn-from-metadata"));
-    assert_eq!(
-        response.reported_model.as_deref(),
-        Some("gpt-internal-report")
-    );
     assert!(!response.body.contains("codex.rate_limits"));
     assert!(response.body.contains("response.metadata"));
     assert!(response.body.contains("event: response.completed"));
@@ -1115,11 +1129,6 @@ async fn reused_websocket_should_not_leak_turn_state_into_the_next_response() {
             .websocket_pool_decision
             .is_some_and(WebSocketPoolDecision::is_reuse)
     );
-    assert_eq!(
-        first.reported_model.as_deref(),
-        Some("first-response-model")
-    );
-    assert_eq!(second.reported_model, None);
     assert_eq!(second.turn_state, None);
     assert!(
         second
@@ -1485,10 +1494,12 @@ async fn codex_backend_client_should_timeout_when_upstream_is_silent() {
 }
 
 #[tokio::test]
-async fn websocket_stream_should_allow_silence_below_idle_timeout() {
+async fn websocket_stream_should_keep_alive_without_requiring_pong_below_idle_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut websocket = accept_codex_test_websocket(stream).await;
@@ -1505,7 +1516,10 @@ async fn websocket_stream_should_allow_silence_below_idle_timeout() {
             .await
             .unwrap();
         created_tx.send(()).unwrap();
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        std::assert_matches!(websocket.next().await.unwrap().unwrap(), Message::Ping(_));
+        ping_tx.send(()).unwrap();
+        // 暂停读取和 flush，避免 tungstenite 自动回复 Pong
+        finish_rx.await.unwrap();
         websocket
             .send(Message::Text(
                 completed_websocket_response("resp_structural", 3, 1).into(),
@@ -1521,7 +1535,21 @@ async fn websocket_stream_should_allow_silence_below_idle_timeout() {
     created_rx.await.unwrap();
     tokio::task::yield_now().await;
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::advance(Duration::from_secs(26)).await;
+    tokio::time::resume();
+    timeout(Duration::from_secs(2), ping_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    tokio::task::yield_now().await;
+    assert!(
+        !response_task.is_finished(),
+        "missing Pong must not end the response"
+    );
+    finish_tx.send(()).unwrap();
     let response = response_task
         .await
         .expect("websocket task should finish")
@@ -1717,6 +1745,12 @@ async fn codex_backend_client_stream_should_keep_socket_after_structural_activit
             .await
             .unwrap();
         first_websocket.close(None).await.unwrap();
+        // 完成关闭握手，避免未读的保活 Ping 导致 TCP reset 丢失已发送的响应
+        while let Some(Ok(message)) = first_websocket.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
     });
     let backend = CodexBackendClient::new(
         reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -1736,7 +1770,9 @@ async fn codex_backend_client_stream_should_keep_socket_after_structural_activit
     let mut stream = response.body;
     let mut body = String::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("delayed websocket stream chunk should be valid");
+        let chunk = chunk.unwrap_or_else(|error| {
+            panic!("delayed websocket stream chunk should be valid: {error}")
+        });
         body.push_str(std::str::from_utf8(&chunk).unwrap());
     }
     server.await.unwrap();
@@ -1847,9 +1883,7 @@ async fn codex_backend_client_stream_should_preserve_burst_during_downstream_bac
         let mut websocket = accept_codex_test_websocket(stream).await;
         let _message = websocket.next().await.unwrap().unwrap();
         let (mut sink, mut source) = websocket.split();
-        // 服务端持续读取控制帧，让 tungstenite 正常回 Pong
-        // 若客户端在本地入站背压
-        // 期间仍执行 Pong deadline，它仍会因为暂时读不到已返回的 Pong 而误杀连接
+        // 服务端持续读取关闭帧，业务背压不应丢失已发送的输出
         let control_frames = tokio::spawn(async move {
             while let Some(message) = source.next().await {
                 match message.unwrap() {
@@ -1892,12 +1926,9 @@ async fn codex_backend_client_stream_should_preserve_burst_during_downstream_bac
         let _ = sink.send(Message::Close(None)).await;
         control_frames.abort();
     });
-    let pool = Arc::new(CodexWebSocketPool::with_config(CodexWebSocketPoolConfig {
-        ping_interval: Some(Duration::from_millis(5)),
-        ping_timeout: Duration::from_millis(20),
-        liveness_timeout: None,
-        ..websocket_pool_config_for_tests(None, None, None)
-    }));
+    let pool = Arc::new(CodexWebSocketPool::with_config(
+        websocket_pool_config_for_tests(None),
+    ));
     let backend = CodexBackendClient::new(
         reqwest::Client::builder().no_proxy().build().unwrap(),
         format!("http://{addr}"),
@@ -1979,10 +2010,13 @@ async fn codex_backend_client_stream_should_cancel_while_inbound_is_backpressure
         timeout(Duration::from_secs(1), async {
             loop {
                 match websocket.next().await {
-                    Some(Ok(Message::Close(_))) => return,
+                    None
+                    | Some(Ok(Message::Close(_)))
+                    | Some(Err(tungstenite::Error::Protocol(
+                        tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                    ))) => return,
                     Some(Ok(_)) => continue,
-                    Some(Err(error)) => panic!("websocket close should be graceful: {error}"),
-                    None => panic!("websocket ended without a close frame"),
+                    Some(Err(error)) => panic!("unexpected websocket cleanup error: {error}"),
                 }
             }
         })
@@ -2081,10 +2115,11 @@ async fn codex_backend_client_stream_should_wait_for_terminal_after_active_webso
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn codex_backend_client_stream_should_timeout_when_active_websocket_stalls() {
+#[tokio::test]
+async fn codex_backend_client_stream_should_timeout_when_active_websocket_stalls_despite_pong() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut websocket = accept_codex_test_websocket(stream).await;
@@ -2100,7 +2135,16 @@ async fn codex_backend_client_stream_should_timeout_when_active_websocket_stalls
             ))
             .await
             .unwrap();
-        futures::future::pending::<()>().await;
+        while let Some(Ok(message)) = websocket.next().await {
+            match message {
+                Message::Ping(_) => {
+                    websocket.flush().await.unwrap();
+                    pong_tx.send(()).await.unwrap();
+                }
+                Message::Close(_) => break,
+                other => panic!("unexpected frame during stalled response: {other:?}"),
+            }
+        }
     });
     let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
     request.set_previous_response_id(Some("resp_previous".to_string()));
@@ -2126,7 +2170,18 @@ async fn codex_backend_client_stream_should_timeout_when_active_websocket_stalls
         .expect("stream should yield partial frame")
         .expect("partial frame should be valid");
     assert!(std::str::from_utf8(&first).unwrap().contains("partial"));
-    tokio::time::advance(Duration::from_secs(5 * 60)).await;
+    for _ in 0..11 {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(25)).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(2), pong_rx.recv())
+            .await
+            .expect("gateway should send keepalive Ping")
+            .expect("upstream should reply with Pong");
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(25)).await;
+    tokio::time::resume();
     tokio::task::yield_now().await;
     let error = response
         .body
@@ -2212,6 +2267,7 @@ async fn codex_backend_client_should_use_websocket_when_previous_response_id_is_
         .create_response(
             &request,
             CodexRequestContext {
+                response_control: None,
                 trace: None,
                 authorization: "Bearer access-token",
                 account_id: Some("chatgpt-account"),

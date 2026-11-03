@@ -266,6 +266,7 @@ pub struct AccountSummaryView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountView {
+    pub upstream: Option<super::AccountUpstreamInfoView>,
     pub capabilities: AccountCapabilitiesView,
     pub outbound_proxy_id: Option<String>,
     pub outbound_proxy_endpoint: Option<String>,
@@ -385,6 +386,8 @@ pub use crate::admin::account_groups::AccountGroupRefView;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountQuotaView {
+    pub refreshed_at: Option<String>,
+    pub refreshed_at_relative: Option<crate::time::RelativeTimeView>,
     pub refreshed_at_display: String,
     pub limit_reached: bool,
     /// 冷却到期或可开始恢复探测的时间；非限流中为 `null`
@@ -392,6 +395,7 @@ pub struct AccountQuotaView {
     pub rate_limit_recovery_display: Option<String>,
     pub rate_limit_reason: Option<String>,
     pub recovery_probe_required: bool,
+    pub protection_rules: Vec<gateway_core::account::AccountProtectionMatch>,
     pub windows: Vec<AccountQuotaWindowView>,
     pub credits: Option<AccountQuotaCreditsView>,
 }
@@ -409,6 +413,11 @@ pub struct AccountQuotaCreditsView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountQuotaWindowView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_account_id: Option<String>,
+    pub amount: Option<super::AccountQuotaAmountView>,
+    pub observed_at_display: Option<String>,
+    pub stale: bool,
     pub key: String,
     pub group: String,
     pub limit_id: Option<String>,
@@ -425,11 +434,22 @@ pub struct AccountQuotaWindowView {
     pub reset_at_display: String,
 }
 
+/// 账号用量窗口的语义标识，展示名称由管理端本地化
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountUsageWindowKind {
+    General,
+    Daily,
+    Weekly,
+    Monthly,
+    Quota,
+}
+
 /// 账号观测用量
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountUsageView {
-    pub window_label_display: String,
+    pub window_kind: AccountUsageWindowKind,
     pub request_count: Option<u64>,
     pub request_count_display: String,
     pub input_tokens: Option<u64>,
@@ -774,8 +794,11 @@ pub struct AccountModelView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountModelsData {
     pub models: Vec<AccountModelView>,
+    pub observed_at: Option<String>,
+    pub observed_at_display: String,
 }
 
 /// 账号模型目录文件；`catalog` 直接作为 Codex `model_catalog_json` 的文件正文落盘
@@ -1099,8 +1122,7 @@ impl AccountExportData {
         time: crate::time::TimePresenter,
     ) -> Self {
         let filename = format!(
-            "cpr-accounts-selected-{}-{}.json",
-            bundle.documents.len(),
+            "cpr-accounts-{}.json",
             time.label(bundle.exported_at, "%Y-%m-%d")
         );
         let documents = bundle

@@ -4,9 +4,8 @@ use chrono::{TimeZone, Utc};
 use gateway_core::routing::ModelServiceTier;
 use provider_openai::transport::profile::{CodexWireProfile, CodexWireProfileState};
 use provider_openai::transport::{
-    CodexBackendClient, CodexCatalogCapabilityEvidence, CodexCatalogVisibility, CodexClientError,
-    CodexModelCatalogError, CodexRequestContext, MAX_CODEX_MODEL_CATALOG_BYTES,
-    build_reqwest_client, parse_codex_model_catalog,
+    CodexBackendClient, CodexCatalogCapabilityEvidence, CodexCatalogVisibility,
+    CodexModelCatalogError, CodexRequestContext, build_reqwest_client, parse_codex_model_catalog,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, query_param};
@@ -130,12 +129,11 @@ fn service_tiers_should_preserve_declared_ids_names_and_descriptions() {
 }
 
 #[test]
-fn missing_or_empty_service_tiers_should_not_infer_fast_from_legacy_metadata() {
+fn missing_or_empty_service_tiers_should_remain_empty() {
     for service_tiers in [None, Some(json!([]))] {
         let mut model = json!({
             "slug": "gpt-5.4",
-            "display_name": "GPT-5.4",
-            "additional_speed_tiers": ["fast"]
+            "display_name": "GPT-5.4"
         });
         if let Some(service_tiers) = service_tiers {
             model["service_tiers"] = service_tiers;
@@ -229,13 +227,17 @@ fn missing_capability_fields_should_remain_unknown() {
 }
 
 #[test]
-fn legacy_data_shape_should_fail_the_entire_snapshot() {
-    let result = parse_codex_model_catalog(
-        br#"{"data":[{"slug":"gpt-5.4","display_name":"GPT-5.4"}]}"#,
-        None,
-    );
-
-    assert!(matches!(result, Err(CodexModelCatalogError::InvalidWire)));
+fn model_array_is_required_and_must_have_array_shape() {
+    for body in [
+        br#"{}"#.as_slice(),
+        br#"{"models":null}"#,
+        br#"{"models":{}}"#,
+    ] {
+        assert!(matches!(
+            parse_codex_model_catalog(body, None),
+            Err(CodexModelCatalogError::InvalidWire)
+        ));
+    }
 }
 
 #[test]
@@ -314,17 +316,6 @@ fn invalid_request_slug_should_fail_the_entire_snapshot() {
     ));
 }
 
-#[test]
-fn body_over_hard_limit_should_fail_before_json_parsing() {
-    let body = vec![b' '; MAX_CODEX_MODEL_CATALOG_BYTES + 1];
-    let result = parse_codex_model_catalog(&body, None);
-
-    assert!(matches!(
-        result,
-        Err(CodexModelCatalogError::ResponseTooLarge)
-    ));
-}
-
 #[tokio::test]
 async fn fetch_should_send_official_catalog_headers_and_query() {
     let server = MockServer::start().await;
@@ -382,15 +373,16 @@ async fn fetch_should_send_official_catalog_headers_and_query() {
 }
 
 #[tokio::test]
-async fn fetch_should_reject_streamed_body_over_hard_limit() {
+async fn fetch_preserves_large_model_instructions() {
+    let instructions = "model instructions\n".repeat(100_000);
+    let body = json!({"models":[{
+        "slug":"gpt-native", "display_name":"Native", "base_instructions":instructions,
+        "model_messages":{"future":{"template":"preserved"}}
+    }]});
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/codex/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
-            b' ';
-            MAX_CODEX_MODEL_CATALOG_BYTES
-                + 1
-        ]))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
         .expect(1)
         .mount(&server)
         .await;
@@ -400,14 +392,12 @@ async fn fetch_should_reject_streamed_body_over_hard_limit() {
         profile(),
     );
 
-    let result = client.fetch_models_with_context(context(), None).await;
-
-    assert!(matches!(
-        result,
-        Err(CodexClientError::ModelCatalog(
-            CodexModelCatalogError::ResponseTooLarge
-        ))
-    ));
+    let result = client
+        .fetch_models_with_context(context(), Some("0.166.0"))
+        .await
+        .unwrap();
+    let preserved: Value = serde_json::from_slice(result.models()[0].document().body()).unwrap();
+    assert!(preserved == body["models"][0]);
 }
 
 fn profile() -> CodexWireProfileState {
@@ -423,6 +413,7 @@ fn profile() -> CodexWireProfileState {
         terminal: "xterm".to_owned(),
         exact_user_agent: None,
         residency: None,
+        account_routing_override: None,
         verified_at: Utc
             .with_ymd_and_hms(2026, 7, 18, 0, 0, 0)
             .single()
@@ -432,6 +423,7 @@ fn profile() -> CodexWireProfileState {
 
 fn context() -> CodexRequestContext<'static> {
     CodexRequestContext {
+        response_control: None,
         trace: None,
         authorization: "Bearer oauth-access",
         account_id: Some("acct_123"),

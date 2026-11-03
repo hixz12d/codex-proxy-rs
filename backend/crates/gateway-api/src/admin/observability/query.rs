@@ -2,6 +2,8 @@
 
 use super::*;
 
+pub use crate::time::parse_datetime;
+
 /// 观测列表默认页大小
 pub const DEFAULT_PAGE_SIZE: u16 = 50;
 /// 观测列表允许的最大页大小
@@ -25,31 +27,97 @@ impl DashboardQuery {
     }
 }
 
-/// 逻辑请求列表、汇总和洞察查询参数
+/// 请求明细的字段筛选、时间范围与分页参数
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageQuery {
+    pub client_api_key_name: Option<String>,
+    pub account_name: Option<String>,
     pub status: Option<String>,
     pub current_page: Option<u32>,
     pub page_size: Option<u16>,
-    pub kind: Option<String>,
-    pub outcome: Option<String>,
-    pub client_api_key_id: Option<String>,
     pub provider: Option<String>,
-    pub request_id: Option<String>,
-    pub account_id: Option<String>,
-    pub route: Option<String>,
     pub model: Option<String>,
-    pub status_code: Option<i64>,
-    pub transport: Option<String>,
-    pub attempt_index: Option<i64>,
-    pub response_id: Option<String>,
-    pub upstream_request_id: Option<String>,
-    pub search: Option<String>,
     pub period: Option<String>,
     pub as_of: Option<i64>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
+}
+
+/// 用量汇总与洞察只按时间和 Provider 查询
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageAnalyticsQuery {
+    pub provider: Option<String>,
+    pub period: Option<String>,
+    pub as_of: Option<i64>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+}
+
+/// 卡片内的指标选择与时间、Provider 范围
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageMetricQuery<T> {
+    pub metric: T,
+    pub provider: Option<String>,
+    pub period: Option<String>,
+    pub as_of: Option<i64>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+}
+
+impl<T> UsageMetricQuery<T> {
+    pub fn into_parts(self) -> (UsageAnalyticsQuery, T) {
+        (
+            UsageAnalyticsQuery {
+                provider: self.provider,
+                period: self.period,
+                as_of: self.as_of,
+                start_time: self.start_time,
+                end_time: self.end_time,
+            },
+            self.metric,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsagePerformanceMetricKind {
+    Latency,
+    FirstToken,
+    Throughput,
+    Load,
+}
+
+impl From<UsagePerformanceMetricKind> for domain::UsageInsightMetric {
+    fn from(value: UsagePerformanceMetricKind) -> Self {
+        match value {
+            UsagePerformanceMetricKind::Latency => Self::Latency,
+            UsagePerformanceMetricKind::FirstToken => Self::FirstToken,
+            UsagePerformanceMetricKind::Throughput => Self::Throughput,
+            UsagePerformanceMetricKind::Load => Self::Load,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UsageCostMetricKind {
+    Cost,
+    Savings,
+    Cache,
+}
+
+impl From<UsageCostMetricKind> for domain::UsageInsightMetric {
+    fn from(value: UsageCostMetricKind) -> Self {
+        match value {
+            UsageCostMetricKind::Cost => Self::Cost,
+            UsageCostMetricKind::Savings => Self::Savings,
+            UsageCostMetricKind::Cache => Self::Cache,
+        }
+    }
 }
 
 impl UsageQuery {
@@ -190,16 +258,6 @@ impl DiagnosticDimension {
     }
 }
 
-/// 解析 RFC3339 时间；错误不回显原始值
-pub fn parse_datetime(value: Option<&str>) -> Result<Option<DateTime<Utc>>, WireValidationError> {
-    let Some(value) = trimmed(value) else {
-        return Ok(None);
-    };
-    DateTime::parse_from_rfc3339(value)
-        .map(|value| Some(value.with_timezone(&Utc)))
-        .map_err(|_| WireValidationError::new("timeRange"))
-}
-
 /// 解析 HTTP 状态码
 pub fn parse_status(value: Option<i64>) -> Result<Option<u16>, WireValidationError> {
     value
@@ -258,16 +316,6 @@ pub(crate) fn domain_diagnostic_dimension(
     }
 }
 
-pub(crate) fn request_outcome(
-    value: Option<String>,
-) -> Result<Option<domain::RequestOutcome>, WireValidationError> {
-    non_empty(value)
-        .map(|value| {
-            domain::RequestOutcome::new(value).map_err(|_| WireValidationError::new("outcome"))
-        })
-        .transpose()
-}
-
 pub(crate) fn usage_range(
     start: Option<&str>,
     end: Option<&str>,
@@ -288,39 +336,14 @@ pub(crate) fn dashboard_today_range(
     crate::time::query_range(start, end, period, as_of, timezone, "today")
 }
 
-pub(crate) fn usage_filter(query: &UsageQuery) -> Result<domain::UsageFilter, WireValidationError> {
-    let outcome = query.outcome.clone().or_else(|| {
-        non_empty(query.kind.clone()).filter(|value| {
-            matches!(
-                value.as_str(),
-                "running" | "succeeded" | "failed" | "cancelled" | "incomplete"
-            )
-        })
-    });
-    Ok(domain::UsageFilter {
-        client_api_key_ref: non_empty(query.client_api_key_id.clone()),
-        request_id: non_empty(query.request_id.clone()),
-        provider_account_ref: non_empty(query.account_id.clone()),
-        operation: non_empty(query.route.clone()),
+pub(crate) fn usage_filter(query: &UsageQuery) -> domain::UsageFilter {
+    domain::UsageFilter {
+        client_api_key_name: non_empty(query.client_api_key_name.clone()),
+        provider_account_name: non_empty(query.account_name.clone()),
         provider_kind: non_empty(query.provider.clone()),
-        model: non_empty(query.model.clone()),
-        outcome: request_outcome(outcome)?,
-        status_code: parse_status(query.status_code)?,
-        transport: non_empty(query.transport.clone()),
-        attempt_index: parse_attempt_index(query.attempt_index)?,
-        response_id: non_empty(query.response_id.clone()),
-        upstream_request_id: non_empty(query.upstream_request_id.clone()),
-        search: non_empty(query.search.clone()),
-    })
-}
-
-pub(crate) fn analytics_filter(
-    query: &UsageQuery,
-) -> Result<domain::UsageFilter, WireValidationError> {
-    if query.search.is_some() {
-        return Err(WireValidationError::new("search"));
+        model_contains: non_empty(query.model.clone()),
+        ..Default::default()
     }
-    usage_filter(query)
 }
 
 pub(crate) fn usage_command(
@@ -344,7 +367,7 @@ pub(crate) fn usage_command(
             query.as_of,
             timezone,
         )?,
-        filter: usage_filter(query)?,
+        filter: usage_filter(query),
         current_page,
         page_size: page_size_value,
     })

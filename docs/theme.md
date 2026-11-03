@@ -45,7 +45,7 @@
 - **文案不使用句号和分号**：自行编写的标题、标签、按钮、表单帮助、空状态、提示和错误文案不使用 `。`、句末 `.`、`；` 或 `;`，优先写成短语或简短分句
   需要表达多个要点时，按内容关系拆成字段、短行或列表，不把长段落机械替换成逗号串
   这项约定针对界面文案，URL、版本号、小数、代码、原始日志和用户输入保留原样
-- **说明只补必要信息**：标题、字段值和操作已能表达的内容不再重复，不同时用帮助文字、状态行和说明卡解释同一事实
+- **页面直显以简洁为主**：标题、标签、按钮使用简短明确的名称或动作，说明只补必要信息，不重复标题、字段值和操作已能表达的内容，不同时用多种说明形式解释同一事实
   页面保留当前决策必需的短提示，详细规则、背景原因、示例和低频帮助优先收进已有 Popover 或就近的帮助入口，不把实现细节写成用户教程
   重要说明可以在 Popover 中展开，但影响当前选择的关键限制、错误原因和不可逆后果需在操作处保留简明提示，不能全部藏起来
 - **按内容选择提示方式**：Tooltip 用于短名称或单句补充，Popover 用于需要阅读、多段说明或含链接的内容，复用项目现有组件
@@ -62,20 +62,40 @@
 | 页面头部 | `@codex-proxy/ui` 的 `ZPageHeader`、[系统概览](../frontend/src/views/dashboard/components/DashboardContent.vue) | 简短标题、必要的统计范围或状态、就近操作 |
 | 内容与指标 | `@codex-proxy/ui` 的 `ZCard`、[用量概览卡片](../frontend/src/views/usage/components/UsageSummaryCards.vue) | 可选说明、紧凑摘要、数值与辅助信息的主次 |
 | 表单帮助 | [API Key 账号字段](../frontend/src/views/accounts/components/AccountApiKeyFields.vue) | 直接命名字段，在对应位置提供短提示和示例 |
+| 详细规则 | [自动审批并发帮助](../frontend/src/views/settings/components/ConcurrencyPolicyCard.vue) | 标签旁帮助图标打开 Popover，页面保留短提示，浮层补充规则和示例 |
 | 账号与用量展示 | [账号额度窗口](../frontend/src/components/account/account-usage-window/index.vue)、[共用用量表格](../frontend/src/components/usage/UsageRecordsTable.vue) | 复用后端展示字段和共享 presenter，管理端与 Key 页保持同一展示口径 |
 
 页面查询、表单状态与纯展示逻辑的归属见 [前端模块职责](architecture.md#34-前端模块职责)
+
+## 语言与字体
+
+应用使用 Vue I18n Composition API，语言标识为 `en`、`zh-Hans`、`zh-Hant`。资源按领域存放在 `frontend/src/i18n/locales/`，使用 `领域.功能.用途` 的语义 key，例如 `accounts.connectionTest.description`，三种语言保持相同 key 和具名参数
+
+默认语言为简体中文，浏览器本地保存的有效语言选择优先；未保存选择、保存值无效或存储不可用时使用简体中文
+
+业务语言包及对应 UI 文案按语言加载，首次只加载当前语言，加载成功后缓存资源。缺失消息显示为空，不回退到其他语言或显示 key；切换时语言包加载失败则保留当前语言
+
+- 标签、帮助、ARIA、通知和图表显式取消息；列定义、选项和展示投影使用响应式计算，不把翻译结果存进业务数据
+- 完整句子使用具名参数，含组件的消息使用 `I18nT`；数量使用 Vue I18n 复数规则，不拆词拼接
+- 专业缩写在三种语言中保留原样及规范大小写，例如 `TTFT`、`RPM`、`TPM`、`API`、`HTTP`、`WS`、`RC`，直接显示时不翻译或展开，必要的全称和解释放入帮助提示
+- 英文使用句首大写和美式拼写，统一 Account、Proxy、Usage、Rate limit、API key、TTFT 等术语，协议标识和用户值保留原样
+- 繁体中文只转换简体原文的字形，保持措辞与语序，不替换地区用词，例如 `数据 → 數據`、`设置 → 設置`
+- 只翻译应用拥有的文本，具体后端错误、上游诊断、日志和独立插件内容保留原文；固定错误码在请求层映射，业务分类码优先保留后端公开的具体原因，无原因时使用本地兜底文案
+- 侧边栏语言图标展开就地选项，选择后切换并收起；品牌区固定显示 `Codex Proxy`、`Rust build` 和版本号
+- UI 库默认文案由 `ZConfigProvider` 提供，命令式通知通过 `utils/notification.ts` 绑定同一个语言来源，组件约定见 [UI 国际化](../modules/ui/playground/guide/i18n.md)
+
+正文默认使用 Inter Variable，中文及缺失字形按系统无衬线字体栈回退。代码使用 JetBrains Mono Variable，中文由系统字体补齐，不随语言切换额外修改字重。默认值由 UI 库持有，应用负责加载字体包，图表读取同一字体 Token
 
 ## 架构概览
 
 ```mermaid
 flowchart LR
-  A[Pinia 持久化配置] --> B[resolveTheme]
+  A[Pinia 持久化配置] --> B[createTheme]
   B --> C[Seed Token]
   C --> D[Map Token]
   D --> E[Alias Token]
   E --> F[Component Token]
-  F --> G[#cp-runtime-theme]
+  F --> G[#z-runtime-theme]
   G --> H[Vue / Tailwind / ECharts]
 
   B --> I[Theme Editor 草稿]
@@ -99,7 +119,7 @@ flowchart LR
 [SDK 页面与宿主桥](../backend/crates/gateway-plugin/sdk/docs/capabilities.md#页面宿主桥-v2)。
 `theme/` 根目录只保留公开入口 `index.ts` 和唯一类型文件 `types.ts`；内部实现按 `core/`、`derive/`、`runtime/` 分层，不增加嵌套 barrel。
 纯派生模块不访问 DOM，`theme/runtime/browser.ts` 不包含派生规则，Theme Store 不复制算法。
-普通 Map 字段按 camelCase → kebab-case 统一生成 `--cp-*`；Semantic 与 Preset Color 仅维护各自的短角色表。
+普通 Map 字段按 camelCase → kebab-case 统一生成 `--z-*`；Semantic 与 Preset Color 仅维护各自的短角色表。
 `ThemeTokenName` 在 `types.ts` 中由 Map 契约推导，无需手写重复的联合类型和对象映射
 
 下文未带宿主路径的 `theme/`、`styles/` 均指 `codex-proxy-ui/src/` 下的目录，联调入口见[开发文档](development.md#源码联调)
@@ -121,8 +141,8 @@ type ThemeMode = 'system' | 'light' | 'dark'
 type ThemeColorId = 'relay-blue' | 'deep-teal' | 'signal-violet' | 'graphite' | 'custom'
 
 interface ThemeCustomization {
-  seed?: Partial<ThemeSeedOverrides>
-  component?: Partial<ThemeComponentOverrides>
+  seed?: ThemeSeedOverrides
+  component?: ThemeComponentOverrides
   tokenOverrides?: Partial<ThemeTokens>
 }
 ```
@@ -134,7 +154,8 @@ interface ThemeCustomization {
 | 中性色 | `colorTextBase`、`colorBgBase` |
 | 尺寸 | `fontSize`、`sizeUnit`、`sizeStep`、`controlHeight` |
 | 风格 | `borderRadius`、`shadowStrength` |
-| 组件尺寸 | `tableRowHeight`、`cardBorderRadius` |
+
+表格行高与卡片圆角通过 `customization.component` 的 `tableRowHeight`、`cardBorderRadius` 配置，属于组件尺寸覆盖
 
 持久化键为 `codex-proxy-rs-theme`。Store 不保存完整色板或 CSS Variables，损坏的模式、颜色与自定义值会在
 初始化时规范化并回退到默认配置
@@ -194,20 +215,20 @@ Quaternary；主按钮白字与功能色文字遵循各自的容器配对规则
 
 ### Alias Token
 
-Alias 按视觉角色命名，使用 `--cp-` 命名空间；整体分层对齐 Ant Design，并以 Container / On Container 表达成对的
+Alias 按视觉角色命名，使用 `--z-` 命名空间；整体分层对齐 Ant Design，并以 Container / On Container 表达成对的
 语义表面与前景：
 
 | 角色 | CSS Token | 主要消费者 |
 | --- | --- | --- |
-| 品牌交互 | `--cp-color-primary*` | 主操作、选中态、焦点与强调 |
-| 链接 | `--cp-color-link*` | 普通文本链接 |
-| 表面 | `--cp-color-bg-*` | 页面、容器、浮层和遮罩 |
-| 填充 | `--cp-color-fill-*` | 轨道、弱背景和静态层级 |
-| 文字 | `--cp-color-text*` | 标题、正文和辅助信息 |
-| 选择 | `--cp-control-item-bg-active*` | Segmented、Select 和选择控件 |
-| 焦点 | `--cp-control-outline` | 键盘焦点和输入反馈 |
-| 功能色 | `--cp-color-info / success / warning / error-*` | 系统反馈与状态 |
-| 预设彩色 | `--cp-color-{blue,cyan,green,orange,purple,red}-{container,container-strong,border,solid,text,on-container}` | 分类标签与数据强调 |
+| 品牌交互 | `--z-color-primary*` | 主操作、选中态、焦点与强调 |
+| 链接 | `--z-color-link*` | 普通文本链接 |
+| 表面 | `--z-color-bg-*` | 页面、容器、浮层和遮罩 |
+| 填充 | `--z-color-fill-*` | 轨道、弱背景和静态层级 |
+| 文字 | `--z-color-text*` | 标题、正文和辅助信息 |
+| 选择 | `--z-control-item-bg-active*` | Segmented、Select 和选择控件 |
+| 焦点 | `--z-control-outline` | 键盘焦点和输入反馈 |
+| 功能色 | `--z-color-info / success / warning / error-*` | 系统反馈与状态 |
+| 预设彩色 | `--z-color-{blue,cyan,green,orange,purple,red}-{container,container-strong,border,solid,text,on-container}` | 分类标签与数据强调 |
 
 Alias 不在页面中追加修色；中性与彩色文字在派生层执行各自的背景配对约束。Component
 Token 直接覆盖时不会自动重算同组件的其他状态；需要保持梯度关系时应修改 Seed，而不是逐个覆盖 Map Token
@@ -218,24 +239,24 @@ Token 直接覆盖时不会自动重算同组件的其他状态；需要保持�
 
 | 组件 | 代表 Token |
 | --- | --- |
-| Button | `--cp-button-primary-color / bg / hover-bg / active-bg`、`--cp-button-secondary-bg / hover-bg / active-bg` |
-| IconButton | `--cp-icon-button-secondary-bg / hover-bg / active-bg` |
-| Input | `--cp-input-bg / hover-bg / active-bg / error-active-bg` 与对应 Shadow |
-| Menu | `--cp-menu-item-selected-bg` |
-| Popover | `--cp-popover-header-bg` |
-| Table | `--cp-table-row-bg / stripe-bg / hover-bg / selected-bg / selected-hover-bg / height` |
-| Card | `--cp-card-bg / border-radius / shadow` |
-| Layout | `--cp-layout-sider-bg / shadow` |
-| Scrollbar | `--cp-scrollbar-thumb-bg / hover-bg` |
-| BrandMark | `--cp-brand-mark-bg` |
+| Button | `--z-button-primary-color / bg / hover-bg / active-bg`、`--z-button-secondary-bg / hover-bg / active-bg` |
+| IconButton | `--z-icon-button-secondary-bg / hover-bg / active-bg` |
+| Input | `--z-input-bg / hover-bg / active-bg / error-active-bg` 与对应 Shadow |
+| Menu | `--z-menu-item-selected-bg` |
+| Popover | `--z-popover-header-bg` |
+| Table | `--z-table-row-bg / stripe-bg / hover-bg / selected-bg / selected-hover-bg / height` |
+| Card | `--z-card-bg / border-radius / shadow` |
+| Layout | `--z-layout-sider-bg / shadow` |
+| Scrollbar | `--z-scrollbar-thumb-bg / hover-bg` |
+| BrandMark | `--z-brand-mark-bg` |
 
 组件状态由 UI 库的 Component 派生层统一生成，页面不维护混色系数：
 
 | 角色 | 状态与可读性约束 |
 | --- | --- |
 | 主按钮 | 白字背景至少达到 4.5:1；Hover / Active 加深，不反向改写 Primary Seed |
-| 输入控件 | Input、Select、Textarea、NumberInput 共用 Token；常态无边，Hover 与 Focus 保持相同背景和外圈 |
-| 次级操作 | 普通按钮与图标按钮各用自己的 Secondary Token；透明填充与宿主表面合成，`ghost` 无常态底色 |
+| 输入控件 | Input、Select、Textarea、InputNumber 共用 Token；常态无边，Hover 与 Focus 保持相同背景和外圈 |
+| 次级操作 | 普通按钮与图标按钮各用自己的 Secondary Token；透明填充与宿主表面合成，`text` 与 `link` 无常态底色 |
 | 表格 | 表头、斑马纹、Hover 独立派生；固定列使用不透明合成背景，选中行保留 Primary 语义 |
 | 错误与焦点 | Hover / Focus 不覆盖错误反馈；焦点外圈不受装饰性阴影强度影响 |
 | 浮层头部 | 浅色取 Secondary Fill，深色取 Tertiary Fill；箭头与头部使用同一 Token，不借用表格背景 |
@@ -287,13 +308,17 @@ Theme Store 统一读取持久化配置并初始化主题，首个 Vue 组件渲
 
 ### CSS Variables 提交
 
+主题内部和持久化配置使用 `color-primary`、`input-bg` 等语义 Token 名，不包含 CSS 前缀。
+UI 构建插件 `CodexProxyUI({ themePrefix: 'z' })` 同时配置变量生成与样式引用，默认前缀为 `z`；
+它与组件导出名、DOM 类名和 utility 类名独立，修改后需重新构建。配置方式见 UI 的[主题定制](../modules/ui/playground/guide/theme.md#自定义主题前缀)
+
 全局主题由 `<head>` 中唯一的运行时样式节点承载：
 
 ```html
-<style id="cp-runtime-theme">
+<style id="z-runtime-theme">
 :root[data-theme='dark'][data-theme-color='relay-blue'] {
   color-scheme: dark;
-  --cp-color-bg-layout: #0B111C;
+  --z-color-bg-layout: #0B111C;
   /* 其余 Map、Alias 与 Component Token */
 }
 </style>
@@ -303,21 +328,22 @@ Theme Store 统一读取持久化配置并初始化主题，首个 Vue 组件渲
 全局弹窗通过 Teleport 挂到 `body` 后仍继承根变量
 
 > [!NOTE]
-> Theme Editor 预览是例外：草稿 Token 以内联变量写在影子环境的局部根节点上，仅影响预览，不污染已保存主题
+> Theme Editor 预览是例外：草稿 Token 经 `createThemeVars()` 转换后以内联变量写在影子环境的局部根节点上，仅影响预览，不污染已保存主题
 
 ### 切换与图表
 
 - 用户主动切换时，以点击位置为圆心运行 View Transition；不支持时使用 180ms 颜色过渡
 - 初始化、系统主题变化或减少动态效果时直接提交，不播放扩散动画
 - 每次有效提交只增加一次 `themeRevision`，相同签名不会重复刷新
-- `useThemeColor()` 在正式页面读取根 CSS Variables，在影子预览中优先读取注入的局部 Token
+- `useThemeColor()` 接收语义 Token 名，通过 `getThemeVarName()` 读取当前前缀下的 CSS Variables；影子预览优先读取注入的局部变量
+- 插件桥接传递语义 Token，由插件构建元数据指定的前缀生成 CSS 变量，宿主与插件可独立配置
 - 图表 Option 在主题 revision 或预览 Token 改变后重算，`BaseChart` 通过 `setOption` 更新现有 Canvas
 
 ## 主题编辑器
 
 主题编辑器位于一级路由 `/theme`，采用一屏工作台：左侧编辑，右侧预览，顶部保留全局操作。桌面端高度固定为
-`100dvh - 3rem`，切换编辑层级或预览类型时不改变外框高度。窄屏头部操作允许自然换行；手机端隐藏实时预览，
-只保留 Token 编辑，避免在有限宽度内渲染不可操作的缩放画板
+`100dvh - 3rem`，切换编辑层级或预览类型时不改变外框高度。窄屏头部操作允许自然换行；手机端通过预览与编辑按钮
+切换 Token 面板和实时画板，复用相同草稿、预览类型及缩放状态
 
 ### 编辑能力
 
@@ -360,30 +386,30 @@ Store 在其他入口发生变化时更新保存基线；没有未保存修改�
 
 ### CSS Token
 
-- 全局 Token：`--cp-color-bg-container`、`--cp-font-size`
-- Component Token：`--cp-table-row-hover-bg`、`--cp-input-active-shadow`
-- Preset Color Token：`--cp-color-purple-container-strong`、`--cp-color-cyan-on-container`
+- 全局 Token：`--z-color-bg-container`、`--z-font-size`
+- Component Token：`--z-table-row-hover-bg`、`--z-input-active-shadow`
+- Preset Color Token：`--z-color-purple-container-strong`、`--z-color-cyan-on-container`
 - 业务组件按[通用颜色消费](#通用颜色消费)选择角色，不在主题层声明业务域名称
-- Map 与 Component 字段由 `theme/core/tokens.ts` 统一生成 CSS Token；禁止在解析器中再写平行的逐项映射表
+- Map 与 Component 字段由 `theme/core/tokens.ts` 统一生成语义 Token，运行时通过 `createThemeVars()` 输出 CSS 变量；禁止在解析器中再写平行的逐项映射表
 - 不使用 `accent`、`soft`、`current`、`subtle` 等与现有角色重叠的平行词汇
 
 ### Vue 与 Tailwind CSS 4
 
-组件优先使用 `bg-cp-*`、`text-cp-*`、`shadow-cp-*`、`rounded-cp-*` 等由 `@theme inline` 暴露的 utility：
+组件优先使用 `bg-z-*`、`text-z-*`、`shadow-z-*`、`rounded-z-*` 等由 `@theme inline` 暴露的 utility：
 
 ```vue
-<section class="rounded-cp-card bg-cp-bg-container text-cp-text shadow-cp-card">
+<section class="rounded-z-card bg-z-bg-container text-z-text shadow-z-card">
   ...
 </section>
 ```
 
-仅当值需要在 CSS 函数、SVG 或局部派生中参与计算时，直接读取 `var(--cp-*)`。不在页面组件中重新实现色阶、
+仅当值需要在 CSS 函数、SVG 或局部派生中参与计算时，CSS 中直接读取 `var(--z-*)`，JavaScript 中通过 `getThemeVarName()` 生成变量名。不在页面组件中重新实现色阶、
 对比度或明暗算法
 
 共享包的 `styles/tailwind.css` 是唯一 `@theme inline` 注册表，只注册 Tailwind 名称，不保存主题值。注册表按基础、排版、颜色、圆角、阴影、间距与尺寸排序；
 颜色再按基元、表面、主色与链接、语义、预设、数据、组件分组。
 Preset 家族按字母排序，每个家族固定使用 `container → container-strong → border → solid → text → on-container`。主题值由
-`initializeTheme()` 在 Vue 挂载前动态生成并提交，不增加 `theme:generate`、`theme:check` 或构建期快照
+`initializeTheme()` 在 Vue 挂载前动态生成并提交，不维护构建期快照
 
 全局元素基线统一放进共享包 `styles/base.css` 的 `@layer base`，确保组件 utility 可以按 Tailwind 层级正常覆盖；可复用的
 原生滚动条声明使用 Tailwind CSS 4 `@utility`。组件内能等价表达的简单 SVG、渐变、原生外观与伪元素优先使用
@@ -397,6 +423,7 @@ utility / arbitrary variant；Vue Transition、跨浏览器 Range、动态富文
 - 表格斑马纹使用 `table-row-stripe-bg`；选中行悬停使用 `table-row-selected-hover-bg`，不被普通 Hover 覆盖
 - 结构化浮层头部使用 `popover-header-bg`，明暗模式分别检查它与表格背景的区分
 - Card 和选项默认不增加装饰性边框；键盘焦点必须保留可见反馈
+- 帮助与说明图标常态、Hover 和 Active 均保持透明背景，按钮使用 `variant="link"`，保留键盘焦点反馈；已有说明浮层时不重复显示原生 `title` 提示
 - 阴影保持中性，`shadowStrength` 只调节层级强弱，不给阴影染品牌色
 
 ## 扩展指南
@@ -404,8 +431,8 @@ utility / arbitrary variant；Vue Transition、跨浏览器 Range、动态富文
 ### 增加预置主题
 
 1. 在 `ThemeColorPresetId` 增加稳定 ID
-2. 在 `THEME_COLOR_PRESETS` 声明名称、描述与主色 Seed
-3. 不新增页面特判，确认预置可通过同一 `resolveTheme()` 派生
+2. 在 `themeColorPresets` 声明名称、描述与主色 Seed
+3. 不新增页面特判，确认预置可通过同一 `createTheme()` 派生
 4. 在浅色、深色和系统模式下检查文本、浮层、Input、表格与图表
 
 ### 增加全局 Seed 或 Alias

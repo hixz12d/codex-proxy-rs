@@ -1,5 +1,6 @@
 import type { RequestOptions } from '../request'
-import type { AccountQuotaWindow } from './accounts'
+import type { RelativeTimeView } from '../types/time'
+import type { AccountQuotaWindow, AccountUpstream } from './accounts'
 import type { AnalyticsMetadata } from './analytics'
 import type { UsageListRecord } from './usage'
 import request from '../request'
@@ -25,25 +26,21 @@ export interface DashboardTrendPoint {
   tokensValue: number
   errors: string
   errorsValue: number
-  latency: string
   latencyValue: number | null
-  maxLatency: string
-  maxLatencyValue: number | null
-  minLatency: string
-  minLatencyValue: number | null
   successRate: string
   successRateValue: number | null
-  firstTokenP50Ms: number | null
   firstTokenP95Ms: number | null
   latencyP95Ms: number | null
   outputThroughputP50: number | null
-  admissionDecisionP95Ms: number | null
-  accountSelectionWaitP95Ms: number | null
-  capacityUtilization: number | null
 }
 
+export type DashboardTrendMetric
+  = 'inputTokens' | 'outputTokens' | 'cachedInputTokens'
+    | 'firstTokenP95Ms' | 'latencyP95Ms' | 'outputThroughputP50'
+    | 'errors' | 'successRate' | 'requests'
+
 export interface DashboardTrendSummaryItem {
-  label: string
+  metric: DashboardTrendMetric
   value: string
   ratio: string | null
 }
@@ -124,7 +121,7 @@ export interface DashboardWireProfile {
     terminal: string
   }
   userAgent: string
-  attributes: Array<{ label: string, value: string }>
+  attributes: Array<{ key: string, value: string }>
   verifiedAt?: string
   verifiedAtDisplay?: string
   release?: {
@@ -144,10 +141,12 @@ export interface DashboardAccountRequestBucket {
 }
 
 export interface DashboardAccountUsage {
+  upstream: AccountUpstream | null
   id: string
   provider: string
   authenticationKind: string
   email: string
+  notes: string | null
   planType: string | null
   planTypeDisplay: string
   tokens: string
@@ -155,8 +154,12 @@ export interface DashboardAccountUsage {
   requestBuckets: DashboardAccountRequestBucket[]
   quotaUsedPercent: number | null
   usageWindow: AccountQuotaWindow | null
+  metric: 'requests' | 'tokens'
+  metricValueRaw: number | null
   metricLabel: string
   metricValue: string
+  lastUsedAt: string | null
+  lastUsedRelative: RelativeTimeView | null
   lastUsed: string
 }
 

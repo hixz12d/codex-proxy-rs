@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import type { TableColumn } from '@codex-proxy/ui'
-import type { UsageListRecord } from '@/api'
 
+import type { UsageListRecord } from '@/api'
 import { ZTable } from '@codex-proxy/ui'
+
+import { useI18n } from 'vue-i18n'
 import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import UsageBillingCell from '@/components/usage/UsageBillingCell.vue'
@@ -30,9 +32,10 @@ withDefaults(
   }>(),
   {
     loading: false,
-    emptyText: '暂无使用记录',
   },
 )
+
+const { t } = useI18n({ useScope: 'global' })
 </script>
 
 <template>
@@ -40,11 +43,11 @@ withDefaults(
     :columns="columns"
     :data="rows"
     :loading="loading"
-    :empty-text="emptyText"
+    :empty-text="emptyText ?? t('usage.noUsageRecords')"
   >
     <template #clientApiKeyName="{ displayValue }">
       <span
-        class="block max-w-full truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
+        class="block max-w-full truncate font-mono text-z-sm leading-none font-bold text-z-text"
         :title="String(displayValue)"
       >
         {{ displayValue }}
@@ -60,14 +63,14 @@ withDefaults(
 
     <template #accountEmail="{ row }">
       <span
-        class="block max-w-full truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
+        class="block max-w-full truncate font-mono text-z-sm leading-none font-bold text-z-text"
         :title="usageAccountText(row)"
       >
         {{ usageAccountText(row) }}
       </span>
       <span
         v-if="row.accountNotes?.trim()"
-        class="mt-1 block max-w-full truncate text-cp-xs font-emphasis text-cp-text-quaternary"
+        class="mt-1 block max-w-full truncate text-z-xs font-emphasis text-z-text-quaternary"
         :title="row.accountNotes"
       >
         {{ row.accountNotes }}
@@ -76,12 +79,14 @@ withDefaults(
 
     <template #accountPlanType="{ row }">
       <AccountPlanBadge
-        v-if="row.accountPlanType"
+        v-if="row.accountUpstreamPeer || row.authenticationKind === 'api_key' || row.accountPlanType"
+        :authentication-kind="row.authenticationKind ?? undefined"
+        :upstream-peer="row.accountUpstreamPeer"
         :plan-type="row.accountPlanType"
-        :plan-type-display="row.accountPlanTypeDisplay || row.accountPlanType"
+        :plan-type-display="row.accountPlanTypeDisplay || row.accountPlanType || ''"
         size="sm"
       />
-      <span v-else class="text-cp-text-quaternary">—</span>
+      <span v-else class="text-z-text-quaternary">—</span>
     </template>
 
     <template #createdAtDisplay="{ row }">
@@ -93,7 +98,7 @@ withDefaults(
     </template>
 
     <template #userAgent="{ row }">
-      <span class="block max-w-full wrap-break-word whitespace-normal font-mono text-cp-sm leading-[1.4] font-emphasis text-cp-text-secondary">
+      <span class="block max-w-full wrap-break-word whitespace-normal font-mono text-z-sm leading-[1.4] font-emphasis text-z-text-secondary">
         {{ usageUserAgent(row) }}
       </span>
     </template>
@@ -112,10 +117,10 @@ withDefaults(
 
     <template #errorMessage="{ row }">
       <div class="min-w-0 py-0.5" :title="row.errorMessage || row.errorCode || undefined">
-        <code class="block truncate font-mono text-cp-sm font-bold text-cp-error-text">
-          {{ row.errorCode || (row.logicalOutcome === 'incomplete' ? '响应未完成' : '请求失败') }}
+        <code class="block truncate font-mono text-z-sm font-bold text-z-error-text">
+          {{ row.errorCode || (row.logicalOutcome === 'incomplete' ? t('usage.error.responseIsNotComplete') : t('usage.error.requestFailed')) }}
         </code>
-        <p v-if="row.errorMessage" class="mt-1 mb-0 truncate text-cp-xs leading-[1.45] font-emphasis text-cp-text-secondary">
+        <p v-if="row.errorMessage" class="mt-1 mb-0 truncate text-z-xs leading-[1.45] font-emphasis text-z-text-secondary">
           {{ row.errorMessage }}
         </p>
       </div>

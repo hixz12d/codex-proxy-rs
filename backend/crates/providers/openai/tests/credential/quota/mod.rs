@@ -1,6 +1,5 @@
 //! OpenAI 额度事实边界与展示快照回归
 
-mod capacity_freeze;
 mod credits;
 mod initial_sync;
 mod recovery;
@@ -46,6 +45,7 @@ fn wire_profile() -> CodexWireProfileState {
         terminal: "quota-contract".to_owned(),
         exact_user_agent: None,
         residency: None,
+        account_routing_override: None,
         verified_at: Utc
             .with_ymd_and_hms(2026, 7, 18, 0, 0, 0)
             .single()
@@ -69,8 +69,8 @@ pub(super) fn quota_service_with_base_url(
     http: reqwest::Client,
     base_url: String,
 ) -> CodexCredentialQuotaService {
-    // 首查随机启动延迟只在 initial_sync 专项测试中注入非零值；
-    // 其余测试固定为零，保持「首轮即查」的确定性旧行为。
+    // 首查随机启动延迟只在 initial_sync 专项测试中注入非零值
+    // 其余测试固定为零，避免计时抖动影响业务断言
     quota_service_with_initial_delays(store, http, base_url, Arc::new(|| Duration::ZERO))
 }
 
@@ -86,7 +86,6 @@ pub(super) fn quota_service_with_initial_delays(
         http,
         base_url,
         Arc::new(crate::support::MemoryCooldownPort::new()),
-        Arc::new(crate::support::TestLeaseCoordinator::default()),
         crate::support::runtime_policy(),
     )
     .with_initial_sync_delays(delays)
@@ -411,42 +410,43 @@ async fn websocket_additional_rate_limit_resolves_by_name_without_touching_core(
 #[tokio::test]
 async fn quota_refresh_synchronizes_plan_changes_without_losing_subtypes() {
     for (current_plan, observed_plan, expected) in [
-        ("plus", Some("pro"), "pro"),
-        ("pro", Some("plus"), "plus"),
-        ("plus", Some("free"), "free"),
-        ("unknown", Some("pro"), "pro"),
-        ("plus", Some("  PRO  "), "pro"),
-        ("pro", None, "pro"),
-        ("pro", Some("unknown"), "pro"),
-        ("pro", Some("  "), "pro"),
+        (None, Some("free"), "free"),
+        (Some("plus"), Some("pro"), "pro"),
+        (Some("pro"), Some("plus"), "plus"),
+        (Some("plus"), Some("free"), "free"),
+        (Some("unknown"), Some("pro"), "pro"),
+        (Some("plus"), Some("  PRO  "), "pro"),
+        (Some("pro"), None, "pro"),
+        (Some("pro"), Some("unknown"), "pro"),
+        (Some("pro"), Some("  "), "pro"),
         (
-            "self_serve_business_prolite",
+            Some("self_serve_business_prolite"),
             Some("team"),
             "self_serve_business_prolite",
         ),
         (
-            "self_serve_business_usage_based",
+            Some("self_serve_business_usage_based"),
             Some("team"),
             "self_serve_business_usage_based",
         ),
         (
-            "enterprise_cbp_usage_based",
+            Some("enterprise_cbp_usage_based"),
             Some("business"),
             "enterprise_cbp_usage_based",
         ),
-        ("edu_plus", Some("edu"), "edu_plus"),
-        ("self_serve_business_prolite", Some("pro"), "pro"),
+        (Some("edu_plus"), Some("edu"), "edu_plus"),
+        (Some("self_serve_business_prolite"), Some("pro"), "pro"),
         (
-            "team",
+            Some("team"),
             Some("self_serve_business_prolite"),
             "self_serve_business_prolite",
         ),
-        ("plus", Some("future_plan"), "future_plan"),
+        (Some("plus"), Some("future_plan"), "future_plan"),
     ] {
         let store = Arc::new(MemoryAccountStore::default());
         let account_id = "acct_plan_refresh";
         let mut verified_account = profile("chatgpt-plan-refresh");
-        verified_account.plan_type = Some(current_plan.to_owned());
+        verified_account.plan_type = current_plan.map(str::to_owned);
         store
             .seed_oauth_credential(ImportCodexOAuthCredential {
                 account_id: account_id.to_owned(),
@@ -481,7 +481,7 @@ async fn quota_refresh_synchronizes_plan_changes_without_losing_subtypes() {
         assert_eq!(
             after.plan_type(),
             Some(expected),
-            "{current_plan} -> {observed_plan:?}"
+            "{current_plan:?} -> {observed_plan:?}"
         );
         assert_eq!(after.revision(), before.revision());
         assert_eq!(after.email(), before.email());

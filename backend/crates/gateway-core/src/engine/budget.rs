@@ -19,6 +19,29 @@ impl ClientBudgetLimits {
     pub fn is_limited(self) -> bool {
         self.daily_usd != Decimal::ZERO || self.weekly_usd != Decimal::ZERO
     }
+
+    /// 准入与对外预算查询共用真实账本口径，展示字符串不参与访问判断
+    #[must_use]
+    pub fn access(self, daily_used: Decimal, weekly_used: Decimal) -> ClientBudgetAccess {
+        ClientBudgetAccess {
+            daily_limit_reached: self.daily_usd != Decimal::ZERO && daily_used >= self.daily_usd,
+            weekly_limit_reached: self.weekly_usd != Decimal::ZERO
+                && weekly_used >= self.weekly_usd,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientBudgetAccess {
+    pub daily_limit_reached: bool,
+    pub weekly_limit_reached: bool,
+}
+
+impl ClientBudgetAccess {
+    #[must_use]
+    pub const fn allowed(self) -> bool {
+        !self.daily_limit_reached && !self.weekly_limit_reached
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -44,9 +67,9 @@ pub struct ClientBudgetCharge {
 pub struct ClientBudgetError(#[source] pub Option<crate::error::ErrorSource>);
 
 pub trait ClientBudgetPort: Send + Sync {
-    /// 原子检查当前限额与已用金额，不创建预扣费或待结算记录
+    /// 检查当前限额、已用金额与已接管的费用，不预占未来费用
     fn admit(&self, key_id: ClientApiKeyId) -> BoxFuture<'_, Result<(), GatewayError>>;
 
-    /// 按网关请求 ID 幂等累计已取得费用；写入失败由 Store 重试
+    /// 按网关请求 ID 幂等接管已取得费用；运行时入队后返回，由 Store 后台落库和重试
     fn settle(&self, charge: ClientBudgetCharge) -> BoxFuture<'_, Result<(), ClientBudgetError>>;
 }

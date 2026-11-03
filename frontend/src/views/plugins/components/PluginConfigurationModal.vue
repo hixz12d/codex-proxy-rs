@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import type { ConfigurePluginInstanceRequest, PluginArtifact, PluginInstance, PluginVersionPlan } from '@/api'
-import { ZButton, ZDialog, ZNotification, ZSegmented } from '@codex-proxy/ui'
-import { Blocks, Save, Settings2, ShieldCheck } from '@lucide/vue'
+
+import { ZButton, ZDialog, ZSegmented } from '@codex-proxy/ui'
+import { Blocks, Settings2, ShieldCheck } from '@lucide/vue'
 import { cloneDeep } from 'es-toolkit'
 import { computed, nextTick, ref, shallowRef, useTemplateRef, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { notification as ZNotification } from '@/utils/notification'
 import { pluginRequestBindingEntries } from '../utils/model'
 import PluginBindingEditor from './PluginBindingEditor.vue'
 import PluginConfigurationFields from './PluginConfigurationFields.vue'
@@ -16,14 +19,17 @@ const props = defineProps<{
   error: string
   saving: boolean
 }>()
+
 const emit = defineEmits<{ save: [value: ConfigurePluginInstanceRequest] }>()
+
+const { t } = useI18n({ useScope: 'global' })
+
 const open = defineModel<boolean>({ required: true })
 const section = shallowRef('general')
 const configurationValid = shallowRef(true)
 const authenticationValid = shallowRef(true)
 const bindingsValid = shallowRef(true)
-const secretMode = shallowRef<'preserve' | 'replace' | 'clear'>('preserve')
-const secretValues = ref<Record<string, string>>({})
+const secretValues = ref<Record<string, string | null>>({})
 const configuration = ref<Record<string, unknown>>({})
 const bindings = ref<ConfigurePluginInstanceRequest['bindings']>([])
 const configurationFields = useTemplateRef<{ focusInvalid: () => Promise<unknown>, validationMessage: string }>('configurationFields')
@@ -35,21 +41,45 @@ const authenticationBinding = computed({
   get: () => bindings.value.find(binding => binding.contribution === authenticationContribution.value?.id) ?? null,
   set: (binding) => {
     const others = bindings.value.filter(value => value.contribution !== authenticationContribution.value?.id)
-    bindings.value = binding ? [...others, cloneDeep(binding)] : others
+    bindings.value = binding
+      ? [
+          ...others,
+          cloneDeep(binding),
+        ]
+      : others
   },
 })
 const hasRequestBindings = computed(() => props.artifact && pluginRequestBindingEntries(props.artifact.metadata).length > 0)
 const sections = computed(() => [
-  { label: '插件参数', value: 'general', icon: Settings2 },
-  ...(hasRequestBindings.value ? [{ label: '高级设置', value: 'requests', icon: Blocks }] : []),
-  ...(authenticationContribution.value ? [{ label: '客户端认证', value: 'authentication', icon: ShieldCheck }] : []),
+  {
+    label: t('plugins.configuration.pluginParameters'),
+    value: 'general',
+    icon: Settings2,
+  },
+  ...(hasRequestBindings.value
+    ? [
+        {
+          label: t('plugins.configuration.advancedSettings'),
+          value: 'requests',
+          icon: Blocks,
+        },
+      ]
+    : []),
+  ...(authenticationContribution.value
+    ? [
+        {
+          label: t('plugins.configuration.clientAuthentication'),
+          value: 'authentication',
+          icon: ShieldCheck,
+        },
+      ]
+    : []),
 ])
-const primaryLabel = computed(() => versionChanged.value ? '应用并切换' : props.instance?.configurationRequired ? '保存并启用' : '保存设置')
-const secretModes = [
-  { label: '保留已有值', value: 'preserve' },
-  { label: '替换全部值', value: 'replace' },
-  { label: '清除全部值', value: 'clear' },
-]
+const primaryLabel = computed(() => versionChanged.value
+  ? t('plugins.configuration.applyAndSwitch')
+  : props.instance?.configurationRequired
+    ? t('plugins.configuration.saveAndEnable')
+    : t('plugins.configuration.saveSettings'))
 
 async function focusConfigurationInvalid() {
   section.value = 'general'
@@ -63,18 +93,20 @@ async function submit() {
   if (!instance || !artifact)
     return
   if (!configurationValid.value) {
-    ZNotification.warning({ message: configurationFields.value?.validationMessage || '请检查插件参数' })
+    ZNotification.warning({ message: configurationFields.value?.validationMessage || t('plugins.configuration.checkPluginParameters') })
     await focusConfigurationInvalid()
     return
   }
   if (!bindingsValid.value) {
     section.value = 'requests'
-    ZNotification.warning({ message: '请设置请求范围，或勾选“应用于所有请求”' })
+    ZNotification.warning({
+      message: t('plugins.configuration.setRequestScopeOrCheckApplyTo'),
+    })
     return
   }
   if (!authenticationValid.value) {
     section.value = 'authentication'
-    ZNotification.warning({ message: authenticationEditor.value?.validationError || '请检查客户端认证身份映射' })
+    ZNotification.warning({ message: authenticationEditor.value?.validationError || t('plugins.configuration.invalidIdentityMappings') })
     return
   }
   const input: ConfigurePluginInstanceRequest = {
@@ -84,8 +116,8 @@ async function submit() {
     configuration: cloneDeep(configuration.value),
     bindings: cloneDeep(bindings.value),
   }
-  if (secretMode.value !== 'preserve')
-    input.secrets = secretMode.value === 'clear' ? {} : cloneDeep(secretValues.value)
+  if (Object.keys(secretValues.value).length)
+    input.secrets = cloneDeep(secretValues.value)
   emit('save', input)
 }
 
@@ -95,7 +127,6 @@ watch(open, async (value) => {
   secretValues.value = {}
   configuration.value = cloneDeep(props.draft?.configuration ?? props.instance?.configuration ?? {})
   bindings.value = cloneDeep(props.draft?.bindings ?? props.instance?.bindings ?? [])
-  secretMode.value = existingSecretFields.value.length ? 'preserve' : 'replace'
   configurationValid.value = true
   authenticationValid.value = true
   bindingsValid.value = true
@@ -110,22 +141,14 @@ function clearSecrets() {
 </script>
 
 <template>
-  <ZDialog v-model="open" :title="versionChanged ? `切换至 ${artifact?.metadata.version}` : '插件设置'" :description="artifact ? `${artifact.metadata.displayName} · ${artifact.metadata.version}` : undefined" width="48rem" :show-close="!saving" :close-on-click-modal="!saving" :close-on-press-escape="!saving" @closed="clearSecrets">
+  <ZDialog v-model="open" :title="versionChanged ? t('plugins.configuration.switchTo', { version: artifact?.metadata.version }) : t('plugins.configuration.pluginSettings')" :description="artifact ? `${artifact.metadata.displayName} · ${artifact.metadata.version}` : undefined" width="48rem" :show-close="!saving" :close-on-click-modal="!saving" :close-on-press-escape="!saving" @closed="clearSecrets">
     <div v-if="artifact && instance" class="grid gap-5">
-      <div v-if="error" role="alert" class="grid gap-1 text-cp-sm text-cp-warning-text">
+      <div v-if="error" role="alert" class="grid gap-1 text-z-sm text-z-warning-text">
         <span>{{ error }}</span>
-        <span class="text-cp-xs text-cp-text-secondary">当前版本保持不变，修改后再应用</span>
+        <span class="text-z-xs text-z-text-secondary">{{ t('plugins.configuration.unchangedVersion') }}</span>
       </div>
-      <ZSegmented v-if="sections.length > 1" v-model="section" :options="sections" aria-label="插件设置分区" :disabled="saving" class="w-fit max-w-full" />
+      <ZSegmented v-if="sections.length > 1" v-model="section" :options="sections" :aria-label="t('plugins.configuration.pluginSettingsPartition')" :disabled="saving" class="w-fit max-w-full" />
       <div v-show="section === 'general'" class="grid gap-5">
-        <ZSegmented
-          v-if="existingSecretFields.length"
-          v-model="secretMode"
-          :options="secretModes"
-          aria-label="敏感配置保存方式"
-          :disabled="saving"
-          class="w-full sm:w-auto"
-        />
         <PluginConfigurationFields
           ref="configurationFields"
           v-model:configuration="configuration"
@@ -133,7 +156,6 @@ function clearSecrets() {
           :schema="artifact.metadata.configurationSchema"
           :secret-fields="artifact.metadata.secretFields"
           :existing-secret-fields="existingSecretFields"
-          :secret-mode="secretMode"
           :disabled="saving"
           @validity-change="configurationValid = $event"
         />
@@ -161,12 +183,9 @@ function clearSecrets() {
     </div>
     <template #footer>
       <ZButton :disabled="saving" @click="open = false">
-        取消
+        {{ t('common.actions.cancel') }}
       </ZButton>
       <ZButton type="primary" :loading="saving" :disabled="!instance || !artifact" @click="submit">
-        <template #icon>
-          <Save class="size-4" />
-        </template>
         {{ primaryLabel }}
       </ZButton>
     </template>

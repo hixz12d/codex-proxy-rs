@@ -2,12 +2,11 @@
 import type { dashboardTrendView, normalizeDashboardTrendKind } from '../presenter'
 
 import { ZCard, ZEmpty, ZSegmented } from '@codex-proxy/ui'
+
 import { toRef } from 'vue'
+import { useI18n } from 'vue-i18n'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { useRequestTrendChart } from '../composables/useRequestTrendChart'
-
-type TrendKind = ReturnType<typeof normalizeDashboardTrendKind>
-type TrendView = ReturnType<typeof dashboardTrendView>
 
 const props = withDefaults(defineProps<{
   points: TrendView['points']
@@ -23,10 +22,15 @@ const emit = defineEmits<{
   trendChange: [kind: TrendKind]
 }>()
 
+const { t } = useI18n({ useScope: 'global' })
+
+type TrendKind = ReturnType<typeof normalizeDashboardTrendKind>
+type TrendView = ReturnType<typeof dashboardTrendView>
+
 const activeKind = defineModel<TrendKind>('kind', { required: true })
 const {
   tabs,
-  pinnedSummaryLabel,
+  pinnedSummaryMetric,
   hasSamples,
   chartOption,
   summaryMarkerStyle,
@@ -35,18 +39,17 @@ const {
   isSummarySeriesActive,
 } = useRequestTrendChart({
   points: toRef(props, 'points'),
-  summary: toRef(props, 'summary'),
   activeKind,
   onTrendChange: kind => emit('trendChange', kind),
 })
 </script>
 
 <template>
-  <ZCard as="article" title="使用趋势" class="min-h-95 w-full">
+  <ZCard as="article" :title="t('dashboard.trends.title')" class="min-h-95 w-full">
     <template #actions>
       <ZSegmented
         v-model="activeKind"
-        aria-label="趋势指标"
+        :aria-label="t('dashboard.trends.metric')"
         :options="tabs"
         class="w-full max-w-61.5 sm:w-61.5"
         @update:model-value="handleTrendChange"
@@ -55,36 +58,36 @@ const {
 
     <template #body>
       <div class="grid gap-3.5">
-        <div class="grid h-14.25 min-w-0 grid-cols-3 gap-1.5 rounded-xl bg-cp-fill-quaternary/45 p-1.5">
+        <div class="grid h-14.25 min-w-0 grid-cols-3 gap-1.5 rounded-xl bg-z-fill-quaternary/45 p-1.5">
           <button
             v-for="item in props.summary"
-            :key="item.label"
+            :key="item.metric"
             type="button"
-            :aria-label="`突出显示${item.label}曲线`"
-            :aria-pressed="pinnedSummaryLabel === item.label"
-            class="group grid min-w-0 grid-cols-[8px_minmax(0,1fr)] items-center gap-x-2 rounded-lg border-0 bg-transparent px-2.5 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-cp-control-outline"
-            @click="toggleSummarySeries(item.label)"
+            :aria-label="t('dashboard.trends.highlight', { label: item.label })"
+            :aria-pressed="pinnedSummaryMetric === item.metric"
+            class="group grid min-w-0 grid-cols-[8px_minmax(0,1fr)] items-center gap-x-2 rounded-lg border-0 bg-transparent px-2.5 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-z-control-outline"
+            @click="toggleSummarySeries(item.metric)"
           >
             <i
               class="size-2 rounded-full transition-transform duration-200 ease-out group-hover:scale-125 motion-reduce:transition-none"
               :style="summaryMarkerStyle(item)"
               :class="[
-                isSummarySeriesActive(item.label) ? 'scale-125' : undefined,
+                isSummarySeriesActive(item.metric) ? 'scale-125' : undefined,
                 {
-                  'bg-cp-info': item.tone === 'info',
-                  'bg-cp-success': item.tone === 'success',
-                  'bg-cp-warning': item.tone === 'warning',
-                  'bg-cp-error': item.tone === 'danger',
-                  'bg-cp-text-tertiary': item.tone === 'normal',
+                  'bg-z-info': item.tone === 'info',
+                  'bg-z-success': item.tone === 'success',
+                  'bg-z-warning': item.tone === 'warning',
+                  'bg-z-error': item.tone === 'danger',
+                  'bg-z-text-tertiary': item.tone === 'normal',
                 },
               ]"
             />
             <span class="grid min-w-0 gap-1.5">
-              <span class="truncate text-[10px] leading-none font-bold text-cp-text-secondary">
+              <span class="truncate text-[10px] leading-none font-bold text-z-text-secondary">
                 {{ item.label }}
               </span>
               <strong
-                class="truncate font-mono text-cp-xl leading-none font-heavy tabular-nums text-cp-text"
+                class="truncate font-mono text-z-xl leading-none font-heavy tabular-nums text-z-text"
                 :title="item.value"
               >
                 {{ item.value }}
@@ -96,9 +99,9 @@ const {
         <div class="relative h-55 w-full overflow-hidden">
           <BaseChart v-if="hasSamples" :option="chartOption" :height="220" />
           <ZEmpty
-            v-else-if="!loading"
+            v-else-if="!loading && !error"
             surface="none"
-            :title="error || '暂无趋势数据'"
+            :title="t('dashboard.trends.empty')"
             class="h-full place-content-center"
           />
         </div>

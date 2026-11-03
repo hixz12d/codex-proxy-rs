@@ -1,13 +1,19 @@
 <script setup lang="ts">
 import type { AccountGroupRef } from '@/api'
+
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 const props = defineProps<{
   groups: AccountGroupRef[]
 }>()
 
+const { t } = useI18n({ useScope: 'global' })
+
 const fullNames = computed(() =>
-  props.groups.map(group => (group.enabled ? group.name : `${group.name}（已禁用）`)).join('、'),
+  props.groups.map(group => (group.enabled
+    ? group.name
+    : t('common.status.disabledName', { name: group.name }))).join('、'),
 )
 </script>
 
@@ -26,5 +32,5 @@ const fullNames = computed(() =>
       :title="group.name"
     />
   </div>
-  <span v-else class="text-xs text-cp-text-quaternary">—</span>
+  <span v-else class="text-xs text-z-text-quaternary">—</span>
 </template>

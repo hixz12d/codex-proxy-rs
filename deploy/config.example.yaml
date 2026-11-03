@@ -53,6 +53,7 @@ store:
     # 与 PostgreSQL 共用密码格式要求，并满足 Redis 服务端密码策略
     password: &redis_password ''
   # 可选：PostgreSQL 连接池预算；下列值与当前推荐默认一致。
+  # 小内存低并发部署的池上限与数据库调优见 deploy/README.md#小内存优化
   # pool:
   #   max_connections: 20
   #   acquire_timeout_seconds: 5
@@ -78,8 +79,17 @@ api:
   request_id_header: 'x-request-id'
 
 openai:
-  # 数据驻留约束；省略或 null 不指定地域约束，与管理端客户端身份无关。
+  # 数据驻留参考值：us；填写值原样发送，省略或 null 时删除对应请求头
   residency: us
+  # 账号路由参考值：us、us_cr；填写值原样发送，省略或 null 时删除对应请求头
+  account_routing_override: null
+  # 可选：完整的 Responses 上游 WS 池配置；省略整段使用以下默认值。
+  # ws_pool:
+  #   enabled: true
+  #   max_age_ms: 3300000
+  #   max_connecting: 8
+  #   idle_timeout_ms: 300000 # 仅回收未绑定活跃客户端 WS 的空闲连接，必须大于零。
+  #   stream_idle_timeout_ms: 300000
 
 # Compose 启动桥接区；密码仍只维护在 store 中。
 services:
@@ -95,6 +105,7 @@ services:
       POSTGRES_PASSWORD: *postgres_password
 
   redis-credentials:
+    # 可选的持久化与内存预算见 deploy/README.md#小内存优化，调整时保留密码参数
     command:
       - redis-server
       - --appendonly

@@ -106,7 +106,7 @@ impl DefaultKeyUsageService {
 fn usage_filter(id: &ClientApiKeyId, model: Option<String>) -> UsageFilter {
     UsageFilter {
         client_api_key_ref: Some(id.as_str().to_owned()),
-        model,
+        model_contains: model,
         ..UsageFilter::default()
     }
 }
@@ -194,7 +194,8 @@ impl KeyUsageService for DefaultKeyUsageService {
             self.observations.usage_insights_observation(
                 query.range,
                 filter,
-                Granularity::for_range(query.range)
+                Granularity::for_range(query.range),
+                false,
             ),
             self.observations.usage_trend(
                 today,

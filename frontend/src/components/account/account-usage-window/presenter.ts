@@ -1,5 +1,6 @@
 import type { AccountQuotaWindow } from '@/api/index'
 import { clamp } from 'es-toolkit'
+import { t } from '@/i18n'
 import { isRecord } from '@/utils/data'
 import { formatInteger } from '@/utils/format'
 
@@ -55,9 +56,9 @@ const variantDefinitions: Record<
 > = {
   metric: {
     rootClass: 'grid min-w-0 grid-rows-[14px_14px] gap-1',
-    headerClass: 'flex items-center justify-between gap-2 text-cp-xs leading-[14px] font-bold',
-    labelClass: 'truncate text-cp-text-quaternary',
-    valueClass: 'text-cp-xs leading-none font-bold',
+    headerClass: 'flex items-center justify-between gap-2 text-z-xs leading-[14px] font-bold',
+    labelClass: 'truncate text-z-text-quaternary',
+    valueClass: 'text-z-xs leading-none font-bold',
     trackOffsetClass: 'self-center',
     trackShapeClass: 'h-1.5 w-full overflow-hidden rounded-full',
     minimumBarWidth: '6px',
@@ -67,21 +68,21 @@ const variantDefinitions: Record<
   },
   compact: {
     rootClass: 'flex min-w-0 flex-col',
-    headerClass: 'mb-1 flex items-baseline justify-between gap-2 text-cp-xs leading-[14px] font-bold',
-    labelClass: 'truncate text-cp-text-quaternary',
+    headerClass: 'mb-1 flex items-baseline justify-between gap-2 text-z-xs leading-[14px] font-bold',
+    labelClass: 'truncate text-z-text-quaternary',
     valueClass: 'text-[10px] leading-[14px] font-heavy',
     trackOffsetClass: 'mt-auto',
-    trackShapeClass: 'h-[3px] w-full overflow-hidden rounded-full',
+    trackShapeClass: 'h-1 w-full overflow-hidden rounded-full',
     minimumBarWidth: '3px',
     compactValues: true,
     labelTooltip: true,
     showResetTime: false,
   },
   detail: {
-    rootClass: 'rounded-lg bg-cp-fill-quaternary p-2',
-    headerClass: 'flex items-center justify-between gap-3 text-cp-sm font-bold',
-    labelClass: 'text-cp-text-secondary',
-    valueClass: 'text-cp-sm font-heavy',
+    rootClass: 'rounded-lg bg-z-fill-quaternary p-2',
+    headerClass: 'flex items-center justify-between gap-3 text-z-sm font-bold',
+    labelClass: 'text-z-text-secondary',
+    valueClass: 'text-z-sm font-heavy',
     trackOffsetClass: 'mt-2',
     trackShapeClass: 'h-2 overflow-hidden rounded-full',
     minimumBarWidth: '8px',
@@ -96,20 +97,20 @@ const quotaToneClasses: Record<
   { bar: string, text: string }
 > = {
   unknown: {
-    bar: 'bg-cp-border',
-    text: 'text-cp-text-quaternary',
+    bar: 'bg-z-border',
+    text: 'text-z-text-quaternary',
   },
   danger: {
-    bar: 'bg-cp-error',
-    text: 'text-cp-error-text',
+    bar: 'bg-z-error',
+    text: 'text-z-error-text',
   },
   warning: {
-    bar: 'bg-cp-warning',
-    text: 'text-cp-warning-text',
+    bar: 'bg-z-warning',
+    text: 'text-z-warning-text',
   },
   success: {
-    bar: 'bg-cp-success',
-    text: 'text-cp-success-text',
+    bar: 'bg-z-success',
+    text: 'text-z-success-text',
   },
 }
 
@@ -125,15 +126,19 @@ export function resolveAccountUsageWindowPresentation(
   const localRequestValueVisible = input.showLocalValue
     && typeof localUsage?.requestCount === 'number'
     && localUsage.requestCount > 0
-  const localRequestLabel = '日请求'
+  const localRequestLabel = t('accounts.quota.dailyRequests')
   const quota = input.window
     ? quotaWindowPresentation(input.window, definition.minimumBarWidth)
     : null
+  const label = input.window
+    ? quotaWindowLabel(input.window)
+    : undefined
 
   return {
     mode,
     compactValues: definition.compactValues,
-    labelTooltip: definition.labelTooltip ? input.window?.labelDisplay : undefined,
+    label,
+    labelTooltip: definition.labelTooltip ? label : undefined,
     classes: {
       root: definition.rootClass,
       header: definition.headerClass,
@@ -141,7 +146,7 @@ export function resolveAccountUsageWindowPresentation(
       value: definition.valueClass,
       trackOffset: definition.trackOffsetClass,
       trackShape: definition.trackShapeClass,
-      track: `${definition.trackShapeClass} bg-cp-border-secondary`,
+      track: `${definition.trackShapeClass} bg-z-border-secondary`,
     },
     quota: {
       valueVisible: typeof input.window?.usedPercent === 'number'
@@ -159,7 +164,7 @@ export function resolveAccountUsageWindowPresentation(
       label: localRequestLabel,
       requestDisplay: localRequestDisplay,
       requestValueVisible: localRequestValueVisible,
-      timelineTitle: `${localRequestLabel} ${localRequestDisplay} 次`,
+      timelineTitle: t('accounts.quota.requests', { localRequestLabel, localRequestDisplay }),
       requestBars: requestTimeline(localUsage?.requestBuckets ?? []),
       durationDisplay: rollingWindowDurationDisplay(input.window?.windowSeconds),
     },
@@ -202,11 +207,13 @@ function requestBuckets(value: unknown) {
     ) {
       return []
     }
-    return [{
-      bucketStart: item.bucketStart,
-      label: item.label,
-      requestCount: item.requestCount,
-    }]
+    return [
+      {
+        bucketStart: item.bucketStart,
+        label: item.label,
+        requestCount: item.requestCount,
+      },
+    ]
   })
 }
 
@@ -214,7 +221,7 @@ function usageWindowMode(
   window: AccountQuotaWindow | undefined,
   localUsage: AccountLocalUsage | null,
 ): AccountUsageWindowMode {
-  if (typeof window?.usedPercent === 'number')
+  if (typeof window?.usedPercent === 'number' || window?.amount)
     return 'quota'
   if (localUsage)
     return 'local'
@@ -232,9 +239,109 @@ function localTokenDisplay(localUsage: AccountLocalUsage | null) {
   return formatInteger(total)
 }
 
-export function quotaWindowLocalUsageDisplay(window: AccountQuotaWindow) {
+export function quotaWindowDetails(window: AccountQuotaWindow) {
   const localUsage = accountLocalUsage(window.localUsage)
-  return localTokenDisplay(localUsage) || null
+  const tokenDisplay = localTokenDisplay(localUsage) || null
+  const amountDisplay = window.amount?.usedDisplay ?? null
+  const hasConsumption = Boolean(tokenDisplay || amountDisplay)
+    || (!window.amount && localUsage?.totalTokens == null)
+  return {
+    stale: window.stale,
+    observationDisplay: [
+      window.stale
+        ? t('accounts.upstream.stale')
+        : null,
+      window.observedAtDisplay && window.observedAtDisplay !== '—'
+        ? t('accounts.upstream.observedAt', { time: window.observedAtDisplay })
+        : null,
+    ].filter(Boolean).join(' · '),
+    localUsageDisplay: tokenDisplay,
+    amountUsedDisplay: amountDisplay,
+    quotaValueDisplay: window.amount && window.usedPercent === null
+      ? window.amount.totalDisplay
+      : window.usedPercentDisplay,
+    consumptionDisplay: hasConsumption
+      ? [
+          amountDisplay,
+          tokenDisplay || (!window.amount && localUsage?.totalTokens == null
+            ? '—'
+            : null),
+        ].filter(Boolean).join(' · ')
+      : null,
+    resetAtDisplay: window.amount && window.resetAtDisplay === '—'
+      ? t('accounts.upstream.startsOnNextUse')
+      : window.resetAtDisplay,
+  }
+}
+
+const quotaWindowPeriods = [
+  {
+    seconds: 18_000,
+    label: () => t('accounts.quota.windows.fiveHour'),
+  },
+  {
+    seconds: 86_400,
+    label: () => t('accounts.quota.windows.daily'),
+  },
+  {
+    seconds: 604_800,
+    label: () => t('accounts.quota.windows.weekly'),
+  },
+  {
+    seconds: 2_592_000,
+    label: () => t('accounts.quota.windows.monthly'),
+  },
+  {
+    seconds: 31_536_000,
+    label: () => t('accounts.quota.windows.annual'),
+  },
+]
+
+export function quotaWindowLabel(window: AccountQuotaWindow, includeLimitName = true) {
+  const seconds = window.windowSeconds
+  // 沿用 Codex 官方的显示时长容差；仅决定文案，不改变后端窗口归属或额度判定。
+  const period = seconds === null
+    ? undefined
+    : quotaWindowPeriods.find(period =>
+        seconds >= period.seconds * 0.95 && seconds <= period.seconds * 1.05,
+      )
+  let label: string
+  if (period) {
+    label = period.label()
+  }
+  else if (seconds !== null && seconds > 0) {
+    if (seconds % 86_400 === 0) {
+      label = t('accounts.quota.windows.days', {
+        duration: formatInteger(seconds / 86_400),
+      })
+    }
+    else if (seconds % 3_600 === 0) {
+      label = t('accounts.quota.windows.hours', {
+        duration: formatInteger(seconds / 3_600),
+      })
+    }
+    else {
+      label = t('accounts.quota.windows.minutes', {
+        duration: formatInteger(Math.ceil(seconds / 60)),
+      })
+    }
+  }
+  else if (window.role === 'monthly') {
+    label = t('accounts.quota.windows.monthly')
+  }
+  else if (window.role === 'primary') {
+    label = t('accounts.quota.windows.primary')
+  }
+  else if (window.role === 'secondary') {
+    label = t('accounts.quota.windows.secondary')
+  }
+  else {
+    label = window.windowLabelDisplay
+  }
+
+  return includeLimitName && window.limitName && window.limitId !== 'codex'
+    ? `${window.limitName} · ${label}`
+    : label
 }
 
 function requestCountDisplay(localUsage: AccountLocalUsage | null) {
@@ -242,7 +349,9 @@ function requestCountDisplay(localUsage: AccountLocalUsage | null) {
   if (typeof display === 'string' && display.trim())
     return display.trim()
   const count = localUsage?.requestCount
-  return typeof count === 'number' ? formatInteger(count) : '0'
+  return typeof count === 'number'
+    ? formatInteger(count)
+    : '0'
 }
 
 function rollingWindowDurationDisplay(windowSeconds: number | null | undefined) {
@@ -251,34 +360,48 @@ function rollingWindowDurationDisplay(windowSeconds: number | null | undefined) 
 
   const hourSeconds = 60 * 60
   const daySeconds = 24 * hourSeconds
-  if (windowSeconds <= daySeconds * 2 && windowSeconds % hourSeconds === 0)
-    return `${formatInteger(windowSeconds / hourSeconds)} 小时`
-  if (windowSeconds % daySeconds === 0)
-    return `${formatInteger(windowSeconds / daySeconds)} 天`
-  if (windowSeconds % hourSeconds === 0)
-    return `${formatInteger(windowSeconds / hourSeconds)} 小时`
-  return `${formatInteger(windowSeconds)} 秒`
+  if (windowSeconds <= daySeconds * 2 && windowSeconds % hourSeconds === 0) {
+    return t('accounts.quota.h', {
+      duration: formatInteger(windowSeconds / hourSeconds),
+    })
+  }
+  if (windowSeconds % daySeconds === 0) {
+    return t('accounts.quota.d', {
+      duration: formatInteger(windowSeconds / daySeconds),
+    })
+  }
+  if (windowSeconds % hourSeconds === 0) {
+    return t('accounts.quota.h', {
+      duration: formatInteger(windowSeconds / hourSeconds),
+    })
+  }
+  return t('accounts.quota.s', {
+    duration: formatInteger(windowSeconds),
+  })
 }
 
 export function quotaWindowPresentation(window: AccountQuotaWindow, minimumWidth: string) {
   const percent = clamp(window.usedPercent ?? 0, 0, 100)
-  const tone = quotaWindowTone(window.usedPercent)
+  const tone = quotaWindowTone(window.stale ? null : window.usedPercent)
   return {
     barStyle: {
       width: `${percent}%`,
-      minWidth: percent > 0 ? minimumWidth : '0',
+      minWidth: percent > 0
+        ? minimumWidth
+        : '0',
     },
     barClass: quotaToneClasses[tone].bar,
     percentTextClass: quotaToneClasses[tone].text,
   }
 }
 
-function quotaWindowTone(usedPercent: number | null): QuotaWindowTone {
+export function quotaWindowTone(usedPercent: number | null): QuotaWindowTone {
   if (usedPercent === null)
     return 'unknown'
-  if (usedPercent >= 95)
+  // 每个窗口按自身的已用比例分档，剩余不足 30% / 10% 时分别预警
+  if (usedPercent > 90)
     return 'danger'
-  if (usedPercent >= 80)
+  if (usedPercent > 70)
     return 'warning'
   return 'success'
 }
@@ -288,7 +411,9 @@ function requestTimeline(buckets: NonNullable<AccountLocalUsage['requestBuckets'
   return buckets.map(bucket => ({
     key: bucket.bucketStart,
     requestCount: bucket.requestCount,
-    height: bucket.requestCount === 0 ? '0' : `${Math.max(25, Math.round(bucket.requestCount / maximum * 100))}%`,
+    height: bucket.requestCount === 0
+      ? '0'
+      : `${Math.max(25, Math.round(bucket.requestCount / maximum * 100))}%`,
     title: bucket.label,
   }))
 }

@@ -1,12 +1,12 @@
 import type { Ref } from 'vue'
 import type { Account, AccountModelAccess } from '@/api'
-
-import { ZNotification } from '@codex-proxy/ui'
 import { ref, shallowRef, watch } from 'vue'
+
 import { batchUpdateAccounts } from '@/api'
 import { useAsyncAction } from '@/composables/useAsyncAction'
-import { accountModelAccessError } from '../utils/modelAccess'
-import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
+import { t } from '@/i18n'
+import { notification as ZNotification } from '@/utils/notification'
+import { accountSchedulingValues, concurrencyLimitInput } from '../utils/schedulingForm'
 
 export function useAccountBatchEditor(options: {
   accounts: Ref<Account[]>
@@ -17,7 +17,7 @@ export function useAccountBatchEditor(options: {
   const selectedAccountsById = new Map<string, Account>()
   const showBatchEditModal = shallowRef(false)
   const editingCount = shallowRef(0)
-  const schedulingEnabled = shallowRef(false)
+  const schedulingEnabled = shallowRef<boolean>()
   const concurrencyLimit = shallowRef('')
   const weight = shallowRef('1')
   const modelAccess = ref<AccountModelAccess | undefined>()
@@ -29,7 +29,7 @@ export function useAccountBatchEditor(options: {
   const saveAction = useAsyncAction()
   const saving = saveAction.loading
 
-  // 调度按开关值统一更新，其他未操作字段保留每个账号原值
+  // 未操作的批量字段保留每个账号原值
   watch([concurrencyLimit, weight, selectedGroupIds], (values, previous) => {
     if (!showBatchEditModal.value || saving.value)
       return
@@ -49,7 +49,7 @@ export function useAccountBatchEditor(options: {
     modelAccess.value = undefined
     editedFields.value.clear()
     catalogAccountId.value = accounts[0]?.id
-    schedulingEnabled.value = false
+    schedulingEnabled.value = undefined
     proxyMode.value = 'preserve'
     proxyId.value = ''
     concurrencyLimit.value = sharedConcurrencyLimit(accounts)
@@ -61,44 +61,59 @@ export function useAccountBatchEditor(options: {
   async function save() {
     if (saving.value || options.selectedIds.value.size === 0)
       return
-    const modelError = accountModelAccessError(modelAccess.value)
-    if (modelError) {
-      ZNotification.warning({ message: modelError })
+    if (schedulingEnabled.value === undefined && modelAccess.value === undefined
+      && editedFields.value.size === 0 && proxyMode.value === 'preserve') {
+      showBatchEditModal.value = false
       return
     }
-    const scheduling = parseAccountSchedulingForm(editedFields.value.has('concurrencyLimit') ? concurrencyLimit.value : '', editedFields.value.has('weight') ? weight.value : '1')
-    if (proxyMode.value === 'proxy' && !proxyId.value.trim()) {
-      ZNotification.warning({ message: '请选择已通过测试的代理' })
-      return
-    }
-    if (!scheduling.valid) {
-      ZNotification.warning({ message: scheduling.message })
-      return
-    }
+    const scheduling = accountSchedulingValues(editedFields.value.has('concurrencyLimit')
+      ? concurrencyLimit.value
+      : '', editedFields.value.has('weight')
+      ? weight.value
+      : '1')
 
     await saveAction.run(async () => {
       const accountIds = selectedAccounts().map(account => account.id)
       await batchUpdateAccounts({
         accountIds,
         modelAccess: modelAccess.value,
-        outboundProxyId: proxyMode.value === 'preserve' ? undefined : proxyMode.value === 'direct' ? '' : proxyId.value.trim(),
+        outboundProxyId: proxyMode.value === 'preserve'
+          ? undefined
+          : proxyMode.value === 'direct'
+            ? ''
+            : proxyId.value.trim(),
         enabled: schedulingEnabled.value,
-        concurrencyLimit: editedFields.value.has('concurrencyLimit') ? scheduling.values.concurrencyLimit : undefined,
-        weight: editedFields.value.has('weight') ? scheduling.values.weight : undefined,
-        groupIds: editedFields.value.has('groupIds') ? [...new Set(selectedGroupIds.value)] : undefined,
+        concurrencyLimit: editedFields.value.has('concurrencyLimit')
+          ? scheduling.concurrencyLimit
+          : undefined,
+        weight: editedFields.value.has('weight')
+          ? scheduling.weight
+          : undefined,
+        groupIds: editedFields.value.has('groupIds')
+          ? [
+              ...new Set(selectedGroupIds.value),
+            ]
+          : undefined,
       })
       showBatchEditModal.value = false
       options.selectedIds.value = new Set()
-      ZNotification.success({ message: `已更新 ${accountIds.length} 个账号` })
-      void Promise.allSettled([options.reloadAccounts(), options.reloadGroups()])
-    }, { onError: () => void options.reloadAccounts() })
+      ZNotification.success({
+        message: t('accounts.batchEdit.saved', { count: accountIds.length }),
+      })
+      void Promise.allSettled([
+        options.reloadAccounts(),
+        options.reloadGroups(),
+      ])
+    }, {
+      onError: () => void options.reloadAccounts(),
+    })
   }
 
   function selectedAccounts() {
     return [...options.selectedIds.value].map((accountId) => {
       const account = selectedAccountsById.get(accountId)
       if (!account)
-        throw new Error(`账号 ${accountId} 的页面数据已失效，请重新选择`)
+        throw new Error(t('accounts.batchEdit.staleAccount', { accountId }))
       return account
     })
   }
@@ -125,6 +140,7 @@ export function useAccountBatchEditor(options: {
     concurrencyLimit,
     weight,
     modelAccess,
+    editedFields,
     catalogAccountId,
     proxyMode,
     proxyId,
@@ -144,7 +160,9 @@ function sharedConcurrencyLimit(accounts: Account[]) {
 
 function sharedWeight(accounts: Account[]) {
   const first = accounts[0]?.weight ?? 1
-  return accounts.every(account => account.weight === first) ? String(first) : '1'
+  return accounts.every(account => account.weight === first)
+    ? String(first)
+    : '1'
 }
 
 function sharedGroupIds(accounts: Account[]) {

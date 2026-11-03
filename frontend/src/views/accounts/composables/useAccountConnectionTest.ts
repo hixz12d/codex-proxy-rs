@@ -7,7 +7,6 @@ import type {
   AccountConnectionTestRequestPayload,
   AccountModelsResponse,
 } from '@/api'
-import { ZNotification } from '@codex-proxy/ui'
 
 import { CheckCircle2, Clock3, Wifi, XCircle } from '@lucide/vue'
 import { clamp } from 'es-toolkit'
@@ -16,6 +15,7 @@ import { getAccountModels, refreshAccountModels, streamAccountConnectionTests } 
 import { ApiError } from '@/api/request'
 import { useIdSet } from '@/composables/useIdSet'
 import { useRequestState } from '@/composables/useRequestState'
+import { notification as ZNotification } from '@/utils/notification'
 import { errorMessage, withMinimumDuration } from '@/utils/operation'
 
 interface ConnectionTestRun {
@@ -137,8 +137,8 @@ export function useAccountConnectionTest(options: { reload: () => Promise<unknow
         label: '正在测试',
         description: '正在向所选模型发送请求并接收流式响应',
         icon: Clock3,
-        badge: 'bg-cp-info-container text-cp-info-on-container',
-        iconClass: 'text-cp-info',
+        badge: 'bg-z-info-container text-z-info-on-container',
+        iconClass: 'text-z-info',
       }
     }
     if (connectionTestStatus.value === 'success') {
@@ -146,8 +146,8 @@ export function useAccountConnectionTest(options: { reload: () => Promise<unknow
         label: '连接正常',
         description: '请求已完成，可在下方查看模型、耗时和事件轨迹',
         icon: CheckCircle2,
-        badge: 'bg-cp-success-container text-cp-success-on-container',
-        iconClass: 'text-cp-success',
+        badge: 'bg-z-success-container text-z-success-on-container',
+        iconClass: 'text-z-success',
       }
     }
     if (connectionTestStatus.value === 'error') {
@@ -155,16 +155,16 @@ export function useAccountConnectionTest(options: { reload: () => Promise<unknow
         label: '测试失败',
         description: '请求未完成，请在下方查看失败来源与原始诊断',
         icon: XCircle,
-        badge: 'bg-cp-error-container text-cp-error-on-container',
-        iconClass: 'text-cp-error',
+        badge: 'bg-z-error-container text-z-error-on-container',
+        iconClass: 'text-z-error',
       }
     }
     return {
       label: '准备测试',
       description: '选择模型后，点击“开始测试”发送真实请求',
       icon: Wifi,
-      badge: 'bg-cp-fill-quaternary text-cp-text-secondary',
-      iconClass: 'text-cp-text-quaternary',
+      badge: 'bg-z-fill-quaternary text-z-text-secondary',
+      iconClass: 'text-z-text-quaternary',
     }
   })
 

@@ -1,21 +1,26 @@
 <script setup lang="ts">
 import { ZIconButton } from '@codex-proxy/ui'
+
 import { LocateFixed } from '@lucide/vue'
+import { useI18n } from 'vue-i18n'
 
 defineProps<{ loading: boolean, disabled?: boolean }>()
+
 const emit = defineEmits<{ detect: [] }>()
+
+const { t } = useI18n({ useScope: 'global' })
 </script>
 
 <template>
   <ZIconButton
     size="default"
-    :aria-label="loading ? '正在解析出口位置' : '解析出口位置并填入表单'"
-    :title="loading ? '正在解析出口位置' : '解析出口位置并填入表单'"
+    :aria-label="loading ? t('common.location.resolving') : t('common.location.detect')"
+    :title="loading ? t('common.location.resolving') : t('common.location.detect')"
     :aria-busy="loading"
     :disabled="disabled || loading"
     @click="emit('detect')"
   >
-    <span class="relative grid size-7 place-items-center text-cp-link">
+    <span class="relative grid size-7 place-items-center text-z-link">
       <span v-if="loading" class="location-ripple" aria-hidden="true" />
       <span v-if="loading" class="location-ripple location-ripple-delayed" aria-hidden="true" />
       <LocateFixed class="relative z-10 size-4" aria-hidden="true" />

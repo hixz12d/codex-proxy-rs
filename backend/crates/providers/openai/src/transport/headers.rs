@@ -11,10 +11,8 @@ use super::client::{
     CodexBackendClient, CodexClientResult, CodexRequestContext, OpenAiUpstreamProtocol,
     openai_subagent_from_metadata,
 };
-use super::profile::{CodexResidency, CodexWireProfile};
+use super::profile::CodexWireProfile;
 use super::protocol::responses::CodexResponsesRequest;
-
-const CODEX_RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
 
 /// 不透传下游携带的认证、账号及相关身份字段，避免影响网关选定的上游身份
 /// 上游需要的官方身份头由网关构造；这里也包含通用认证和 Cookie 字段
@@ -30,16 +28,15 @@ pub(super) fn is_managed_identity_header(name: &str) -> bool {
             | "chatgpt-project-id"
             | "openai-organization"
             | "openai-project"
-            // 工作区路由和合规属性属于认证账号，不能继承下游账号的值
-            | "x-openai-account-routing-override"
-            | "x-openai-fedramp"
-            // 安装身份由当前账号写入 client_metadata，不继承下游安装头
+            // 安装头与 client_metadata 共用当前账号的安装身份
             | "x-codex-installation-id"
             // 画像和设备证明须属于选定账号，不能由下游覆盖
             | "originator"
             | "user-agent"
             | "version"
+            // 地域和账号路由统一按部署配置生成
             | "x-openai-internal-codex-residency"
+            | "x-openai-account-routing-override"
             | "x-oai-attestation"
             | "x-oai-is"
             | "x-oai-is-update"
@@ -70,12 +67,16 @@ pub fn build_codex_profile_headers(profile: &CodexWireProfile) -> CodexClientRes
         HeaderValue::from_str(&profile.originator)?,
     );
     headers.insert(USER_AGENT, HeaderValue::from_str(&profile.user_agent())?);
-    if let Some(CodexResidency::Us) = profile.residency {
-        headers.insert(
-            HeaderName::from_static(CODEX_RESIDENCY_HEADER),
-            HeaderValue::from_static("us"),
-        );
-    }
+    insert_optional_header(
+        &mut headers,
+        "x-openai-internal-codex-residency",
+        profile.residency.as_deref(),
+    )?;
+    insert_optional_header(
+        &mut headers,
+        "x-openai-account-routing-override",
+        profile.account_routing_override.as_deref(),
+    )?;
     Ok(headers)
 }
 
@@ -125,6 +126,11 @@ impl CodexBackendClient {
         };
         let mut headers = build_codex_model_headers(profile, context.authorization, account_id)?;
         insert_optional_header(&mut headers, "cookie", cookie_header)?;
+        insert_optional_header(
+            &mut headers,
+            "x-codex-installation-id",
+            context.installation_id,
+        )?;
         Ok(headers)
     }
 

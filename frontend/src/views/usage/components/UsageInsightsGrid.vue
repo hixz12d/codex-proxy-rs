@@ -1,58 +1,53 @@
 <script setup lang="ts">
-import type {
-  getUsageRecordInsightsDiagnostics,
-  getUsageRecordInsightsOverview,
-} from '@/api'
-
+import type { UsageQueryState } from '../composables/useUsageInsights'
+import type { UsageCostMetric, UsageDiagnosticsResponse, UsageMetricResponse, UsagePerformanceMetric } from '@/api'
+import { useI18n } from 'vue-i18n'
 import UsageCostCard from './UsageCostCard.vue'
 import UsageDiagnosticCard from './UsageDiagnosticCard.vue'
 import UsageHealthCard from './UsageHealthCard.vue'
 import UsagePerformanceCard from './UsagePerformanceCard.vue'
 
-withDefaults(
-  defineProps<{
-    overview: Omit<Awaited<ReturnType<typeof getUsageRecordInsightsOverview>>, 'analytics'>
-    diagnostics: Omit<Awaited<ReturnType<typeof getUsageRecordInsightsDiagnostics>>, 'analytics'>
-    loading?: boolean
-  }>(),
-  {
-    loading: false,
-  },
-)
+defineProps<{
+  health: UsageQueryState<UsageMetricResponse<'health'>>
+  diagnostics: UsageQueryState<UsageDiagnosticsResponse>
+  performance: UsageQueryState<UsageMetricResponse<UsagePerformanceMetric>>
+  cost: UsageQueryState<UsageMetricResponse<UsageCostMetric>>
+}>()
 
-const diagnosticDimension = defineModel('diagnosticDimension', {
-  type: String,
-  default: 'model',
-})
+const { t } = useI18n({ useScope: 'global' })
+const diagnosticDimension = defineModel<string>('diagnosticDimension', { required: true })
+const performanceMetric = defineModel<UsagePerformanceMetric>('performanceMetric', { required: true })
+const costMetric = defineModel<UsageCostMetric>('costMetric', { required: true })
 </script>
 
 <template>
   <section
-    class="mt-5 grid grid-cols-1 gap-3 xl:auto-rows-97 xl:grid-cols-2"
-    aria-label="使用统计观测"
+    class="mt-5 grid grid-cols-1 gap-3 xl:auto-rows-[minmax(24.25rem,auto)] xl:grid-cols-2"
+    :aria-label="t('usage.insights.useStatisticalObservations')"
   >
     <UsageHealthCard
-      :health="overview.health"
-      :granularity="overview.granularity"
-      :loading="loading"
+      :health="health.data?.data ?? null"
+      :granularity="health.data?.granularity ?? ''"
+      :loading="health.loading"
+      :error="health.error"
     />
-
     <UsageDiagnosticCard
       v-model:dimension="diagnosticDimension"
-      :diagnostics="diagnostics"
-      :loading="loading"
+      :diagnostics="diagnostics.data"
+      :loading="diagnostics.loading"
+      :error="diagnostics.error"
     />
-
     <UsagePerformanceCard
-      :performance="overview.performance"
-      :activity="overview.health.points"
-      :loading="loading"
+      v-model="performanceMetric"
+      :performance="performance.data"
+      :loading="performance.loading"
+      :error="performance.error"
     />
-
     <UsageCostCard
-      :cost="overview.cost"
-      :activity="overview.health.points"
-      :loading="loading"
+      v-model="costMetric"
+      :result="cost.data"
+      :loading="cost.loading"
+      :error="cost.error"
     />
   </section>
 </template>

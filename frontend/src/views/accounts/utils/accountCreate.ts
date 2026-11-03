@@ -1,7 +1,7 @@
 import type { ApiKeyAccountForm } from './upstreamApiKey'
 import type { AccountModelAccess } from '@/api'
-import { accountModelAccessError } from './modelAccess'
-import { parseAccountSchedulingForm } from './schedulingForm'
+import { t } from '@/i18n'
+import { accountSchedulingValues } from './schedulingForm'
 import { emptyApiKeyAccountForm } from './upstreamApiKey'
 
 export type AccountCreateSource = { kind: 'bundle' } | { kind: 'provider', id: string }
@@ -9,6 +9,7 @@ export type AccountImportMode = 'oauth' | 'api_key' | 'access_token' | 'refresh_
 type AccountImportInputMode = 'access_token' | 'refresh_token' | 'json'
 
 export interface AccountCreateForm {
+  name: string
   source: AccountCreateSource | null
   apiKey: ApiKeyAccountForm
   notes: string
@@ -26,6 +27,7 @@ export interface AccountCreateForm {
 
 export function emptyAccountCreateForm(): AccountCreateForm {
   return {
+    name: '',
     source: null,
     apiKey: emptyApiKeyAccountForm(),
     notes: '',
@@ -42,33 +44,34 @@ export function emptyAccountCreateForm(): AccountCreateForm {
 }
 
 export function accountCreateProvider(form: AccountCreateForm) {
-  return form.source?.kind === 'provider' ? form.source.id : undefined
+  return form.source?.kind === 'provider'
+    ? form.source.id
+    : undefined
 }
 
 export function accountCreateSourceKey(form: AccountCreateForm) {
-  return form.source?.kind === 'provider' ? `provider:${form.source.id}` : form.source?.kind ?? ''
-}
-
-export function accountProxyError(form: AccountCreateForm): string | undefined {
-  if (form.proxyMode !== 'proxy')
-    return undefined
-  if (!form.proxyId.trim())
-    return '请选择已通过测试的代理'
-  return undefined
+  return form.source?.kind === 'provider'
+    ? `provider:${form.source.id}`
+    : form.source?.kind ?? ''
 }
 
 export function accountImportSettings(form: AccountCreateForm) {
-  const scheduling = parseAccountSchedulingForm(form.concurrencyLimit, form.weight)
-  if (!scheduling.valid)
-    throw new Error(scheduling.message)
-  const modelError = accountModelAccessError(form.modelAccess)
-  if (modelError)
-    throw new Error(modelError)
+  const scheduling = accountSchedulingValues(form.concurrencyLimit, form.weight)
   return {
-    modelAccess: form.modelAccess ? { ...form.modelAccess, models: [...form.modelAccess.models] } : undefined,
+    name: form.source?.kind === 'provider'
+      ? form.name.trim() || undefined
+      : undefined,
+    modelAccess: form.modelAccess
+      ? {
+          ...form.modelAccess,
+          models: [...form.modelAccess.models],
+        }
+      : undefined,
     enabled: form.enabled,
-    ...scheduling.values,
-    groupIds: [...new Set(form.groupIds)],
+    ...scheduling,
+    groupIds: [
+      ...new Set(form.groupIds),
+    ],
     notes: form.notes.trim() || undefined,
   }
 }
@@ -77,13 +80,26 @@ export function accountImportModes(provider: string | undefined) {
   if (provider === 'openai') {
     return [
       { label: 'OAuth', value: 'oauth' as const },
-      { label: 'API Key', value: 'api_key' as const },
+      {
+        label: t('common.fields.apiKey'),
+        value: 'api_key' as const,
+      },
       { label: 'AT', value: 'access_token' as const },
       { label: 'RT', value: 'refresh_token' as const },
-      { label: '账号文件', value: 'json' as const },
+      {
+        label: t('accounts.onboarding.accountFile'),
+        value: 'json' as const,
+      },
     ]
   }
-  if (provider === 'xai')
-    return [{ label: 'OAuth', value: 'oauth' as const }, { label: '账号文件', value: 'json' as const }]
+  if (provider === 'xai') {
+    return [
+      { label: 'OAuth', value: 'oauth' as const },
+      {
+        label: t('accounts.onboarding.accountFile'),
+        value: 'json' as const,
+      },
+    ]
+  }
   return []
 }

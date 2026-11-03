@@ -41,7 +41,7 @@ impl AnalyticsValue for DashboardObservation {
         &mut self.analytics
     }
 }
-impl AnalyticsValue for UsageOverview {
+impl AnalyticsValue for UsageSummaryObservation {
     fn metadata(&mut self) -> &mut AnalyticsMetadata {
         &mut self.analytics
     }
@@ -177,8 +177,9 @@ type UsageKey = (TimeRange, UsageFilter);
 pub(crate) struct CachedObservabilityStore {
     inner: Arc<dyn ObservabilityStore>,
     dashboard: Cache<DashboardQuery, DashboardObservation>,
-    summaries: Cache<UsageKey, UsageOverview>,
-    insights: Cache<(UsageKey, Granularity), UsageInsightsObservation>,
+    summaries: Cache<UsageKey, UsageSummaryObservation>,
+    insights: Cache<(UsageKey, Granularity, bool), UsageInsightsObservation>,
+    metrics: Cache<(UsageKey, Granularity, UsageInsightMetric), UsageInsightsObservation>,
     diagnostics: Cache<(UsageKey, DiagnosticDimension, u16), DiagnosticsObservation>,
 }
 impl CachedObservabilityStore {
@@ -188,6 +189,7 @@ impl CachedObservabilityStore {
             dashboard: Cache::default(),
             summaries: Cache::default(),
             insights: Cache::default(),
+            metrics: Cache::default(),
             diagnostics: Cache::default(),
         }
     }
@@ -237,24 +239,49 @@ impl ObservabilityStore for CachedObservabilityStore {
         range: TimeRange,
         filter: UsageFilter,
         granularity: Granularity,
+        include_concurrency: bool,
     ) -> AdminStoreResult<UsageInsightsObservation> {
         self.insights
             .get(
-                ((range, filter.clone()), granularity),
+                ((range, filter.clone()), granularity, include_concurrency),
                 self.inner.as_ref(),
                 TTL,
                 || {
-                    self.inner
-                        .usage_insights_observation(range, filter, granularity)
+                    self.inner.usage_insights_observation(
+                        range,
+                        filter,
+                        granularity,
+                        include_concurrency,
+                    )
                 },
             )
             .await
     }
+    async fn usage_metric_observation(
+        &self,
+        range: TimeRange,
+        filter: UsageFilter,
+        granularity: Granularity,
+        metric: UsageInsightMetric,
+    ) -> AdminStoreResult<UsageInsightsObservation> {
+        self.metrics
+            .get(
+                ((range, filter.clone()), granularity, metric),
+                self.inner.as_ref(),
+                TTL,
+                || {
+                    self.inner
+                        .usage_metric_observation(range, filter, granularity, metric)
+                },
+            )
+            .await
+    }
+
     async fn usage_summary(
         &self,
         range: TimeRange,
         filter: UsageFilter,
-    ) -> AdminStoreResult<UsageOverview> {
+    ) -> AdminStoreResult<UsageSummaryObservation> {
         self.summaries
             .get((range, filter.clone()), self.inner.as_ref(), TTL, || {
                 self.inner.usage_summary(range, filter)

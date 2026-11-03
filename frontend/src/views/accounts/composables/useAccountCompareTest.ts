@@ -1,11 +1,11 @@
 import type { Ref } from 'vue'
 import type { Account, AccountConnectionTestEvent } from '@/api'
 
-import { ZNotification } from '@codex-proxy/ui'
 import { useIntervalFn, useStorage } from '@vueuse/core'
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { getAccountModels, streamAccountConnectionTests } from '@/api'
 import { ApiError } from '@/api/request'
+import { notification as ZNotification } from '@/utils/notification'
 import { errorMessage } from '@/utils/operation'
 import {
   CONNECTION_TEST_INPUT_MAX_LENGTH,

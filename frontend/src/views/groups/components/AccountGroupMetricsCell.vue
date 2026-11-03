@@ -1,10 +1,19 @@
 <script setup lang="ts">
 import type { Component } from 'vue'
+
 import type { AccountGroup } from '@/api'
 import { AlertTriangle, CircleCheck, Grid2X2, Users } from '@lucide/vue'
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { formatUsd } from '@/utils/format'
+
+const props = defineProps<{
+  group: AccountGroup
+  kind: MetricKind
+}>()
+
+const { t } = useI18n({ useScope: 'global' })
 
 type MetricKind = 'accounts' | 'capacity' | 'usage'
 type MetricTone = 'primary' | 'secondary' | 'success' | 'warning' | 'active'
@@ -16,36 +25,31 @@ interface MetricItem {
   icon?: Component
 }
 
-const props = defineProps<{
-  group: AccountGroup
-  kind: MetricKind
-}>()
-
 const toneClasses: Record<MetricTone, string> = {
-  primary: 'text-cp-text',
-  secondary: 'text-cp-text-secondary',
-  success: 'text-cp-success-text',
-  warning: 'text-cp-warning',
-  active: 'text-cp-success',
+  primary: 'text-z-text',
+  secondary: 'text-z-text-secondary',
+  success: 'text-z-success-text',
+  warning: 'text-z-warning',
+  active: 'text-z-success',
 }
 
 const metrics = computed<MetricItem[]>(() => {
   if (props.kind === 'accounts') {
     return [
       {
-        label: '可用',
+        label: t('common.status.available'),
         value: props.group.accountSummary.available,
         tone: 'success',
         icon: CircleCheck,
       },
       {
-        label: '受限',
+        label: t('groups.metrics.restricted'),
         value: props.group.accountSummary.limited,
         tone: 'warning',
         icon: AlertTriangle,
       },
       {
-        label: '总数',
+        label: t('groups.metrics.total'),
         value: props.group.accountSummary.total,
         tone: 'primary',
         icon: Users,
@@ -56,18 +60,24 @@ const metrics = computed<MetricItem[]>(() => {
   if (props.kind === 'capacity') {
     return [
       {
-        label: '并发',
+        label: t('groups.metrics.concurrency'),
         value: `${props.group.capacity.usedSlots ?? '—'} / ${props.group.capacity.totalSlots ?? '∞'}`,
-        tone: (props.group.capacity.usedSlots ?? 0) > 0 ? 'active' : 'primary',
+        tone: (props.group.capacity.usedSlots ?? 0) > 0
+          ? 'active'
+          : 'primary',
         icon: Grid2X2,
       },
     ]
   }
 
   return [
-    { label: '今日', value: formatUsd(props.group.usage.todayUsd), tone: 'primary' },
     {
-      label: '累计',
+      label: t('groups.metrics.today'),
+      value: formatUsd(props.group.usage.todayUsd),
+      tone: 'primary',
+    },
+    {
+      label: t('groups.metrics.cumulative'),
       value: formatUsd(props.group.usage.retainedTotalUsd),
       tone: 'secondary',
     },
@@ -78,7 +88,7 @@ const metrics = computed<MetricItem[]>(() => {
 <template>
   <dl v-if="kind === 'usage'" class="m-0 grid grid-cols-[auto_auto] justify-start gap-x-2 gap-y-0.5 text-xs leading-4">
     <template v-for="metric in metrics" :key="metric.label">
-      <dt class="text-cp-text-quaternary">
+      <dt class="text-z-text-quaternary">
         {{ metric.label }}
       </dt>
       <dd class="m-0 font-mono font-semibold tabular-nums" :class="toneClasses[metric.tone]">

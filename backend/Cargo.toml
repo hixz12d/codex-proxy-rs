@@ -49,6 +49,10 @@ opt-level = 2
 [profile.dev.package."miniz_oxide@0.9.1"]
 opt-level = 2
 
+# workspace 的 WebSocket deflate 特性会让 flate2 选用 zlib-rs
+[profile.dev.package.zlib-rs]
+opt-level = 2
+
 [profile.release]
 debug = false
 strip = "symbols"
@@ -57,7 +61,5 @@ codegen-units = 1
 panic = "abort"
 
 [patch.crates-io]
-# Upstream SOCKS IPv6 fix; remove once a release includes hyperium/hyper-util#302.
-hyper-util = { git = "https://github.com/hyperium/hyper-util", rev = "191b1acf0a6b18e807e4abf5a6d4a7c47979ecd6" }
 # 固定上游 BEGIN 取消回滚修复，避免未结束事务复用；见 transact-rs/sqlx#4394
 sqlx = { git = "https://github.com/transact-rs/sqlx", rev = "f1e94ec34dd5f11ad6488a3a8ac7988439a3f757" }

@@ -1,6 +1,7 @@
 //! 验证运行时快照发布、版本对账与并发更新行为
 
 use std::collections::BTreeMap;
+mod protection;
 mod publications;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -323,6 +324,39 @@ fn publisher_should_suspend_but_still_notify_after_committed_refresh_failure() {
             .as_slice(),
         &[revision(2)],
     );
+}
+
+#[test]
+fn committed_refresh_reloads_raced_facts_without_losing_revoked_scope() {
+    block_on(async {
+        let store = Arc::new(TestSnapshotStore::new(Ok(scoped_facts(10, true))));
+        let initial = compiler(store.clone())
+            .compile()
+            .await
+            .expect("initial scope");
+        let handle = RuntimeSnapshotHandle::new(initial);
+        let frozen = handle.acquire().expect("initial request");
+        assert!(removed_account_allowed(&frozen));
+        let publisher = RuntimeSnapshotPublisher::new(
+            Arc::new(compiler(store.clone())),
+            handle.clone(),
+            Arc::new(TestSnapshotSubscriptions::default()),
+        );
+        let (release, gate) = oneshot::channel();
+        *store.next_load.lock().expect("load gate lock") = Some(gate);
+        let mut committed = publisher.publish_committed(revision(11));
+        assert!(futures::poll!(committed.as_mut()).is_pending());
+        *store.facts.lock().expect("facts lock") = Ok(scoped_facts(11, false));
+        *store.current_revision.lock().expect("revision lock") = Ok(revision(11));
+        release.send(Ok(facts(10, 11))).expect("release raced read");
+
+        committed.await;
+
+        let current = handle.acquire().expect("latest snapshot remains available");
+        assert_eq!(current.revision(), revision(11));
+        assert!(!removed_account_allowed(&current));
+        assert!(removed_account_allowed(&frozen));
+    });
 }
 
 #[test]

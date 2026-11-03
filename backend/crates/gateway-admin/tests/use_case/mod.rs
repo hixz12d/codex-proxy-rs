@@ -10,11 +10,12 @@ mod credentials;
 mod freeze_recovery;
 mod import_tasks;
 mod observability;
-mod plugin_update;
+mod peer_link;
 mod plugins;
 mod proxies;
 mod settings;
 mod system;
+mod system_preflight;
 mod usage_data;
 
 use std::{
@@ -49,7 +50,7 @@ use gateway_admin::{
             DashboardDesktopRelease, DashboardObservation, DashboardQuery, DashboardWireAttribute,
             DashboardWireProfile, DashboardWireTarget, DesktopReleaseStatus, DiagnosticDimension,
             DiagnosticsObservation, Granularity, OpsErrorPage, OpsErrorQuery, RequestMetricPoint,
-            TimeRange, UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
+            TimeRange, UsageDetail, UsageFilter, UsagePage, UsageQuery, UsageSummaryObservation,
         },
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
@@ -99,6 +100,7 @@ pub(super) struct AdminHarness {
     proxy_probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
     account_runtime: Arc<dyn AccountRuntimeStore>,
     account_groups: Arc<dyn AccountGroupStore>,
+    snapshot: Arc<dyn SnapshotControl>,
     auth: Arc<dyn AuthStore>,
     client_keys: Arc<dyn ClientKeyStore>,
     observability: Arc<dyn ObservabilityStore>,
@@ -110,6 +112,7 @@ pub(super) struct AdminHarness {
     plugin_store: Arc<dyn gateway_admin::ports::plugins::PluginStore>,
     plugin_inspector: Arc<dyn gateway_admin::ports::plugins::PluginPackageInspector>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
+    upstream_info: Option<Arc<dyn gateway_admin::ports::peer::PeerUpstreamService>>,
     service_middleware: gateway_admin::public_service::PlanSource,
 }
 
@@ -125,6 +128,7 @@ impl AdminHarness {
             proxy_probe: Arc::new(proxies::TestProxies::default()),
             account_runtime: unavailable.clone(),
             account_groups: Arc::new(UnavailableAccountGroupStore),
+            snapshot: Arc::new(NoopSnapshot),
             auth: Arc::new(BootstrapAuthStore::default()),
             client_keys: unavailable.clone(),
             observability: unavailable.clone(),
@@ -139,6 +143,7 @@ impl AdminHarness {
             plugin_store: Arc::new(plugins::TestPluginPorts),
             plugin_inspector: Arc::new(plugins::TestPluginPorts),
             client_key_verifier: Arc::new(UnavailableClientKeyVerifier),
+            upstream_info: None,
             service_middleware: Arc::new(|| None),
         }
     }
@@ -158,6 +163,14 @@ impl AdminHarness {
         self
     }
 
+    pub(super) fn upstream_info(
+        mut self,
+        peer: Arc<dyn gateway_admin::ports::peer::PeerUpstreamService>,
+    ) -> Self {
+        self.upstream_info = Some(peer);
+        self
+    }
+
     pub(super) fn account_runtime(mut self, store: Arc<dyn AccountRuntimeStore>) -> Self {
         self.account_runtime = store;
         self
@@ -165,6 +178,11 @@ impl AdminHarness {
 
     pub(super) fn account_groups(mut self, store: Arc<dyn AccountGroupStore>) -> Self {
         self.account_groups = store;
+        self
+    }
+
+    pub(super) fn snapshot(mut self, snapshot: Arc<dyn SnapshotControl>) -> Self {
+        self.snapshot = snapshot;
         self
     }
 
@@ -279,6 +297,7 @@ impl AdminHarness {
                 Arc::new(plugins::TestPluginPorts),
             ),
             gateway_admin::AdminRuntimePorts {
+                upstream_info: self.upstream_info,
                 timezone: Default::default(),
                 service_middleware: self.service_middleware,
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),
@@ -291,7 +310,7 @@ impl AdminHarness {
                     self.providers,
                 )
                 .unwrap(),
-                snapshot: Arc::new(NoopSnapshot),
+                snapshot: self.snapshot,
                 account_probe: self.probe,
                 proxy_probe: self.proxy_probe,
                 client_distribution: Arc::new(NoopClientDistribution),
@@ -478,6 +497,13 @@ impl AccountGroupStore for UnavailableAccountGroupStore {
 
 #[async_trait]
 impl AccountStore for UnavailableStore {
+    async fn load_account_record(
+        &self,
+        _: &ProviderAccountId,
+    ) -> AdminStoreResult<Option<gateway_admin::model::accounts::AccountRecord>> {
+        Err(unavailable("account"))
+    }
+
     async fn account_exists(&self, _: &str) -> AdminStoreResult<bool> {
         Err(unavailable("account"))
     }
@@ -607,15 +633,6 @@ impl AccountStore for UnavailableStore {
         Err(unavailable("account enabled"))
     }
 
-    async fn lower_concurrency_limit(
-        &self,
-        _: &gateway_core::account::ProviderAccountId,
-        _: gateway_core::account::AccountConcurrencyLimit,
-        _: &MutationContext,
-    ) -> AdminStoreResult<Option<gateway_admin::model::accounts::AccountUpdateResult>> {
-        Ok(None)
-    }
-
     async fn recover_account(
         &self,
         _: &ProviderAccountId,
@@ -675,13 +692,6 @@ impl AccountRuntimeStore for UnavailableStore {
     async fn active_freezes(
         &self,
     ) -> AdminStoreResult<BTreeMap<String, gateway_admin::model::accounts::AccountFreeze>> {
-        Ok(BTreeMap::new())
-    }
-
-    async fn capacity_peaks(
-        &self,
-        _account_ids: &[String],
-    ) -> AdminStoreResult<BTreeMap<String, u32>> {
         Ok(BTreeMap::new())
     }
 
@@ -814,8 +824,25 @@ impl ObservabilityStore for UnavailableStore {
         _: TimeRange,
         _: UsageFilter,
         _: Granularity,
+        _include_concurrency: bool,
     ) -> AdminStoreResult<gateway_admin::model::observability::UsageInsightsObservation> {
         Err(unavailable("usage insights"))
+    }
+
+    async fn usage_metric_observation(
+        &self,
+        range: gateway_admin::model::observability::TimeRange,
+        filter: gateway_admin::model::observability::UsageFilter,
+        granularity: gateway_admin::model::observability::Granularity,
+        metric: gateway_admin::model::observability::UsageInsightMetric,
+    ) -> AdminStoreResult<gateway_admin::model::observability::UsageInsightsObservation> {
+        self.usage_insights_observation(
+            range,
+            filter,
+            granularity,
+            metric == gateway_admin::model::observability::UsageInsightMetric::Load,
+        )
+        .await
     }
 
     async fn list_usage_records(&self, _: UsageQuery) -> AdminStoreResult<UsagePage> {
@@ -826,7 +853,11 @@ impl ObservabilityStore for UnavailableStore {
         Err(unavailable("usage detail"))
     }
 
-    async fn usage_summary(&self, _: TimeRange, _: UsageFilter) -> AdminStoreResult<UsageOverview> {
+    async fn usage_summary(
+        &self,
+        _: TimeRange,
+        _: UsageFilter,
+    ) -> AdminStoreResult<UsageSummaryObservation> {
         Err(unavailable("usage summary"))
     }
 
@@ -897,6 +928,7 @@ impl SettingsStore for UnavailableStore {
 }
 
 struct UnavailableProvider {
+    peer_enabled: bool,
     kind: ProviderKind,
     dashboard_profile: Option<DashboardWireProfile>,
     calculated_billing: Option<gateway_admin::model::observability::CalculatedBillingBreakdown>,
@@ -919,6 +951,7 @@ impl UnavailableProvider {
     fn new(kind: &str) -> Self {
         Self {
             kind: ProviderKind::new(kind).expect("provider kind"),
+            peer_enabled: false,
             dashboard_profile: None,
             calculated_billing: None,
         }
@@ -931,6 +964,28 @@ pub(super) fn test_provider(kind: &str) -> Arc<dyn ProviderAdmin> {
 
 #[async_trait]
 impl ProviderAdmin for UnavailableProvider {
+    fn peer_authentication_kinds(&self) -> &[&str] {
+        if self.peer_enabled {
+            &["peer_test"]
+        } else {
+            &[]
+        }
+    }
+
+    fn peer_connection(
+        &self,
+        loaded: &gateway_core::account::LoadedCredential,
+    ) -> Result<Option<gateway_admin::ports::peer::PeerConnection>, ProviderAdminError> {
+        Ok(
+            (self.peer_enabled && loaded.account.authentication_kind() == "peer_test").then(|| {
+                gateway_admin::ports::peer::PeerConnection {
+                    base_url: format!("https://{}.invalid/v1", self.kind),
+                    bearer_token: secrecy::SecretString::from("test-peer-only"),
+                }
+            }),
+        )
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
     }
@@ -1020,6 +1075,7 @@ impl ProviderAdmin for UnavailableProvider {
 
 pub(super) fn dashboard_profile_provider() -> Arc<dyn ProviderAdmin> {
     Arc::new(UnavailableProvider {
+        peer_enabled: false,
         kind: ProviderKind::new("openai").expect("provider kind"),
         dashboard_profile: Some(DashboardWireProfile {
             provider: "openai".to_owned(),
@@ -1034,7 +1090,7 @@ pub(super) fn dashboard_profile_provider() -> Arc<dyn ProviderAdmin> {
             },
             user_agent: "gateway-admin-test".to_owned(),
             attributes: vec![DashboardWireAttribute {
-                label: "Core".to_owned(),
+                key: "core".to_owned(),
                 value: "test".to_owned(),
             }],
             verified_at: Some(chrono::Utc::now()),
@@ -1063,6 +1119,7 @@ pub(super) fn calculated_billing_provider() -> Arc<dyn ProviderAdmin> {
             .expect("test billing amount"),
     };
     Arc::new(UnavailableProvider {
+        peer_enabled: false,
         kind: ProviderKind::new("openai").expect("provider kind"),
         dashboard_profile: None,
         calculated_billing: Some(

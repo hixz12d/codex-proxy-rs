@@ -44,7 +44,6 @@ use serde_json::{Map, Number, Value};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::XaiWireProfileState;
 use crate::credential::{
     FailureClass, GrokAccountProfile, GrokCredentialAdmin, GrokCredentialCatalogError,
     GrokCredentialCatalogService, GrokCredentialQuotaService, GrokCredentialRefreshError,
@@ -53,10 +52,11 @@ use crate::credential::{
     GrokOAuthImportMetadata, GrokOAuthImportTokens, GrokOAuthSecret, GrokQuotaError,
     GrokQuotaPeriodKind, GrokQuotaSnapshot, OAuthError, PendingAuthorization,
     PreparedGrokCredentialRotation, PreparedGrokCredentialRotationGuard, RedirectUriAllowlist,
-    RotateManagedGrokCredential, SecretValue, VerifiedGrokAccount, VerifiedTokenSet,
+    RotateManagedGrokCredential, VerifiedGrokAccount, VerifiedTokenSet,
 };
 use crate::transport::profile::{GrokCliReleaseSnapshot, GrokCliReleaseStatus};
 use crate::transport::{GROK_CLI_BASE_URL, XAI_PROVIDER_NAME, grok_billing_breakdown_with_tier};
+use crate::{SecretValue, XaiWireProfileState};
 
 const PENDING_SCHEMA_VERSION: u64 = 3;
 const PENDING_TTL: TimeDelta = TimeDelta::minutes(30);
@@ -321,6 +321,16 @@ impl XaiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for XaiAdminProvider {
+    fn peer_model_eligible(&self, account: &AccountRecord, _model: &str) -> Option<bool> {
+        Some(crate::credential::is_direct_account_kind(
+            &account.authentication_kind,
+        ))
+    }
+
+    fn is_direct_account(&self, authentication_kind: &str) -> bool {
+        crate::credential::is_direct_account_kind(authentication_kind)
+    }
+
     fn account_capabilities(
         &self,
         _account_id: &ProviderAccountId,
@@ -369,15 +379,15 @@ impl ProviderAdmin for XaiAdminProvider {
         view.target.terminal = profile.client_mode.clone();
         view.attributes = vec![
             DashboardWireAttribute {
-                label: "客户端标识".to_owned(),
+                key: "client_identifier".to_owned(),
                 value: profile.client_identifier,
             },
             DashboardWireAttribute {
-                label: "运行模式".to_owned(),
+                key: "client_mode".to_owned(),
                 value: profile.client_mode,
             },
             DashboardWireAttribute {
-                label: "Token 认证".to_owned(),
+                key: "token_auth".to_owned(),
                 value: "xai-grok-cli".to_owned(),
             },
         ];
@@ -430,15 +440,15 @@ impl ProviderAdmin for XaiAdminProvider {
             user_agent: profile.user_agent(),
             attributes: vec![
                 DashboardWireAttribute {
-                    label: "客户端标识".to_owned(),
+                    key: "client_identifier".to_owned(),
                     value: profile.client_identifier,
                 },
                 DashboardWireAttribute {
-                    label: "运行模式".to_owned(),
+                    key: "client_mode".to_owned(),
                     value: profile.client_mode,
                 },
                 DashboardWireAttribute {
-                    label: "Token 认证".to_owned(),
+                    key: "token_auth".to_owned(),
                     value: "xai-grok-cli".to_owned(),
                 },
             ],
@@ -1185,6 +1195,7 @@ fn project_quota(
 ) -> ProviderQuota {
     let Some(snapshot) = snapshot else {
         return ProviderQuota {
+            upstream: None,
             credits: None,
             plan_type: None,
             observed_at: None,
@@ -1222,6 +1233,7 @@ fn project_quota(
             );
         }
         ProviderQuotaWindow {
+            upstream: None,
             key: billing.period_type().unwrap_or("billing").to_owned(),
             group: quota_group(period_kind).to_owned(),
             label: xai_quota_window_label(period_kind, window_seconds),
@@ -1240,6 +1252,7 @@ fn project_quota(
         }
     } else {
         ProviderQuotaWindow {
+            upstream: None,
             key: "free-rolling-24h".to_owned(),
             group: "shortTerm".to_owned(),
             label: "日限额".to_owned(),
@@ -1256,6 +1269,7 @@ fn project_quota(
         }
     };
     ProviderQuota {
+        upstream: None,
         credits: None,
         plan_type: billing.plan_type().map(str::to_owned),
         observed_at: Some(snapshot.observed_at()),

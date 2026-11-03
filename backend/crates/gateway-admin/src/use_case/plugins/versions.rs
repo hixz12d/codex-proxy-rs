@@ -10,9 +10,9 @@ use crate::{
         plugins::{
             PluginArtifactMetadata,
             instances::{
-                ConfigurePluginInstance, PluginInstance, PluginInstanceMutation,
-                PluginRollbackPlan, PluginRollbackTarget, PluginVersionConfiguration,
-                PluginVersionPlan, RollbackPluginInstance,
+                ConfigurePluginInstance, PluginCompatibilityConfirmation, PluginInstance,
+                PluginInstanceMutation, PluginRollbackPlan, PluginRollbackTarget,
+                PluginVersionConfiguration, PluginVersionPlan, RollbackPluginInstance,
             },
         },
     },
@@ -61,6 +61,7 @@ impl PluginsService {
                 AdminError::invalid("该版本没有可恢复的配置，请通过版本切换检查当前设置")
             })?;
         let configuration = ConfigurePluginInstance {
+            compatibility_confirmation: None,
             creation_id: None,
             expected_revision: None,
             replace_instances: Vec::new(),
@@ -68,7 +69,7 @@ impl PluginsService {
             artifact_sha256: input.artifact_sha256,
             enabled: existing.enabled,
             configuration: saved.configuration,
-            secrets: Some(saved.secrets),
+            secrets: Default::default(),
             bindings: saved.bindings,
         };
         // 沿用同一份快照的 CAS 和状态迁移流程，不能在检查目标后重新读取并覆盖并发配置
@@ -142,7 +143,21 @@ impl PluginsService {
             .find(|instance| instance.id == id)
             .ok_or_else(|| AdminError::not_found("插件实例不存在"))?;
         let (configuration, restored) = self.version_configuration(instance, digest).await?;
+        let status = self.package_status(digest).await?;
+        let compatibility_confirmation = if status.warning.is_some() {
+            Some(PluginCompatibilityConfirmation {
+                host_fingerprint: self.inspector.compatibility_host_fingerprint()?,
+                instance_id: instance.id.clone(),
+                instance_revision: instance.revision.get(),
+                artifact_sha256: digest.to_owned(),
+            })
+        } else {
+            None
+        };
         Ok(PluginVersionPlan {
+            compatibility_warning: status.warning,
+            compatibility_confirmation,
+            load_error: status.load_error,
             instance_revision: instance.revision.get(),
             artifact_sha256: digest.to_owned(),
             configuration: configuration.configuration,
@@ -179,6 +194,7 @@ impl PluginsService {
             .version_configuration(&existing, &input.artifact_sha256)
             .await?;
         let request = ConfigurePluginInstance {
+            compatibility_confirmation: None,
             creation_id: None,
             expected_revision: Some(existing.revision.get()),
             replace_instances: Vec::new(),
@@ -186,7 +202,7 @@ impl PluginsService {
             artifact_sha256: input.artifact_sha256,
             enabled: existing.enabled,
             configuration: configuration.configuration,
-            secrets: Some(configuration.secrets),
+            secrets: Default::default(),
             bindings: configuration.bindings,
         };
         // 同一次读取的 CAS 覆盖草稿计算、准备与提交，不能覆盖并发设置

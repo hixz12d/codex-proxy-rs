@@ -1,15 +1,19 @@
 <script setup lang="ts">
 import { ZSkeleton } from '@codex-proxy/ui'
+
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n({ useScope: 'global' })
 </script>
 
 <template>
   <div class="grid gap-8 sm:gap-10" role="status" aria-live="polite" aria-busy="true">
-    <span class="sr-only">正在加载累计活动</span>
+    <span class="sr-only">{{ t('accounts.profile.loadingCumulativeActivity') }}</span>
 
     <section class="grid min-w-0 gap-4 overflow-hidden">
       <div class="flex items-center justify-between">
         <ZSkeleton shape="text" class="h-4 w-20" />
-        <ZSkeleton class="h-7 w-32 rounded-cp opacity-70" />
+        <ZSkeleton class="h-7 w-32 rounded-z opacity-70" />
       </div>
       <div class="grid min-w-190 gap-1" style="grid-template-columns: repeat(52, minmax(0, 1fr))">
         <div v-for="week in 52" :key="week" class="grid gap-1">

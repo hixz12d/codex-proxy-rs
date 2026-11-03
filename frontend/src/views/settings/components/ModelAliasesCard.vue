@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { ZButton, ZCard, ZIconButton, ZInput } from '@codex-proxy/ui'
+import type { FormRule } from '@codex-proxy/ui'
+import { ZButton, ZCard, ZFormItem, ZIconButton, ZInput } from '@codex-proxy/ui'
 
 import { Plus, Trash2 } from '@lucide/vue'
 
-withDefaults(defineProps<{
+import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
+
+const props = withDefaults(defineProps<{
   mappings: Array<{ requestedModel: string, upstreamModel: string }>
   loading?: boolean
 }>(), {
@@ -15,12 +19,28 @@ const emit = defineEmits<{
   updateMapping: [index: number, key: 'requestedModel' | 'upstreamModel', value: string]
   removeMapping: [index: number]
 }>()
+
+const { t } = useI18n({ useScope: 'global' })
+const requiredRule = computed<FormRule>(() => ({
+  required: true,
+  whitespace: true,
+  trigger: ['blur', 'change'],
+  message: t('settings.form.fillInModelMappingCompletely'),
+}))
+const uniqueModelRule = computed<FormRule>(() => ({
+  trigger: ['blur', 'change'],
+  validator: (_rule, value: string) => {
+    const requested = value.trim()
+    return !requested || props.mappings.filter(row => row.requestedModel.trim() === requested).length < 2
+      || new Error(t('settings.form.duplicateClientModel', { requested }))
+  },
+}))
 </script>
 
 <template>
   <ZCard
-    title="模型映射"
-    description="将客户端请求的模型名称映射为实际使用的上游模型"
+    :title="t('settings.modelMapping')"
+    :description="t('settings.routing.modelMapHelp')"
   >
     <div class="grid gap-4">
       <div class="flex flex-wrap items-center gap-3">
@@ -28,42 +48,45 @@ const emit = defineEmits<{
           <template #icon>
             <Plus class="size-4" />
           </template>
-          添加映射
+          {{ t('settings.addMapping') }}
         </ZButton>
       </div>
 
       <div
         v-if="loading"
-        class="rounded-cp bg-cp-fill-quaternary px-4 py-4 text-cp font-emphasis text-cp-text-quaternary"
+        class="rounded-z bg-z-fill-quaternary px-4 py-4 text-z font-emphasis text-z-text-quaternary"
       >
-        正在加载模型映射...
+        {{ t('settings.loadingModelMapping') }}
       </div>
       <div v-else-if="mappings.length > 0" class="grid max-w-6xl gap-3">
         <div
           v-for="(row, index) in mappings"
           :key="index"
-          class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-cp-card bg-cp-fill-quaternary p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto]"
+          class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-4.5 rounded-z-card bg-z-fill-quaternary p-3 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto]"
         >
-          <ZInput
-            :model-value="row.requestedModel"
-            placeholder="请求模型"
-            aria-label="请求模型"
-            @update:model-value="emit('updateMapping', index, 'requestedModel', $event)"
-          />
-          <span class="hidden text-cp-text-quaternary sm:block" aria-hidden="true">→</span>
-          <ZInput
-            class="col-start-1 row-start-2 sm:col-start-auto sm:row-start-auto"
-            :model-value="row.upstreamModel"
-            placeholder="上游模型"
-            aria-label="上游模型名称"
-            @update:model-value="emit('updateMapping', index, 'upstreamModel', $event)"
-          />
+          <ZFormItem :prop="`modelMappings.${index}.requestedModel`" :rules="[requiredRule, uniqueModelRule]" :show-message="Boolean(row.requestedModel.trim())">
+            <ZInput
+              :model-value="row.requestedModel"
+              :placeholder="t('settings.requestModel')"
+              :aria-label="t('settings.requestModel')"
+              @update:model-value="emit('updateMapping', index, 'requestedModel', $event)"
+            />
+          </ZFormItem>
+          <span class="hidden text-z-text-quaternary sm:block" aria-hidden="true">→</span>
+          <ZFormItem :prop="`modelMappings.${index}.upstreamModel`" :rules="requiredRule" :show-message="false" class="col-start-1 row-start-2 sm:col-start-auto sm:row-start-auto">
+            <ZInput
+              :model-value="row.upstreamModel"
+              :placeholder="t('settings.upstreamModel')"
+              :aria-label="t('settings.upstreamModelName')"
+              @update:model-value="emit('updateMapping', index, 'upstreamModel', $event)"
+            />
+          </ZFormItem>
           <ZIconButton
             class="col-start-2 row-span-2 row-start-1 sm:col-start-auto sm:row-span-1 sm:row-start-auto"
-            aria-label="删除映射"
+            :aria-label="t('settings.deleteMapping')"
             @click="emit('removeMapping', index)"
           >
-            <Trash2 class="size-4 text-cp-error" />
+            <Trash2 class="size-4 text-z-error" />
           </ZIconButton>
         </div>
       </div>

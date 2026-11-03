@@ -70,7 +70,7 @@ pub(crate) async fn live_call(
                 return live_error_response(
                     LiveErrorShape::Live,
                     StatusCode::BAD_REQUEST,
-                    "Codex live call request has an invalid model",
+                    "Codex live call request has an invalid model.",
                     "invalid_request",
                 );
             }
@@ -126,7 +126,7 @@ pub(crate) async fn hangup(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let protocol_headers = protocol_header_pairs(&headers);
+    let protocol_headers = filter_protocol_headers(&headers);
     let outcome = gateway
         .hangup(LiveHangupRequest {
             call_id: &call_id,
@@ -141,13 +141,8 @@ pub(crate) async fn hangup(
             let status = StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::OK);
             let mut response = Response::new(axum::body::Body::from(outcome.body));
             *response.status_mut() = status;
-            for (name, value) in outcome.headers {
-                if let (Ok(name), Ok(value)) = (
-                    header::HeaderName::from_bytes(name.as_bytes()),
-                    header::HeaderValue::from_bytes(value.as_bytes()),
-                ) {
-                    response.headers_mut().insert(name, value);
-                }
+            for (name, value) in live_forwarded_response_headers(&outcome.headers) {
+                response.headers_mut().append(name, value);
             }
             response
         }
@@ -189,7 +184,7 @@ async fn read_call_body(
                 Box::new(live_error_response(
                     LiveErrorShape::Live,
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "Codex live request body too large",
+                    "Codex live request body too large.",
                     "invalid_request",
                 ))
             })?;
@@ -199,7 +194,7 @@ async fn read_call_body(
         Box::new(live_error_response(
             LiveErrorShape::Live,
             StatusCode::BAD_REQUEST,
-            "Codex live multipart body is invalid",
+            "Codex live multipart body is invalid.",
             "invalid_request",
         ))
     })?;
@@ -210,7 +205,7 @@ async fn read_call_body(
             Box::new(live_error_response(
                 LiveErrorShape::Live,
                 StatusCode::BAD_REQUEST,
-                "Codex live multipart body is invalid",
+                "Codex live multipart body is invalid.",
                 "invalid_request",
             ))
         })?
@@ -223,7 +218,7 @@ async fn read_call_body(
                     Box::new(live_error_response(
                         LiveErrorShape::Live,
                         StatusCode::BAD_REQUEST,
-                        "Codex live multipart body is invalid",
+                        "Codex live multipart body is invalid.",
                         "invalid_request",
                     ))
                 })?;
@@ -234,7 +229,7 @@ async fn read_call_body(
                     Box::new(live_error_response(
                         LiveErrorShape::Live,
                         StatusCode::BAD_REQUEST,
-                        "Codex live multipart body is invalid",
+                        "Codex live multipart body is invalid.",
                         "invalid_request",
                     ))
                 })?;
@@ -242,7 +237,7 @@ async fn read_call_body(
                     Box::new(live_error_response(
                         LiveErrorShape::Live,
                         StatusCode::BAD_REQUEST,
-                        "Codex live session field must contain valid JSON",
+                        "Codex live session field must contain valid JSON.",
                         "invalid_request",
                     ))
                 })?;
@@ -256,26 +251,13 @@ async fn read_call_body(
         None => Err(Box::new(live_error_response(
             LiveErrorShape::Live,
             StatusCode::BAD_REQUEST,
-            "Codex live multipart body requires an sdp field",
+            "Codex live multipart body requires an sdp field.",
             "invalid_request",
         ))),
     }
 }
 
-/// realtime 协议头的 `(name, value)` 形态；名称小写化以稳定上游顺序。
-pub(crate) fn protocol_header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
-    super::filter_protocol_headers(headers)
-        .into_iter()
-        .map(|header| {
-            (
-                header.name().to_ascii_lowercase(),
-                String::from_utf8_lossy(header.value()).into_owned(),
-            )
-        })
-        .collect()
-}
-
-/// 汇集引导响应；只放行白名单响应头，正文按字节透传。
+/// 汇集引导响应；普通响应头与正文按字节透传
 async fn collect_live_call_response(started: StartedExecution, path: String) -> Response {
     let request_id = started.request_id;
     let mut execution = PendingExecution::new(started.session);

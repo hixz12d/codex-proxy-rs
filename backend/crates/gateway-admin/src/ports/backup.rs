@@ -66,8 +66,12 @@ pub trait BackupRepository: Send + Sync {
         at: DateTime<Utc>,
     ) -> AdminStoreResult<bool>;
 
-    /// 插入 queued 任务；存在活跃任务时返回 `backup.active_task_conflict`
-    async fn insert_backup_record(&self, seed: BackupRecordSeed) -> AdminStoreResult<BackupRecord>;
+    /// 同事务插入人工 queued 任务与审计；存在活跃任务时返回 `backup.active_task_conflict`
+    async fn insert_backup_record(
+        &self,
+        seed: BackupRecordSeed,
+        context: &MutationContext,
+    ) -> AdminStoreResult<BackupRecord>;
 
     /// 核对启停、Cron、时区及旧游标后，同事务推进游标并插入 scheduled 任务
     /// 配置已变化时不写入；同一时间点或活跃冲突时只推进游标，返回 `false`
@@ -111,11 +115,12 @@ pub trait BackupRepository: Send + Sync {
         now: DateTime<Utc>,
     ) -> AdminStoreResult<Option<BackupRecord>>;
 
-    /// 迁移到删除流程（completed/failed → deleting）；供管理员与保留策略调用
+    /// 迁移到删除流程（completed/failed → deleting）；人工操作同事务记录审计，保留策略传 None
     async fn transition_to_deleting(
         &self,
         id: &str,
         now: DateTime<Utc>,
+        context: Option<&MutationContext>,
     ) -> AdminStoreResult<Option<BackupRecord>>;
 
     /// 远端删除成功后硬删除记录行
@@ -131,9 +136,10 @@ pub trait BackupRepository: Send + Sync {
         timezone: &str,
     ) -> AdminStoreResult<bool>;
 
-    /// 按完成时间倒序读取 completed 计划备份，供保留策略扫描（最多 `limit` 条）
+    /// 按完成时间及 ID 倒序分页读取 completed 计划备份，offset 相对完整集合
     async fn list_scheduled_completed_desc(
         &self,
+        offset: u64,
         limit: u32,
     ) -> AdminStoreResult<Vec<BackupRecord>>;
 }
@@ -313,6 +319,7 @@ impl BackupRepository for UnavailableBackupRepository {
     async fn insert_backup_record(
         &self,
         _seed: BackupRecordSeed,
+        _context: &MutationContext,
     ) -> AdminStoreResult<BackupRecord> {
         Err(disabled_store())
     }
@@ -363,6 +370,7 @@ impl BackupRepository for UnavailableBackupRepository {
         &self,
         _id: &str,
         _now: DateTime<Utc>,
+        _context: Option<&MutationContext>,
     ) -> AdminStoreResult<Option<BackupRecord>> {
         Err(disabled_store())
     }
@@ -381,6 +389,7 @@ impl BackupRepository for UnavailableBackupRepository {
     }
     async fn list_scheduled_completed_desc(
         &self,
+        _offset: u64,
         _limit: u32,
     ) -> AdminStoreResult<Vec<BackupRecord>> {
         Err(disabled_store())

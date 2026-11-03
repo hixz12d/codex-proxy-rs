@@ -54,6 +54,7 @@ pub struct RuntimeSettingsValues {
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
+    pub max_retry_after_seconds: u32,
     pub openai_guardian_reserved_concurrency: u32,
     pub openai_account_affinity: gateway_core::account::AccountAffinity,
     pub max_account_rotations: u32,
@@ -65,13 +66,7 @@ pub struct RuntimeSettingsValues {
     pub usage_retention_days: u32,
     pub ops_event_retention_days: u32,
     pub audit_retention_days: u32,
-    pub account_auto_freeze_enabled: bool,
-    pub account_auto_freeze_threshold: u32,
-    pub account_auto_freeze_window_seconds: u64,
-    pub account_auto_freeze_duration_seconds: u64,
-    pub account_auto_freeze_probe_enabled: bool,
-    pub account_auto_freeze_probe_model: Option<String>,
-    pub account_auto_freeze_adaptive_concurrency: bool,
+    pub account_error_protection: gateway_core::account::AccountErrorProtection,
     pub account_warmup_enabled: bool,
     pub account_warmup_schedule_time: String,
     pub account_warmup_model: Option<String>,
@@ -232,12 +227,7 @@ impl RuntimeSettingsValues {
             self.ops_event_retention_days,
             self.audit_retention_days,
         )?;
-        gateway_core::provider_ports::ProviderFreezePolicy::validate_values(
-            self.account_auto_freeze_threshold,
-            self.account_auto_freeze_window_seconds,
-            self.account_auto_freeze_duration_seconds,
-            self.account_auto_freeze_probe_model.as_deref(),
-        )?;
+        self.account_error_protection.validate()?;
         gateway_core::provider_ports::ProviderWarmupPolicy::validate_values(
             self.account_warmup_enabled,
             &self.account_warmup_schedule_time,

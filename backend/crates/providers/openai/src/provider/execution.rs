@@ -43,7 +43,6 @@ impl CodexProvider {
                 endpoint_path,
                 body: image.payload().body().clone(),
                 image_turn_id,
-                turn_metadata: None,
                 session_affinity,
             },
         )
@@ -119,12 +118,6 @@ impl CodexProvider {
                 UpstreamSendState::NotSent,
             ));
         }
-        let turn_metadata = search
-            .payload()
-            .context()
-            .get("turn_metadata")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let session_affinity = derive_codex_endpoint_session_affinity(
             search.payload(),
             context.client_api_key_ref(),
@@ -139,7 +132,6 @@ impl CodexProvider {
                 endpoint_path: CODEX_ALPHA_SEARCH_PATH,
                 body: search.payload().body().clone(),
                 image_turn_id: None,
-                turn_metadata,
                 session_affinity,
             },
         )
@@ -169,7 +161,6 @@ impl CodexProvider {
                 attempt: &context,
                 session_affinity: request.session_affinity.as_ref(),
                 model,
-                requires_oauth: false,
             })
             .await
             .map_err(map_selection_error)?;
@@ -256,7 +247,7 @@ impl CodexProvider {
                 .map_err(map_selection_error)?;
         }
         let lease = Arc::new(lease);
-        let passthrough_headers = match operation {
+        let payload = match &operation {
             Operation::GenerateImage(image) => {
                 let Operation::GenerateImage(original) = &request.operation else {
                     return Err(provider_error(
@@ -270,14 +261,13 @@ impl CodexProvider {
                         UpstreamSendState::NotSent,
                     ));
                 }
-                request.body = image.payload().body().clone();
                 request.image_turn_id = image
                     .payload()
                     .context()
                     .get("image_turn_id")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                crate::transport::request::decode_passthrough_headers(image.payload().context())
+                image.payload()
             }
             Operation::Search(search) => {
                 if !matches!(&request.operation, Operation::Search(_))
@@ -288,14 +278,7 @@ impl CodexProvider {
                         UpstreamSendState::NotSent,
                     ));
                 }
-                request.body = search.payload().body().clone();
-                request.turn_metadata = search
-                    .payload()
-                    .context()
-                    .get("turn_metadata")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                crate::transport::request::decode_passthrough_headers(search.payload().context())
+                search.payload()
             }
             _ => {
                 return Err(provider_error(
@@ -304,6 +287,9 @@ impl CodexProvider {
                 ));
             }
         };
+        request.body = payload.body().clone();
+        let passthrough_headers =
+            crate::transport::request::decode_passthrough_headers(payload.context());
         if !context.is_diagnostic_required_account()
             && let Some(affinity) = affinity.as_ref()
             && let Some(turn) = affinity.turn_alias()
@@ -322,6 +308,11 @@ impl CodexProvider {
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let provider_kind = ProviderKind::new(PROVIDER_NAME)
             .map_err(|_| provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent))?;
+        let outbound_middleware = context.outbound_middleware(
+            provider_kind.clone(),
+            endpoint_requested_model(payload).map(|model| model.as_str().to_owned()),
+            lease.account_id().clone(),
+        );
         let metadata = ProviderCallMetadata::for_provider_endpoint(
             provider_kind,
             lease.account_id().clone(),
@@ -329,6 +320,7 @@ impl CodexProvider {
                 provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent)
             })?,
         )
+        .with_credential_revision(lease.account().revision())
         .with_account_snapshot(Some(
             gateway_core::account::AccountHistorySnapshot::from_account(lease.account()),
         ))
@@ -336,11 +328,19 @@ impl CodexProvider {
             account_selection_wait_ms,
             lease.capacity_snapshot(),
         ));
-        // Standalone Provider 端点没有可证明的账号 owner；Search metadata 必须按
+        // Standalone Provider 端点没有可证明的账号 owner；Images/Search metadata 必须按
         // 跨账号输入收敛到当前 lease，不能沿用下游声明的账号或 installation identity
-        let turn_metadata = request.turn_metadata.as_deref().and_then(|metadata| {
-            crate::transport::request::scope_turn_metadata(metadata, lease.installation_id(), true)
-        });
+        let turn_metadata = payload
+            .context()
+            .get("turn_metadata")
+            .and_then(Value::as_str)
+            .and_then(|metadata| {
+                crate::transport::request::scope_turn_metadata(
+                    metadata,
+                    lease.installation_id(),
+                    true,
+                )
+            });
         let events = cold_json_response_stream(ColdJsonResponse {
             client: self
                 .client_for_request(&context)?
@@ -348,6 +348,7 @@ impl CodexProvider {
                 .map_err(|error| map_client_error(error, UpstreamSendState::NotSent, false).error)?
                 .with_responses_api_base_url(lease.authentication().responses_api_base_url())
                 .with_middleware_headers(middleware_headers)
+                .with_outbound_middleware(outbound_middleware)
                 .with_privacy(context.privacy(), context.cancellation().clone()),
             response_origin: request.response_origin,
             endpoint_path: request.endpoint_path,
@@ -378,7 +379,6 @@ struct RawJsonEndpointRequest {
     endpoint_path: &'static str,
     body: Bytes,
     image_turn_id: Option<String>,
-    turn_metadata: Option<String>,
     session_affinity: Option<CodexSessionAffinity>,
 }
 
@@ -396,6 +396,8 @@ pub(super) struct ColdResponse {
     pub(super) session_transport_key: Option<ProviderSessionAffinityKey>,
     pub(super) session_transport_key_hash: Option<String>,
     pub(super) session_transport_recovery: CodexSessionTransportRecovery,
+    pub(super) guardian_routing: guardian::GuardianRouting,
+    pub(super) turn_state_scope: Option<turn_state::TurnStateScope>,
     pub(super) websocket_retry_count: u32,
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
@@ -425,6 +427,8 @@ pub(super) struct OpenAiSessionState {
     pub(super) turn_state: Option<String>,
     #[serde(default)]
     pub(super) client_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reasoning_effort_override: Option<String>,
     pub(super) continuation_scope: OpenAiContinuationScope,
 }
 
@@ -442,6 +446,7 @@ pub(super) struct OpenAiSessionCapture {
     pub(super) conversation_id: Option<String>,
     pub(super) turn_state: Option<String>,
     pub(super) client_turn_id: Option<String>,
+    pub(super) reasoning_effort_override: Option<String>,
     pub(super) response_store: bool,
     pub(super) continuation_scope: Option<OpenAiContinuationScope>,
 }
@@ -488,6 +493,7 @@ fn encode_openai_session_capture(
         conversation_id: capture.conversation_id.clone(),
         turn_state: capture.turn_state.clone(),
         client_turn_id: capture.client_turn_id.clone(),
+        reasoning_effort_override: capture.reasoning_effort_override.clone(),
         continuation_scope,
     })
 }
@@ -624,7 +630,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             response_origin: &request.response_origin,
             cyber_policy_scope: None,
             allows_account_state_mutation,
-            allows_capacity_feedback: !request.context.is_diagnostic_required_account(),
+            upstream_model: None,
         };
         let active_account = request.lease.account().clone();
         let cookie_header = build_cookie_header(request.lease.cookies())?;
@@ -697,7 +703,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
                     .selector
                     .capture_response_cookies(
                         &active_account,
-                        &request.response_origin,
+                        response.diagnostics.response_origin.as_ref().unwrap_or(&request.response_origin),
                         &response.set_cookie_headers,
                     )
                     .await
@@ -778,6 +784,8 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         session_transport_key,
         session_transport_key_hash,
         session_transport_recovery,
+        guardian_routing,
+        turn_state_scope,
         websocket_retry_count,
         stream_max_retries,
         mut session_capture,
@@ -792,7 +800,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             response_origin: &response_origin,
             cyber_policy_scope: cyber_policy_scope.as_ref(),
             allows_account_state_mutation,
-            allows_capacity_feedback: !context.is_diagnostic_required_account(),
+            upstream_model: Some(&upstream_model),
         };
         let mut active_account = lease.account().clone();
         let cookie_header = build_cookie_header(lease.cookies())?;
@@ -825,7 +833,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 &authorization,
                 cookie_header.as_ref(),
                 account_selection,
-            ).with_trace(&trace),
+            ).with_trace(&trace).with_response_control(context.response_control()),
             active_account.id().as_str(),
             context.deadline(),
             &cancellation,
@@ -867,6 +875,17 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         },
                     );
                 }
+                if let Some(scope) = &turn_state_scope
+                    && let Some(response) = failure.error.client_visible_upstream_response()
+                {
+                    for header in response.headers() {
+                        if header.name().eq_ignore_ascii_case("x-codex-turn-state")
+                            && let Ok(token) = std::str::from_utf8(header.value().as_ref())
+                        {
+                            scope.remember(token);
+                        }
+                    }
+                }
                 if let Some(observation) = failure.observation.take() {
                     yield ProviderEvent::observation(observation);
                 }
@@ -890,6 +909,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .await;
             Err(failure.error)?;
             return;
+        }
+        if let Some(scope) = &turn_state_scope
+            && let Some(token) = response.turn_state.as_deref()
+        {
+            scope.remember(token);
         }
         if let Some(capture) = session_capture.as_mut() {
             capture.continuation_scope = Some(if capture.response_store {
@@ -924,7 +948,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             match selector
                 .capture_response_cookies(
                     &active_account,
-                    &response_origin,
+                    response.diagnostics.response_origin.as_ref().unwrap_or(&response_origin),
                     &response.set_cookie_headers,
                 )
                 .await
@@ -936,6 +960,15 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     {
                         active_account = current;
                     }
+                }
+                // 迟到响应不能覆盖已更新的凭据，版本冲突属于正常跳过而非存储故障
+                Err(CredentialSelectionError::RevisionConflict(_)) => {
+                    tracing::debug!(
+                        request_id = %request_id,
+                        account_id = %active_account.id(),
+                        credential_revision = active_account.revision().get(),
+                        "Skipped OpenAI response cookies after credential revision changed"
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -949,6 +982,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             }
         }
         let response_transport = response.transport;
+        let routing_affinity = response.routing_affinity;
         let websocket_connection_id = response.websocket_connection_id;
         let mut body = response.body;
         let mut failure_diagnostics = response.diagnostics.clone();
@@ -964,8 +998,8 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         // 同协议保留原始帧；canonical 解析只提取计费、续接和状态事实
         let websocket_transport = response.transport == CodexBackendTransport::WebSocket;
         let mut decoder = CodexCanonicalDecoder::new(upstream_model.as_str())
+            .with_trace(trace.clone())
             .with_pricing(context.pricing().get("openai").and_then(|models| models.get(upstream_model.as_str())).cloned())
-            .with_reported_model(response.response_metadata.effective_model.as_deref())
             .with_requested_service_tier(request.service_tier())
             .with_request_tool_pricing(upstream_model.as_str(), request.tools())
             .with_raw_sse_passthrough();
@@ -1024,7 +1058,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         response_metadata_updates.as_ref(),
                         &mut session_capture,
                         &mut observation_state,
-                        &mut decoder,
+                        turn_state_scope.as_ref(),
                     )
                     .await;
                     let observation_event = if rate_limits_changed || metadata_merge.is_some()
@@ -1102,12 +1136,10 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 response_metadata_updates.as_ref(),
                 &mut session_capture,
                 &mut observation_state,
-                &mut decoder,
+                turn_state_scope.as_ref(),
             )
             .await;
             let metadata_changed = metadata_merge.unwrap_or(false);
-            let response_model_changed = observation_state
-                .observe_upstream_response_model(decoder.response_model());
             let service_tier_changed = observation_state
                 .observe_upstream_service_tier(decoder.response_service_tier());
             let terminal_failure = canonical_failure.map(|(error, semantic_output_seen)| {
@@ -1134,6 +1166,13 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 )
             });
             let timing_signals = decoder.take_timing_signals();
+            if let Some(affinity) = &routing_affinity {
+                for fact in events.iter().flat_map(ProviderEvent::canonical_facts) {
+                    if let GatewayEvent::Started(meta) = fact {
+                        guardian_routing.remember(context.client_api_key_ref(), active_account.id(), meta.response_id(), affinity);
+                    }
+                }
+            }
             let output_timing_changed = observation_state
                 .observe_timing_signals(timing_signals, context.timing_started_at());
             let upstream_timing_changed = observation_state
@@ -1157,29 +1196,44 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 session_transport_recovery.websocket_succeeded(key);
             }
             if allows_account_state_mutation && (completed || terminal_failure.is_some()) {
+                let started = Instant::now();
                 synchronize_passive_quota(
                     &quota,
                     &active_account,
                     passive_quota_observation.rate_limits(),
                 )
                 .await;
+                trace.record("provider.quota_sync", json!({
+                    "durationMs": started.elapsed().as_millis(),
+                }));
             }
             if let Some((failure, _)) = terminal_failure.as_ref() {
+                let started = Instant::now();
                 apply_failure(&failure_context, &active_account, failure)
                 .await;
+                trace.record("provider.account_failure", json!({
+                    "durationMs": started.elapsed().as_millis(),
+                }));
             }
             attach_openai_session_update(&mut events, &mut session_capture);
             if allows_account_state_mutation && completed && terminal_failure.is_none() {
                 // 完成事实交给下游前更新账号健康，绑定已经在发送前完成
+                let started = Instant::now();
                 selector
                     .record_success(&active_account)
                     .await;
+                trace.record("provider.account_success", json!({
+                    "durationMs": started.elapsed().as_millis(),
+                }));
+                let started = Instant::now();
                 selector
                     .observe_cyber_policy_success(cyber_policy_scope.as_ref())
                     .await;
+                trace.record("provider.cyber_policy_success", json!({
+                    "durationMs": started.elapsed().as_millis(),
+                }));
             }
             if (rate_limits_changed
-                || response_model_changed
                 || service_tier_changed
                 || timing_changed
                 || metadata_changed
@@ -1249,8 +1303,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             )
         });
         let timing_signals = decoder.take_timing_signals();
-        let response_model_changed = observation_state
-            .observe_upstream_response_model(decoder.response_model());
         let service_tier_changed = observation_state
             .observe_upstream_service_tier(decoder.response_service_tier());
         let output_timing_changed = observation_state
@@ -1285,7 +1337,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             response_metadata_updates.as_ref(),
             &mut session_capture,
             &mut observation_state,
-            &mut decoder,
+            turn_state_scope.as_ref(),
         )
         .await
         .unwrap_or(false);
@@ -1311,8 +1363,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 .observe_cyber_policy_success(cyber_policy_scope.as_ref())
                 .await;
         }
-        if (response_model_changed
-            || service_tier_changed
+        if (service_tier_changed
             || timing_changed
             || rate_limits_changed
             || metadata_changed
@@ -1354,26 +1405,14 @@ async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
-    decoder: &mut CodexCanonicalDecoder,
+    turn_state_scope: Option<&turn_state::TurnStateScope>,
 ) -> Option<bool> {
-    let updates = updates?;
-    let mut pending = updates.lock().await;
-    let turn_state = pending.turn_state.take();
-    let reported_model = pending.reported_model.clone();
-    drop(pending);
-    if turn_state.is_none() && reported_model.is_none() {
-        return None;
+    let turn_state = updates?.lock().await.turn_state.take()?;
+    if let Some(scope) = turn_state_scope {
+        scope.remember(&turn_state);
     }
-    let mut changed = false;
-    if let Some(turn_state) = turn_state {
-        if let Some(capture) = session_capture.as_mut() {
-            capture.turn_state = Some(turn_state.clone());
-        }
-        changed |= observation_state.merge_client_header("x-codex-turn-state", &turn_state);
+    if let Some(capture) = session_capture.as_mut() {
+        capture.turn_state = Some(turn_state.clone());
     }
-    if let Some(model) = reported_model {
-        decoder.observe_reported_model(&model);
-        changed |= observation_state.observe_upstream_response_model(decoder.response_model());
-    }
-    Some(changed)
+    Some(observation_state.merge_client_header("x-codex-turn-state", &turn_state))
 }

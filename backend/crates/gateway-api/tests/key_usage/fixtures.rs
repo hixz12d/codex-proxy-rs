@@ -18,6 +18,7 @@ pub(super) async fn fixture() -> AdminTestFixture {
     let fixture = key_fixture().await;
     let now = Utc::now();
     *fixture.client_key.lock().unwrap() = Some(ClientKeyRecord {
+        peer_sharing: Default::default(),
         request_profile_overrides: Default::default(),
         id: ClientApiKeyId::new("key-42").unwrap(),
         name: "Development".to_owned(),
@@ -91,6 +92,7 @@ pub(super) async fn fixture() -> AdminTestFixture {
 
 fn usage_record() -> UsageListRecord {
     UsageListRecord {
+        provider_account_upstream_peer: None,
         error_code: None,
         error_message: None,
         client_status_code: None,
@@ -110,7 +112,6 @@ fn usage_record() -> UsageListRecord {
         provider_account_authentication_kind: Some("private-sentinel".to_owned()),
         upstream_model_id: Some("private-sentinel".to_owned()),
         upstream_transport: Some("websocket".to_owned()),
-        upstream_response_model: Some("private-sentinel".to_owned()),
         service_tier: Some("private-sentinel".to_owned()),
         input_tokens: Some(1000),
         output_tokens: Some(100),

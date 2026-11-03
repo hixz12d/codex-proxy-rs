@@ -29,7 +29,7 @@ use super::{
         WebSocketPoolConnectLease, WebSocketPoolConnectOutcome, WebSocketPoolDecision,
         WebSocketPoolLease,
     },
-    pump::{PumpKeepalive, PumpLogContext, PumpedWebSocket, transport_metric_reason},
+    pump::{PumpLogContext, PumpedWebSocket, transport_metric_reason},
 };
 
 pub(crate) const WEBSOCKET_FAST_PATH_BUDGET: Duration = Duration::from_millis(800);
@@ -112,7 +112,11 @@ impl PreparedWebSocket {
 /// 只建立或租用 WebSocket，不发送 payload
 pub(crate) async fn prepare_response_create_request_with_pool(
     request: &CodexWebSocketRequest,
-    pool: Option<(&CodexWebSocketPool, Option<CodexWebSocketPoolKey>)>,
+    pool: Option<(
+        &CodexWebSocketPool,
+        Option<CodexWebSocketPoolKey>,
+        Option<&gateway_core::lifecycle::CancellationToken>,
+    )>,
     breaker: &WebSocketOriginBreaker,
     origin_key: &str,
     fast_path_budget: Option<Duration>,
@@ -120,7 +124,7 @@ pub(crate) async fn prepare_response_create_request_with_pool(
     fallback_stream_idle_timeout: Option<Duration>,
 ) -> Result<WebSocketFastPath<PreparedWebSocket>, CodexWebSocketExchangeError> {
     let decision_started_at = Instant::now();
-    let Some((pool, Some(key))) = pool else {
+    let Some((pool, Some(key), downstream_cancellation)) = pool else {
         if require_pool || !request.continuation().permits_fresh_connection() {
             return Err(continuation_unavailable(
                 PreviousResponseUnavailableReason::PoolUnavailable,
@@ -133,7 +137,7 @@ pub(crate) async fn prepare_response_create_request_with_pool(
             fast_path_budget,
             fallback_stream_idle_timeout,
             decision_started_at,
-            pool.map(|(pool, _)| pool),
+            pool.map(|(pool, _, _)| pool),
         )
         .await;
     };
@@ -150,7 +154,9 @@ pub(crate) async fn prepare_response_create_request_with_pool(
         .acquire(
             &key,
             required_response_id,
+            request.codex_search_declared == Some(true),
             request.connection().outbound_proxy.as_ref(),
+            downstream_cancellation,
         )
         .await
     {
@@ -237,7 +243,6 @@ async fn prepare_unpooled_websocket(
     let context = pump_log_context_from_connection(request.connection());
     let connected = connect_with_budget(
         request.connection(),
-        PumpKeepalive::disabled(),
         fast_path_budget,
         context,
         proxy_permit,
@@ -343,7 +348,6 @@ fn start_pooled_websocket_connect(
     let task_key = connect_lease.key().clone();
     let started_at = connect_lease.started_at();
     let cancellation = connect_lease.cancellation_token();
-    let keepalive = pool.keepalive();
     let context = PumpLogContext::new(
         Some(task_key.account_id().to_owned()),
         Some(task_key.conversation_id_hash()),
@@ -365,7 +369,7 @@ fn start_pooled_websocket_connect(
                 );
                 return;
             }
-            result = connect_websocket_connection(&connection, keepalive, context, fast_path, proxy_permit) => result,
+            result = connect_websocket_connection(&connection, context, fast_path, proxy_permit) => result,
         };
         match finish_breaker_attempt(permit, connected) {
             Ok((connection, connect_elapsed)) => {
@@ -394,7 +398,7 @@ fn start_pooled_websocket_connect(
                         );
                     }
                     Err(connection) => {
-                        connection.websocket.close().await;
+                        connection.websocket.abort_and_wait().await;
                         let _ = sender.send(Err(continuation_unavailable(
                             PreviousResponseUnavailableReason::PoolUnavailable,
                         )));
@@ -465,7 +469,6 @@ fn pump_log_context_from_connection(connection: &CodexWebSocketConnection) -> Pu
 
 async fn connect_with_budget(
     connection: &CodexWebSocketConnection,
-    keepalive: PumpKeepalive,
     fast_path_budget: Option<Duration>,
     context: PumpLogContext,
     proxy_permit: Option<pool::ProxyConnectionPermit>,
@@ -475,7 +478,6 @@ async fn connect_with_budget(
         fast_path_budget,
         connect_websocket_connection(
             connection,
-            keepalive,
             context,
             fast_path_budget.is_some(),
             proxy_permit,
@@ -490,20 +492,20 @@ async fn connect_with_budget(
 
 async fn connect_websocket_connection(
     connection: &CodexWebSocketConnection,
-    keepalive: PumpKeepalive,
     context: PumpLogContext,
     fast_path: bool,
     proxy_permit: Option<pool::ProxyConnectionPermit>,
 ) -> Result<(PooledWebSocketConnection, Duration), CodexWebSocketExchangeError> {
     let started_at = Instant::now();
     let (websocket, response) =
-        connect_pumped_websocket(connection, keepalive, context, fast_path, proxy_permit).await?;
+        connect_pumped_websocket(connection, context, fast_path, proxy_permit).await?;
     Ok((
         PooledWebSocketConnection {
             websocket,
-            metadata: websocket_connection_metadata(&response),
+            metadata: websocket_connection_metadata(&response, connection),
             continuation: WebSocketContinuationState::default(),
             created_at: tokio::time::Instant::now(),
+            initial_search_declared: None,
         },
         started_at.elapsed(),
     ))
@@ -614,6 +616,7 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         metadata,
         continuation,
         created_at,
+        initial_search_declared,
     } = connection;
     trace.record("upstream.connection", serde_json::json!({
         "connectionId": websocket.connection_id().to_string(), "reused": reused,
@@ -660,6 +663,8 @@ pub(crate) async fn execute_prepared_response_create_request_stream(
         lease,
         created_at,
         continuation,
+        initial_search_declared: initial_search_declared
+            .unwrap_or(request.codex_search_declared.unwrap_or(false)),
     });
     let mut exchange = stream_websocket_response(
         websocket,
@@ -683,7 +688,7 @@ async fn discard_after_send(
     if let Some(lease) = lease {
         lease.discard_with_observation(observation).await;
     }
-    websocket.close().await;
+    websocket.abort_and_wait().await;
 }
 
 pub(crate) fn post_send_ambiguous(

@@ -1,5 +1,6 @@
 import type { SystemUpdateDetail, SystemVersion } from '@/api'
 import { ArrowUpCircle, CheckCircle2, RefreshCw, XCircle } from '@lucide/vue'
+import { t } from '@/i18n'
 
 interface SystemUpdatePresentationInput {
   version: SystemVersion | null
@@ -24,55 +25,67 @@ export function resolveSystemUpdatePresentation(input: SystemUpdatePresentationI
     confirmRows: resolveConfirmRows(input),
     releaseVersion: displayValue(input.updateInfo?.latestVersion),
     streamStatusLabel: input.updateStreaming
-      ? '实时'
-      : input.updateStreamError ? '断开' : '待连接',
-    restartButtonLabel: input.restarting ? '重启中' : '立即重启',
+      ? t('systemUpdate.logs.live')
+      : input.updateStreamError
+        ? t('systemUpdate.logs.disconnectedState')
+        : t('systemUpdate.logs.waiting'),
+    restartButtonLabel: input.restarting
+      ? t('systemUpdate.status.restarting')
+      : t('systemUpdate.actions.restart'),
   }
 }
 
 export function resolveSystemUpdateLogClasses(level: string) {
   switch (level) {
     case 'success':
-      return { marker: 'text-cp-success', text: 'text-cp-success' }
+      return { marker: 'text-z-success', text: 'text-z-success' }
     case 'warning':
-      return { marker: 'text-cp-warning', text: 'text-cp-warning' }
+      return { marker: 'text-z-warning', text: 'text-z-warning' }
     case 'error':
-      return { marker: 'text-cp-error', text: 'text-cp-error' }
+      return { marker: 'text-z-error', text: 'text-z-error' }
     default:
-      return { marker: 'text-cp-info', text: 'text-cp-text' }
+      return { marker: 'text-z-info', text: 'text-z-text' }
   }
 }
 
 function resolveStatus(input: SystemUpdatePresentationInput) {
   if (input.restarting || input.updating || input.checking || input.loading) {
     return {
-      label: input.restarting ? '重启中' : input.updating ? '更新中' : '检查中',
+      label: input.restarting
+        ? t('systemUpdate.status.restarting')
+        : input.updating
+          ? t('systemUpdate.status.updating')
+          : t('systemUpdate.status.checking'),
       icon: RefreshCw,
-      badge: 'bg-cp-info-container text-cp-info-on-container',
-      iconClass: 'text-cp-info',
+      badge: 'bg-z-info-container text-z-info-on-container',
+      iconClass: 'text-z-info',
     }
   }
   if (input.updateError || input.updateInfo?.warning) {
     return {
-      label: '异常',
+      label: t('common.status.error'),
       icon: XCircle,
-      badge: 'bg-cp-error-container text-cp-error-on-container',
-      iconClass: 'text-cp-error',
+      badge: 'bg-z-error-container text-z-error-on-container',
+      iconClass: 'text-z-error',
     }
   }
   if (input.needRestart || input.hasUpdate || input.updateInfo) {
     return {
-      label: input.needRestart ? '待重启' : input.hasUpdate ? '有可用更新' : '无可用更新',
+      label: input.needRestart
+        ? t('systemUpdate.status.restartRequired')
+        : input.hasUpdate
+          ? t('systemUpdate.status.available')
+          : t('systemUpdate.status.upToDate'),
       icon: input.hasUpdate ? ArrowUpCircle : CheckCircle2,
-      badge: 'bg-cp-success-container text-cp-success-on-container',
-      iconClass: 'text-cp-success',
+      badge: 'bg-z-success-container text-z-success-on-container',
+      iconClass: 'text-z-success',
     }
   }
   return {
-    label: '未检查',
+    label: t('systemUpdate.status.notChecked'),
     icon: CheckCircle2,
-    badge: 'bg-cp-fill-tertiary text-cp-text-secondary',
-    iconClass: 'text-cp-text-quaternary',
+    badge: 'bg-z-fill-tertiary text-z-text-secondary',
+    iconClass: 'text-z-text-quaternary',
   }
 }
 
@@ -80,27 +93,29 @@ function resolveSummaryItems(input: SystemUpdatePresentationInput) {
   return [
     {
       key: 'current',
-      label: '当前版本',
-      value: input.loading ? '...' : versionLabel(input.updateInfo?.currentVersion ?? input.version?.version),
+      label: t('systemUpdate.currentVersion'),
+      value: input.loading
+        ? '...'
+        : versionLabel(input.updateInfo?.currentVersion ?? input.version?.version),
       title: input.updateInfo?.currentVersion ?? input.version?.version,
     },
     {
       key: 'latest',
-      label: '通道最新',
+      label: t('systemUpdate.latestVersion'),
       value: versionLabel(input.updateInfo?.latestVersion),
       title: input.updateInfo?.latestVersion,
       releaseUrl: input.updateInfo?.releaseUrl,
     },
     {
       key: 'build',
-      label: '构建',
-      value: displayValue(input.updateInfo?.buildTypeLabel),
+      label: t('systemUpdate.build'),
+      value: buildTypeLabel(input.updateInfo?.buildType),
       title: input.updateInfo?.buildType,
     },
     {
       key: 'deployment',
-      label: '部署',
-      value: displayValue(input.version?.deploymentModeLabel),
+      label: t('systemUpdate.deployment'),
+      value: deploymentModeLabel(input.version?.deploymentMode),
       title: input.version?.deploymentMode,
     },
   ]
@@ -108,16 +123,51 @@ function resolveSummaryItems(input: SystemUpdatePresentationInput) {
 
 function resolveConfirmRows(input: SystemUpdatePresentationInput) {
   return [
-    { key: 'current', label: '当前版本', value: versionLabel(input.version?.version) },
-    { key: 'previous', label: '已显示目标', value: versionLabel(input.previousTargetVersion) },
-    { key: 'target', label: '远端最新目标', value: versionLabel(input.confirmedTargetVersion) },
+    {
+      key: 'current',
+      label: t('systemUpdate.currentVersion'),
+      value: versionLabel(input.version?.version),
+    },
+    {
+      key: 'previous',
+      label: t('systemUpdate.displayedTarget'),
+      value: versionLabel(input.previousTargetVersion),
+    },
+    {
+      key: 'target',
+      label: t('systemUpdate.remoteTarget'),
+      value: versionLabel(input.confirmedTargetVersion),
+    },
   ]
 }
 
+function buildTypeLabel(value?: string) {
+  switch (value) {
+    case 'release': return t('systemUpdate.buildTypes.release')
+    case 'source': return t('systemUpdate.buildTypes.source')
+    case 'dev': return t('systemUpdate.buildTypes.dev')
+    case 'experimental': return t('systemUpdate.buildTypes.experimental')
+    default: return displayValue(value)
+  }
+}
+
+function deploymentModeLabel(value?: string) {
+  switch (value) {
+    case 'docker': return t('systemUpdate.deploymentModes.docker')
+    case 'binary': return t('systemUpdate.deploymentModes.binary')
+    case 'source': return t('systemUpdate.deploymentModes.source')
+    default: return displayValue(value)
+  }
+}
+
 function versionLabel(value?: string | null) {
-  return value ? `v${value}` : '-'
+  return value
+    ? `v${value}`
+    : '-'
 }
 
 function displayValue(value: unknown) {
-  return value ? String(value) : '-'
+  return value
+    ? String(value)
+    : '-'
 }

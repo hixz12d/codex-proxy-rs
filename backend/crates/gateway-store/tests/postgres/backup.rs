@@ -79,6 +79,63 @@ async fn enable_verified_schedule(repository: &PgBackupRepository) -> BackupSett
 }
 
 #[tokio::test]
+async fn scheduled_completed_pages_keep_stable_order_and_exclude_other_records() {
+    let Some(db) = TestDatabase::create("backup_retention_pages").await else {
+        return;
+    };
+    let repository = PgBackupRepository::new(db.pool.clone());
+    let now = Utc::now();
+    sqlx::query(
+        "insert into backup_records (
+            id, trigger_kind, status, scheduled_at, object_key, size_bytes, sha256,
+            error_code, error_message, started_at, completed_at, created_at, updated_at
+         )
+         select 'backup_' || lpad(to_hex(n), 32, '0'),
+                case when n = 1006 then 'manual' else 'scheduled' end,
+                case when n = 1007 then 'failed' else 'completed' end,
+                case when n = 1006 then null else $1 - n * interval '1 minute' end,
+                'codex/' || n || '.dump', 1, repeat('a', 64),
+                case when n = 1007 then 'backup.pg_dump_failed' end,
+                case when n = 1007 then '导出失败' end,
+                $1 - interval '2 days', $1, $1 - interval '2 days', $1
+           from generate_series(1, 1007) as n",
+    )
+    .bind(now)
+    .execute(&db.pool)
+    .await
+    .expect("seed completed backups with tied completion times");
+
+    let first = repository
+        .list_scheduled_completed_desc(0, 1000)
+        .await
+        .expect("first page");
+    let second = repository
+        .list_scheduled_completed_desc(1000, 1000)
+        .await
+        .expect("second page");
+    assert_eq!(first.len(), 1000);
+    assert_eq!(second.len(), 5);
+    let ids: Vec<_> = first
+        .iter()
+        .chain(&second)
+        .map(|record| record.id.clone())
+        .collect();
+    let expected: Vec<_> = (1..=1005)
+        .rev()
+        .map(|index| format!("backup_{index:032x}"))
+        .collect();
+    assert_eq!(ids, expected);
+    assert!(
+        repository
+            .list_scheduled_completed_desc(1005, 1000)
+            .await
+            .expect("past final page")
+            .is_empty()
+    );
+    db.close().await;
+}
+
+#[tokio::test]
 async fn storage_rotation_pauses_schedule_and_rejects_stale_verification() {
     let Some(db) = TestDatabase::create("backup_rotation").await else {
         return;
@@ -169,14 +226,19 @@ async fn backup_lifecycle_transitions_through_deleting_and_hard_delete() {
     let repository = PgBackupRepository::new(db.pool.clone());
 
     let record = repository
-        .insert_backup_record(seed(&"a".repeat(32), BackupTriggerKind::Manual, None))
+        .insert_backup_record(
+            seed(&"a".repeat(32), BackupTriggerKind::Manual, None),
+            &context(),
+        )
         .await
         .expect("insert queued");
     assert_eq!(record.status, BackupStatus::Queued);
     assert_eq!(record.attempt_count, 0);
 
+    // 生命周期时间统一从数据库创建时间推导，避免测试进程与数据库的时钟偏差
+    let started_at = record.created_at + chrono::Duration::seconds(1);
     let claimed = repository
-        .claim_next_queued(Utc::now())
+        .claim_next_queued(started_at)
         .await
         .expect("claim")
         .expect("claimed one task");
@@ -194,7 +256,7 @@ async fn backup_lifecycle_transitions_through_deleting_and_hard_delete() {
             &record.id,
             transition(BackupStatus::Dumping, BackupStatus::Uploading),
             update,
-            Utc::now(),
+            started_at + chrono::Duration::seconds(1),
         )
         .await
         .expect("dump complete")
@@ -207,7 +269,7 @@ async fn backup_lifecycle_transitions_through_deleting_and_hard_delete() {
             &record.id,
             transition(BackupStatus::Uploading, BackupStatus::Completed),
             StatusTransitionUpdate::default(),
-            Utc::now(),
+            started_at + chrono::Duration::seconds(2),
         )
         .await
         .expect("upload verified")
@@ -216,7 +278,11 @@ async fn backup_lifecycle_transitions_through_deleting_and_hard_delete() {
     assert!(completed.completed_at.is_some());
 
     let deleting = repository
-        .transition_to_deleting(&record.id, Utc::now())
+        .transition_to_deleting(
+            &record.id,
+            started_at + chrono::Duration::seconds(3),
+            Some(&context()),
+        )
         .await
         .expect("to deleting")
         .expect("transition matched");
@@ -244,19 +310,27 @@ async fn active_task_unique_index_blocks_second_queued() {
     };
     let repository = PgBackupRepository::new(db.pool.clone());
 
-    repository
-        .insert_backup_record(seed(&"a".repeat(32), BackupTriggerKind::Manual, None))
+    let record = repository
+        .insert_backup_record(
+            seed(&"a".repeat(32), BackupTriggerKind::Manual, None),
+            &context(),
+        )
         .await
         .expect("first queued");
     let error = repository
-        .insert_backup_record(seed(&"b".repeat(32), BackupTriggerKind::Manual, None))
+        .insert_backup_record(
+            seed(&"b".repeat(32), BackupTriggerKind::Manual, None),
+            &context(),
+        )
         .await
         .expect_err("second queued must conflict");
     assert_eq!(error.kind(), AdminStoreErrorKind::Conflict);
 
     // 第一个任务完成释放名额后，第二个可以插入
+    let started_at = record.created_at + chrono::Duration::seconds(1);
+    let completed_at = started_at + chrono::Duration::seconds(1);
     let claimed = repository
-        .claim_next_queued(Utc::now())
+        .claim_next_queued(started_at)
         .await
         .expect("claim")
         .expect("claimed");
@@ -267,15 +341,18 @@ async fn active_task_unique_index_blocks_second_queued() {
             StatusTransitionUpdate {
                 error_code: Some("backup.pg_dump_failed".to_owned()),
                 error_message: Some("boom".to_owned()),
-                completed_at: Some(Utc::now()),
+                completed_at: Some(completed_at),
                 ..Default::default()
             },
-            Utc::now(),
+            completed_at,
         )
         .await
         .expect("fail task");
     repository
-        .insert_backup_record(seed(&"c".repeat(32), BackupTriggerKind::Manual, None))
+        .insert_backup_record(
+            seed(&"c".repeat(32), BackupTriggerKind::Manual, None),
+            &context(),
+        )
         .await
         .expect("third queued after terminal");
 
@@ -359,7 +436,10 @@ async fn storage_identity_is_locked_once_records_exist() {
         .expect("endpoint change allowed with no records");
 
     repository
-        .insert_backup_record(seed(&"a".repeat(32), BackupTriggerKind::Manual, None))
+        .insert_backup_record(
+            seed(&"a".repeat(32), BackupTriggerKind::Manual, None),
+            &context(),
+        )
         .await
         .expect("insert queued");
 
@@ -503,5 +583,124 @@ async fn scheduled_insert_rejects_changed_schedule_and_stale_timezone_rebase() {
         .await
         .unwrap();
     assert_eq!(count, 0, "obsolete schedule never queues a task");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn manual_backup_mutations_roll_back_when_their_audit_cannot_be_written() {
+    let Some(db) = TestDatabase::create("backup_atomic_audit").await else {
+        return;
+    };
+    let repository = PgBackupRepository::new(db.pool.clone());
+    let seed = seed(&"d".repeat(32), BackupTriggerKind::Manual, None);
+    let backup_id = seed.id.clone();
+    sqlx::query("alter table admin_audit_events add constraint reject_backup_audit check (action not in ('backup.created', 'backup.delete_requested')) not valid")
+        .execute(&db.pool).await.expect("inject audit rejection");
+    assert!(
+        repository
+            .insert_backup_record(seed.clone(), &context())
+            .await
+            .is_err()
+    );
+    assert!(
+        repository
+            .load_backup_record(&backup_id)
+            .await
+            .expect("load rolled back create")
+            .is_none()
+    );
+    sqlx::query("alter table admin_audit_events drop constraint reject_backup_audit")
+        .execute(&db.pool)
+        .await
+        .expect("restore audit writes");
+    let record = repository
+        .insert_backup_record(seed, &context())
+        .await
+        .expect("create with audit");
+    let started_at = record.created_at + chrono::Duration::seconds(1);
+    repository
+        .claim_next_queued(started_at)
+        .await
+        .expect("claim backup fixture")
+        .expect("queued backup is claimed");
+    repository
+        .transition_status(
+            &backup_id,
+            transition(BackupStatus::Dumping, BackupStatus::Failed),
+            StatusTransitionUpdate {
+                error_code: Some("test_failure".to_owned()),
+                error_message: Some("synthetic fixture failure".to_owned()),
+                ..Default::default()
+            },
+            started_at + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("finish backup fixture")
+        .expect("running backup becomes failed");
+    sqlx::query("alter table admin_audit_events add constraint reject_backup_audit check (action <> 'backup.delete_requested') not valid")
+        .execute(&db.pool).await.expect("reject deletion audit");
+    assert!(
+        repository
+            .transition_to_deleting(
+                &backup_id,
+                started_at + chrono::Duration::seconds(2),
+                Some(&context()),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        repository
+            .load_backup_record(&backup_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        BackupStatus::Failed
+    );
+    sqlx::query("alter table admin_audit_events drop constraint reject_backup_audit")
+        .execute(&db.pool)
+        .await
+        .expect("restore deletion audit");
+    assert!(
+        repository
+            .transition_to_deleting(
+                &backup_id,
+                started_at + chrono::Duration::seconds(3),
+                Some(&context()),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        repository
+            .transition_to_deleting(
+                &backup_id,
+                started_at + chrono::Duration::seconds(4),
+                Some(&context()),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let events: Vec<(String, String, String)> = sqlx::query_as(
+        "select action, entity_ref, admin_request_id from admin_audit_events where entity_kind = 'backup' order by created_at, id"
+    ).fetch_all(&db.pool).await.expect("read committed audit events");
+    assert_eq!(
+        events,
+        vec![
+            (
+                "backup.created".to_owned(),
+                backup_id.clone(),
+                context().request_id
+            ),
+            (
+                "backup.delete_requested".to_owned(),
+                backup_id,
+                context().request_id
+            ),
+        ]
+    );
     db.close().await;
 }

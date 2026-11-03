@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use futures::StreamExt as _;
 use gateway_core::{account::ProviderAccountId, routing::ProviderKind};
 
 use crate::{
@@ -19,10 +20,14 @@ use crate::{
             DiagnosticDimension, DiagnosticsItem, DiagnosticsResult, Granularity, HealthStatus,
             HealthTimeline, HealthTimelinePoint, OpsErrorPage, OpsErrorQuery, ProviderBillingInput,
             RequestMetricPoint, RequestMetrics, TimeRange, Trend, TrendKind, TrendPoint,
-            TrendSummary, UsageBilling, UsageBillingProjection, UsageCalculatedBillingFact,
-            UsageDetail, UsageFilter, UsageInsights, UsageInsightsCost, UsageInsightsCostPoint,
-            UsageInsightsHealth, UsageInsightsHealthPoint, UsageInsightsPerformance,
-            UsageInsightsPerformancePoint, UsageOverview, UsagePage, UsageQuery, UsageSummary,
+            TrendSummary, UsageBilling, UsageBillingProjection, UsageCacheEfficiency,
+            UsageCalculatedBillingFact, UsageConcurrencyPoint, UsageCostComparison,
+            UsageCostSummary, UsageDetail, UsageFilter, UsageInsight, UsageInsightData,
+            UsageInsightMetric, UsageInsights, UsageInsightsCost, UsageInsightsCostPoint,
+            UsageInsightsHealth, UsageInsightsHealthPoint, UsageInsightsLoad,
+            UsageInsightsObservation, UsageInsightsPerformance, UsageInsightsPerformancePoint,
+            UsageMetricPoint, UsageMetricSeries, UsageOverview, UsagePage, UsageQuery,
+            UsageSummary, UsageThroughputPercentiles,
         },
         provider_credentials::ProviderQuotaRequest,
     },
@@ -64,6 +69,12 @@ pub trait ObservabilityService: Send + Sync {
         range: TimeRange,
         filter: UsageFilter,
     ) -> Result<UsageInsights, AdminError>;
+    async fn usage_metric(
+        &self,
+        range: TimeRange,
+        filter: UsageFilter,
+        metric: UsageInsightMetric,
+    ) -> Result<UsageInsight, AdminError>;
     async fn diagnostics(
         &self,
         range: TimeRange,
@@ -84,6 +95,7 @@ pub(crate) struct DefaultObservabilityService {
     settings: Arc<dyn SettingsStore>,
     providers: ProviderAdminRegistry,
     system: Arc<dyn super::system::SystemService>,
+    upstream_info: Option<Arc<dyn crate::ports::peer::PeerUpstreamService>>,
 }
 
 impl DefaultObservabilityService {
@@ -95,6 +107,7 @@ impl DefaultObservabilityService {
         providers: ProviderAdminRegistry,
         timezone: gateway_core::time::DeploymentTimeZone,
         system: Arc<dyn super::system::SystemService>,
+        upstream_info: Option<Arc<dyn crate::ports::peer::PeerUpstreamService>>,
     ) -> Self {
         Self {
             timezone,
@@ -103,6 +116,7 @@ impl DefaultObservabilityService {
             settings,
             providers,
             system,
+            upstream_info,
         }
     }
 
@@ -120,7 +134,8 @@ impl DefaultObservabilityService {
         )
         .map_err(|error| map_store_error(error, "dashboard"))?;
         let runtime_slots = observation.runtime_slots;
-        self.enrich_list_records(&mut observation.recent_requests);
+        self.enrich_list_records(&mut observation.recent_requests)
+            .await;
         self.enrich_dashboard_quotas(&mut observation.account_usage)
             .await;
         for account in &mut observation.account_usage {
@@ -233,6 +248,7 @@ impl ObservabilityService for DefaultObservabilityService {
                 range,
                 UsageFilter::default(),
                 Granularity::for_range(range),
+                false,
             )
             .await
             .map_err(|error| map_store_error(error, "dashboard trend"))?;
@@ -245,7 +261,7 @@ impl ObservabilityService for DefaultObservabilityService {
             .list_usage_records(query)
             .await
             .map_err(|error| map_store_error(error, "usage records"))?;
-        self.enrich_list_records(&mut page.items);
+        self.enrich_list_records(&mut page.items).await;
         Ok(page)
     }
 
@@ -267,17 +283,17 @@ impl ObservabilityService for DefaultObservabilityService {
         range: TimeRange,
         filter: UsageFilter,
     ) -> Result<UsageSummary, AdminError> {
-        let overview = self
+        let observation = self
             .store
             .usage_summary(range, filter)
             .await
             .map_err(|error| map_store_error(error, "usage summary"))?;
         let average_latency_ms = average(
-            overview.requests.latency_sum_ms,
-            overview.requests.latency_count,
+            observation.requests.latency_sum_ms,
+            observation.requests.latency_count,
         );
         Ok(UsageSummary {
-            overview,
+            observation,
             average_latency_ms,
         })
     }
@@ -290,21 +306,25 @@ impl ObservabilityService for DefaultObservabilityService {
         let granularity = Granularity::for_range(range);
         let observation = self
             .store
-            .usage_insights_observation(range, filter, granularity)
+            .usage_insights_observation(range, filter, granularity, true)
             .await
             .map_err(|error| map_store_error(error, "usage insights"))?;
-        let mut standard_costs = UsageCostScenarios::default();
-        for point in observation.costs {
-            if let Some(amount) = point.standard_amount {
-                standard_costs.standard.add(point.bucket_start, amount)?;
-            }
-            if let Some(amount) = point.no_cache_amount {
-                standard_costs.no_cache.add(point.bucket_start, amount)?;
-            }
-        }
-        let overview = observation.overview;
-        let trend = observation.trend;
-        build_usage_insights(overview, trend, standard_costs)
+        insights_from_observation(observation)
+    }
+
+    async fn usage_metric(
+        &self,
+        range: TimeRange,
+        filter: UsageFilter,
+        metric: UsageInsightMetric,
+    ) -> Result<UsageInsight, AdminError> {
+        let observation = self
+            .store
+            .usage_metric_observation(range, filter, Granularity::for_range(range), metric)
+            .await
+            .map_err(|error| map_store_error(error, "usage metric"))?;
+        let insights = insights_from_observation(observation)?;
+        Ok(select_usage_metric(insights, metric))
     }
 
     async fn diagnostics(
@@ -318,6 +338,12 @@ impl ObservabilityService for DefaultObservabilityService {
             .usage_diagnostics(range, filter, dimension, 100)
             .await
             .map_err(|error| map_store_error(error, "usage diagnostics"))?;
+        let peers = if dimension == DiagnosticDimension::Account {
+            self.current_upstream_peers(observation.items.iter().map(|item| item.key.as_str()))
+                .await
+        } else {
+            HashMap::new()
+        };
         let items = observation
             .items
             .into_iter()
@@ -327,8 +353,10 @@ impl ObservabilityService for DefaultObservabilityService {
                     rate_or_zero(item.non_completion_count, item.request_count);
                 let retry_rate = rate_or_zero(item.retried_request_count, item.request_count);
                 DiagnosticsItem {
+                    account_upstream_peer: peers.get(&item.key).copied(),
                     key: item.key,
                     name: item.name,
+                    account_authentication_kind: item.account_authentication_kind,
                     account_plan_type_display: item.account_provider_kind.as_deref().and_then(
                         |provider| {
                             self.providers
@@ -381,10 +409,153 @@ impl ObservabilityService for DefaultObservabilityService {
     }
 }
 
+fn insights_from_observation(
+    observation: UsageInsightsObservation,
+) -> Result<UsageInsights, AdminError> {
+    let mut standard_costs = UsageCostScenarios::default();
+    for point in observation.costs {
+        if let Some(amount) = point.standard_amount {
+            standard_costs.standard.add(point.bucket_start, amount)?;
+        }
+        if let Some(amount) = point.no_cache_amount {
+            standard_costs.no_cache.add(point.bucket_start, amount)?;
+        }
+    }
+    let overview = observation.overview;
+    let trend = observation.trend;
+    build_usage_insights(overview, trend, standard_costs, observation.concurrency)
+}
+
+fn select_usage_metric(insights: UsageInsights, metric: UsageInsightMetric) -> UsageInsight {
+    let activity = insights
+        .health
+        .points
+        .iter()
+        .map(|point| (point.bucket_start, point.total_requests))
+        .collect::<BTreeMap<_, _>>();
+    let data = match metric {
+        UsageInsightMetric::Health => UsageInsightData::Health(insights.health),
+        UsageInsightMetric::Latency => UsageInsightData::Latency(metric_series(
+            insights.performance.latency_percentiles,
+            insights
+                .performance
+                .points
+                .into_iter()
+                .map(|point| (point.bucket_start, point.latency_percentiles)),
+            &activity,
+        )),
+        UsageInsightMetric::FirstToken => UsageInsightData::FirstToken(metric_series(
+            insights.performance.first_token_latency_percentiles,
+            insights
+                .performance
+                .points
+                .into_iter()
+                .map(|point| (point.bucket_start, point.first_token_latency_percentiles)),
+            &activity,
+        )),
+        UsageInsightMetric::Throughput => UsageInsightData::Throughput(metric_series(
+            UsageThroughputPercentiles {
+                p10: insights.performance.output_throughput_p10,
+                p50: insights.performance.output_throughput_p50,
+                p90: insights.performance.output_throughput_p90,
+            },
+            insights.performance.points.into_iter().map(|point| {
+                (
+                    point.bucket_start,
+                    UsageThroughputPercentiles {
+                        p10: point.output_throughput_p10,
+                        p50: point.output_throughput_p50,
+                        p90: point.output_throughput_p90,
+                    },
+                )
+            }),
+            &activity,
+        )),
+        UsageInsightMetric::Load => UsageInsightData::Load(metric_series(
+            insights.performance.load,
+            insights
+                .performance
+                .points
+                .into_iter()
+                .map(|point| (point.bucket_start, point.load)),
+            &activity,
+        )),
+        UsageInsightMetric::Cost => UsageInsightData::Cost(metric_series(
+            cost_summary(&insights.cost),
+            insights.cost.points.into_iter().map(|point| {
+                (
+                    point.bucket_start,
+                    UsageCostComparison {
+                        estimated_cost: point.estimated_cost,
+                        no_cache_cost: point.no_cache_cost,
+                    },
+                )
+            }),
+            &activity,
+        )),
+        UsageInsightMetric::Savings => UsageInsightData::Savings(metric_series(
+            cost_summary(&insights.cost),
+            insights
+                .cost
+                .points
+                .into_iter()
+                .map(|point| (point.bucket_start, point.cache_savings)),
+            &activity,
+        )),
+        UsageInsightMetric::Cache => UsageInsightData::Cache(metric_series(
+            cost_summary(&insights.cost),
+            insights.cost.points.into_iter().map(|point| {
+                (
+                    point.bucket_start,
+                    UsageCacheEfficiency {
+                        input_tokens: point.input_tokens,
+                        cached_token_rate: point.cached_token_rate,
+                        cache_hit_request_rate: point.cache_hit_request_rate,
+                    },
+                )
+            }),
+            &activity,
+        )),
+    };
+    UsageInsight {
+        analytics: insights.analytics,
+        granularity: insights.granularity,
+        data,
+    }
+}
+
+fn cost_summary(cost: &UsageInsightsCost) -> UsageCostSummary {
+    UsageCostSummary {
+        estimated_cost: cost.estimated_cost.clone(),
+        cache_savings: cost.cache_savings.clone(),
+        tier_premium: cost.tier_premium.clone(),
+        cost_per_successful_request: cost.cost_per_successful_request.clone(),
+        coverage: cost.coverage.clone(),
+    }
+}
+
+fn metric_series<S, P>(
+    summary: S,
+    points: impl Iterator<Item = (DateTime<Utc>, P)>,
+    activity: &BTreeMap<DateTime<Utc>, u64>,
+) -> UsageMetricSeries<S, P> {
+    UsageMetricSeries {
+        summary,
+        points: points
+            .map(|(bucket_start, value)| UsageMetricPoint {
+                bucket_start,
+                request_count: activity.get(&bucket_start).copied().unwrap_or_default(),
+                value,
+            })
+            .collect(),
+    }
+}
+
 fn build_usage_insights(
     overview: UsageOverview,
     trend: Vec<RequestMetricPoint>,
     standard_costs: UsageCostScenarios,
+    concurrency: Vec<UsageConcurrencyPoint>,
 ) -> Result<UsageInsights, AdminError> {
     let granularity = trend.first().map_or(
         crate::model::observability::Granularity::FifteenMinutes,
@@ -432,49 +603,69 @@ fn build_usage_insights(
             })
             .collect(),
     };
+    let concurrency_by_bucket = concurrency
+        .iter()
+        .map(|point| (point.bucket_start, point))
+        .collect::<BTreeMap<_, _>>();
+    let mut weighted_concurrency_micros = 0.0;
+    let mut effective_micros = 0_i64;
+    for (index, point) in concurrency.iter().enumerate() {
+        let start = point.bucket_start.max(overview.range.start);
+        let end = concurrency
+            .get(index + 1)
+            .map_or(overview.range.end, |next| next.bucket_start)
+            .min(overview.range.end);
+        let micros = (end - start).num_microseconds().unwrap_or(0).max(0);
+        effective_micros = effective_micros.saturating_add(micros);
+        weighted_concurrency_micros += point.average_concurrency * micros as f64;
+    }
+    let average_concurrency = if effective_micros > 0 {
+        weighted_concurrency_micros / effective_micros as f64
+    } else {
+        0.0
+    };
+    let peak_concurrency = concurrency
+        .iter()
+        .map(|point| point.peak_concurrency)
+        .max()
+        .unwrap_or(0);
     let performance = UsageInsightsPerformance {
         latency_percentiles: requests.latency_percentiles,
         first_token_latency_percentiles: requests.first_token_latency_percentiles,
-        latency_coverage: rate_or_zero(requests.latency_count, requests.request_count),
-        first_token_coverage: rate_or_zero(
-            requests.first_token_latency_count,
-            requests.request_count,
-        ),
-        admission_decision_percentiles: requests.admission_decision_percentiles,
-        account_selection_wait_percentiles: requests.account_selection_wait_percentiles,
-        admission_decision_coverage: rate_or_zero(
-            requests.admission_decision_count,
-            requests.request_count,
-        ),
-        account_selection_wait_coverage: rate_or_zero(
-            requests.account_selection_wait_count,
-            requests.request_count,
-        ),
         output_throughput_p10: requests.output_throughput_p10,
         output_throughput_p50: requests.output_throughput_p50,
         output_throughput_p90: requests.output_throughput_p90,
-        capacity_utilization_avg_basis_points: requests.capacity_utilization_avg_basis_points,
-        capacity_utilization_p95_basis_points: requests.capacity_utilization_p95_basis_points,
-        capacity_coverage: rate_or_zero(requests.capacity_sample_count, requests.request_count),
+        load: UsageInsightsLoad {
+            average_concurrency,
+            peak_concurrency,
+            admission_decision_p95_ms: requests.admission_decision_percentiles.p95_ms,
+            account_selection_wait_p95_ms: requests.account_selection_wait_percentiles.p95_ms,
+        },
         points: trend
             .iter()
-            .map(|point| UsageInsightsPerformancePoint {
-                bucket_start: point.bucket_start,
-                latency_percentiles: point.metrics.latency_percentiles,
-                first_token_latency_percentiles: point.metrics.first_token_latency_percentiles,
-                admission_decision_percentiles: point.metrics.admission_decision_percentiles,
-                account_selection_wait_percentiles: point
-                    .metrics
-                    .account_selection_wait_percentiles,
-                output_throughput_p10: point.metrics.output_throughput_p10,
-                output_throughput_p50: point.metrics.output_throughput_p50,
-                output_throughput_p90: point.metrics.output_throughput_p90,
-                capacity_utilization_avg_basis_points: point
-                    .metrics
-                    .capacity_utilization_avg_basis_points,
-                capacity_utilization_p95_basis_points: point
-                    .metrics
-                    .capacity_utilization_p95_basis_points,
+            .map(|point| {
+                let concurrency = concurrency_by_bucket.get(&point.bucket_start);
+                UsageInsightsPerformancePoint {
+                    bucket_start: point.bucket_start,
+                    latency_percentiles: point.metrics.latency_percentiles,
+                    first_token_latency_percentiles: point.metrics.first_token_latency_percentiles,
+                    output_throughput_p10: point.metrics.output_throughput_p10,
+                    output_throughput_p50: point.metrics.output_throughput_p50,
+                    output_throughput_p90: point.metrics.output_throughput_p90,
+                    load: UsageInsightsLoad {
+                        average_concurrency: concurrency
+                            .map_or(0.0, |point| point.average_concurrency),
+                        peak_concurrency: concurrency.map_or(0, |point| point.peak_concurrency),
+                        admission_decision_p95_ms: point
+                            .metrics
+                            .admission_decision_percentiles
+                            .p95_ms,
+                        account_selection_wait_p95_ms: point
+                            .metrics
+                            .account_selection_wait_percentiles
+                            .p95_ms,
+                    },
+                }
             })
             .collect(),
     };
@@ -730,6 +921,29 @@ fn usd_cost(costs: &[CurrencyCost]) -> Option<DecimalAmount> {
 }
 
 impl DefaultObservabilityService {
+    async fn current_upstream_peers<'a>(
+        &self,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> HashMap<String, bool> {
+        let Some(peer) = self.upstream_info.as_deref() else {
+            return HashMap::new();
+        };
+        let ids = ids
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        // 同一页重复账号只读取一次摘要，单个账号不存在或读取失败不阻断历史记录
+        futures::stream::iter(ids)
+            .map(|id: String| async move {
+                let account_id = ProviderAccountId::new(id.clone()).ok()?;
+                let upstream = peer.read_summary(&account_id).await.ok()??.upstream?;
+                Some((id, upstream.discovered && upstream.observed_at.is_some()))
+            })
+            .buffer_unordered(8)
+            .filter_map(|value| async move { value })
+            .collect()
+            .await
+    }
+
     async fn enrich_dashboard_quotas(&self, accounts: &mut [DashboardAccountUsage]) {
         if accounts.is_empty() {
             return;
@@ -754,6 +968,7 @@ impl DefaultObservabilityService {
             .map(|usage| (usage.account_id.clone(), usage))
             .collect::<HashMap<_, _>>();
         let providers = self.providers.clone();
+        let peer = self.upstream_info.as_deref();
         let quota_reads = accounts.iter().map(|account| {
             let rolling_usage = rolling_usage.remove(&account.account_id);
             let account_id = ProviderAccountId::new(account.account_id.clone()).ok();
@@ -764,6 +979,11 @@ impl DefaultObservabilityService {
                 let (Some(account_id), Some(provider)) = (account_id, provider) else {
                     return None;
                 };
+                if let Some(peer) = peer
+                    && let Ok(Some(quota)) = peer.read_summary(&account_id).await
+                {
+                    return Some(quota);
+                }
                 provider
                     .quota(ProviderQuotaRequest {
                         account_id,
@@ -781,14 +1001,29 @@ impl DefaultObservabilityService {
                 quota.apply_limit_reached_display();
                 account.quota_used_percent = quota.representative_used_percent();
                 account.quota_window = quota.representative_window().cloned();
+                account.upstream = quota.upstream;
             }
         }
     }
 
     /// 补充当前套餐展示名称，逐条尽力把可校验的总额升级为完整分解；单条脏数据（非法 Provider kind、
     /// 不支持的来源或费用规则失败）只保留该条已存的总额，不影响整页返回
-    fn enrich_list_records(&self, records: &mut [crate::model::observability::UsageListRecord]) {
+    async fn enrich_list_records(
+        &self,
+        records: &mut [crate::model::observability::UsageListRecord],
+    ) {
+        let peers = self
+            .current_upstream_peers(
+                records
+                    .iter()
+                    .filter_map(|record| record.provider_account_ref.as_deref()),
+            )
+            .await;
         for record in records {
+            record.provider_account_upstream_peer = record
+                .provider_account_ref
+                .as_ref()
+                .and_then(|id| peers.get(id).copied());
             record.provider_account_plan_type_display =
                 record.provider_kind.as_deref().and_then(|provider| {
                     self.providers

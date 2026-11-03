@@ -33,11 +33,11 @@ use gateway_store::postgres::{
 
 use super::TestDatabase;
 
-fn key_id(key: &str) -> ClientApiKeyId {
+pub(super) fn key_id(key: &str) -> ClientApiKeyId {
     ClientApiKeyId::new(key).unwrap()
 }
 
-fn charge(key: &str, request: &str, amount: &str) -> ClientBudgetCharge {
+pub(super) fn charge(key: &str, request: &str, amount: &str) -> ClientBudgetCharge {
     ClientBudgetCharge {
         key_id: key_id(key),
         request_id: ModelRequestId::new(format!("req_{request}")).unwrap(),
@@ -46,7 +46,7 @@ fn charge(key: &str, request: &str, amount: &str) -> ClientBudgetCharge {
     }
 }
 
-async fn seed(database: &TestDatabase, key: &str, daily: &str, weekly: &str) {
+pub(super) async fn seed(database: &TestDatabase, key: &str, daily: &str, weekly: &str) {
     sqlx::query(
         "insert into client_api_keys (id, name, key, daily_limit_usd, weekly_limit_usd, created_at, updated_at)
         values ($1, $1, $2, $3::text::numeric, $4::text::numeric, now(), now())",
@@ -60,7 +60,7 @@ async fn seed(database: &TestDatabase, key: &str, daily: &str, weekly: &str) {
     .unwrap();
 }
 
-async fn status(database: &TestDatabase, key: &str) -> ClientBudgetStatus {
+pub(super) async fn status(database: &TestDatabase, key: &str) -> ClientBudgetStatus {
     PgClientApiKeyRepository::new(database.pool.clone())
         .get_client_api_key(key)
         .await
@@ -69,7 +69,7 @@ async fn status(database: &TestDatabase, key: &str) -> ClientBudgetStatus {
         .budget
 }
 
-fn context() -> MutationContext {
+pub(super) fn context() -> MutationContext {
     MutationContext {
         actor: MutationActor::System,
         request_id: "budget-test".to_owned(),
@@ -589,7 +589,7 @@ async fn budgets_settle_exactly_once_and_enforce_each_threshold_across_store_ins
     assert_eq!(day.daily_used_usd.canonical(), "0.3");
     assert_eq!(day.weekly_used_usd.canonical(), "0.3");
     let day_error = second.admit(key_id("day")).await.unwrap_err();
-    assert_eq!(day_error.kind(), GatewayErrorKind::RateLimited);
+    assert_eq!(day_error.kind(), GatewayErrorKind::BudgetExhausted);
     assert_eq!(
         day_error.client_error_code(),
         Some("key_daily_budget_exceeded")
@@ -687,7 +687,7 @@ async fn zero_cost_and_interrupted_requests_never_block_limited_keys() {
 }
 
 #[tokio::test]
-async fn transient_settlement_failure_rolls_back_and_retries_exact_cost_before_admission() {
+async fn settlement_failure_rolls_back_and_explicit_retry_is_idempotent() {
     let Some(database) = TestDatabase::create("budgets_retry").await else {
         return;
     };
@@ -721,6 +721,7 @@ async fn transient_settlement_failure_rolls_back_and_retries_exact_cost_before_a
         .execute(&database.pool)
         .await
         .unwrap();
+    store.settle(charge("key", "retry", "1.25")).await.unwrap();
     let error = store.admit(key_id("key")).await.unwrap_err();
     assert_eq!(error.client_error_code(), Some("key_daily_budget_exceeded"));
     store.settle(charge("key", "retry", "1.25")).await.unwrap();
@@ -745,6 +746,7 @@ async fn budget_updates_preserve_omitted_limits_and_do_not_clear_usage() {
         .await
         .unwrap();
     let update = UpdateClientKey {
+        peer_sharing: None,
         request_profile_override_updates: Default::default(),
         id: ClientApiKeyId::new("key").unwrap(),
         name: "key".to_owned(),
@@ -764,6 +766,7 @@ async fn budget_updates_preserve_omitted_limits_and_do_not_clear_usage() {
     admin
         .update_client_key(
             UpdateClientKey {
+                peer_sharing: None,
                 request_profile_override_updates: Default::default(),
                 daily_limit_usd: None,
                 weekly_limit_usd: None,
@@ -788,6 +791,7 @@ async fn budget_updates_preserve_omitted_limits_and_do_not_clear_usage() {
     admin
         .update_client_key(
             UpdateClientKey {
+                peer_sharing: None,
                 request_profile_override_updates: Default::default(),
                 daily_limit_usd: Some("0".parse().unwrap()),
                 weekly_limit_usd: None,
@@ -1156,7 +1160,7 @@ async fn plugin_budget_limits_preserve_consumption_and_unrelated_configuration_a
     );
     assert_eq!(
         budgets.admit(key_id("key")).await.unwrap_err().kind(),
-        GatewayErrorKind::RateLimited
+        GatewayErrorKind::BudgetExhausted
     );
     assert!(
         store

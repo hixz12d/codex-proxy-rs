@@ -23,7 +23,7 @@ fn source_manifest() -> Manifest {
         "contributes": {
             "middleware": {
                 "id": "9acme.request-tags.tagRequest",
-                "version": 5,
+                "version": 6,
                 "stages": ["request"],
                 "inputFormats": ["openai"],
                 "outputFormats": ["openai"]
@@ -96,7 +96,7 @@ fn author_manifest_fills_default_ids_versions_and_fixed_stages() {
         "main": "bin/worker",
         "runtime": "trustedProcess",
         "contributes": {
-            "middleware": {"version": 5, "stages": ["attempt"]},
+            "middleware": {"version": 6, "stages": ["attempt"]},
             "management": {"version": 2}
         }
     });
@@ -105,7 +105,7 @@ fn author_manifest_fills_default_ids_versions_and_fixed_stages() {
     let management = &manifest.contributes[&Capability::Management];
 
     assert_eq!(middleware.id, "9acme.request-tags.middleware");
-    assert_eq!(middleware.version, 5);
+    assert_eq!(middleware.version, 6);
     assert_eq!(middleware.stages, [Stage::Attempt]);
     assert_eq!(management.id, "9acme.request-tags.management");
     assert_eq!(management.version, 2);
@@ -133,10 +133,11 @@ fn installation_checks_protocol_engine_and_target() {
 #[test]
 fn capability_contract_versions_are_checked_independently_of_rpc_version() {
     for (capability, stage, supported, needs_formats) in [
-        (Capability::Middleware, Stage::Request, 5, true),
+        (Capability::Middleware, Stage::Request, 6, true),
         (Capability::Management, Stage::Management, 2, false),
-        (Capability::UpstreamAdapter, Stage::Upstream, 4, true),
+        (Capability::UpstreamAdapter, Stage::Upstream, 5, true),
         (Capability::Scheduler, Stage::Scheduling, 3, false),
+        (Capability::ModelCatalog, Stage::Registration, 2, false),
     ] {
         for mut manifest in [source_manifest(), packaged_manifest()] {
             let formats = if needs_formats {
@@ -281,14 +282,22 @@ fn icon_wire_is_a_path_or_exact_light_dark_object() {
 #[test]
 fn contribution_ids_are_owned_unique_and_stage_bounded() {
     let mut manifest = source_manifest();
-    let middleware = manifest
-        .contributes
-        .get(&Capability::Middleware)
-        .unwrap()
-        .clone();
+    manifest.contributes.insert(
+        Capability::Scheduler,
+        ContributionDeclaration {
+            id: "9acme.request-tags.scheduler".into(),
+            version: 3,
+            stages: vec![Stage::Scheduling],
+            input_formats: Vec::new(),
+            output_formats: Vec::new(),
+        },
+    );
+    assert!(manifest.validate().is_ok());
     manifest
         .contributes
-        .insert(Capability::Scheduler, middleware);
+        .get_mut(&Capability::Scheduler)
+        .unwrap()
+        .id = manifest.contributes[&Capability::Middleware].id.clone();
     assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
 
     let mut manifest = source_manifest();
@@ -315,13 +324,19 @@ fn installed_manifest_rejects_non_middleware_stage_drift() {
         Capability::Management,
         ContributionDeclaration {
             id: "9acme.request-tags.management".into(),
-            version: 1,
-            stages: vec![Stage::Registration],
+            version: 2,
+            stages: vec![Stage::Management],
             input_formats: Vec::new(),
             output_formats: Vec::new(),
         },
     );
 
+    assert!(manifest.validate().is_ok());
+    manifest
+        .contributes
+        .get_mut(&Capability::Management)
+        .unwrap()
+        .stages = vec![Stage::Registration];
     assert_eq!(manifest.validate(), Err(ManifestError::Invalid));
 }
 
@@ -377,7 +392,7 @@ fn manifest_round_trips_public_fields_and_rejects_unknown_fields() {
 #[test]
 fn contributes_rejects_duplicate_capability_keys_in_direct_json_parsing() {
     let declaration = r#"{
-        "id":"test.example.middleware","version":5,"stages":["request"],
+        "id":"test.example.middleware","version":6,"stages":["request"],
         "inputFormats":["openai"],"outputFormats":["openai"]
     }"#;
     let manifest = format!(
@@ -412,7 +427,7 @@ fn contributes_rejects_duplicate_capability_keys_in_direct_json_parsing() {
 fn contribution_declaration_uses_camel_case_description_fields() {
     let declaration = ContributionDeclaration {
         id: "test.example.middleware".into(),
-        version: 5,
+        version: 6,
         stages: vec![Stage::Request],
         input_formats: vec!["openai".into()],
         output_formats: vec!["openai".into()],
@@ -421,7 +436,7 @@ fn contribution_declaration_uses_camel_case_description_fields() {
         serde_json::to_value(declaration).unwrap(),
         json!({
             "id":"test.example.middleware",
-            "version":5,
+            "version":6,
             "stages":["request"],
             "inputFormats":["openai"],
             "outputFormats":["openai"]

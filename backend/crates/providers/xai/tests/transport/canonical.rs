@@ -50,23 +50,10 @@ fn decoder_should_bill_the_sent_model_independently_of_the_response_model() {
             provider_cost_ticks(&facts),
             reported_cost.filter(|ticks| *ticks > 0)
         );
-        assert_eq!(decoder.response_model(), returned);
         assert!(facts.iter().any(|event| matches!(
             event,
             GatewayEvent::Completed(meta) if meta.model() == Some(returned.unwrap_or(sent))
         )));
-    }
-}
-
-#[test]
-fn response_model_observation_preserves_raw_model_and_missing_values() {
-    for model in [None, Some("grok-4.6-build")] {
-        let mut decoder = GrokCanonicalDecoder::new("grok-4.6");
-        let body = serde_json::json!({"type":"response.created","response":{"id":"resp_model","model":model}});
-        decoder
-            .push(format!("data: {body}\n\n").as_bytes())
-            .expect("decode created");
-        assert_eq!(decoder.response_model(), model);
     }
 }
 
@@ -653,7 +640,7 @@ fn decoder_should_fail_closed_for_non_integer_provider_cost() {
 #[test]
 fn decoder_should_tolerate_content_field_error_without_breaking_stream() {
     // 内容事件的字段校验失败（此处空 delta）不应打断已开始的客户端流
-    // 旧行为在此断整条流；修复后跳过该事件的 canonical 提取、wire 原样转发，并继续解出终态
+    // 跳过该事件的 canonical 提取、wire 原样转发，并继续解出终态
     let body = concat!(
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a3\",\"model\":\"grok-code-test\"}}\n\n",
@@ -1557,36 +1544,52 @@ fn decoder_should_classify_incomplete_reasons_and_preserve_native_wire() {
 }
 
 #[test]
-fn decoder_should_classify_failed_event_without_retaining_body() {
-    let body = concat!(
-        "event: response.created\n",
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
-        "event: response.failed\n",
-        "data: {\"type\":\"response.failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"type\":\"server_error\",\"message\":\"secret\"}}\n\n",
-    );
-    let error = GrokCanonicalDecoder::new("fallback")
-        .push(body.as_bytes())
-        .expect_err("failed response must surface");
+fn decoder_should_preserve_structured_failure_fields_and_hide_raw_debug() {
+    for (event, expected_error_type) in [
+        (
+            serde_json::json!({"type":"response.failed","error":{"code":"rate_limit_exceeded","type":"server_error","message":"secret"}}),
+            Some("server_error"),
+        ),
+        (
+            serde_json::json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","type":"provider_specific_error","message":"secret"}}}),
+            Some("provider_specific_error"),
+        ),
+        (
+            serde_json::json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"secret"}}}),
+            None,
+        ),
+        (
+            serde_json::json!({"type":"error","code":"rate_limit_exceeded","message":"secret"}),
+            None,
+        ),
+    ] {
+        let body = format!(
+            "event: {}\ndata: {event}\n\n",
+            event["type"].as_str().unwrap()
+        );
+        let error = GrokCanonicalDecoder::new("fallback")
+            .push(body.as_bytes())
+            .expect_err("failed response must surface");
 
-    assert_eq!(
-        error.kind(),
-        gateway_core::error::ProviderErrorKind::RateLimited
-    );
-    assert_eq!(
-        error.upstream_code().map(|code| code.as_str()),
-        Some("rate_limit_exceeded")
-    );
-    let visible = error
-        .client_visible_upstream_error()
-        .expect("structured upstream message is client-visible");
-    assert_eq!(visible.message(), "secret");
-    assert_eq!(visible.code(), Some("rate_limit_exceeded"));
-    assert_eq!(visible.error_type(), Some("server_error"));
-    let raw: serde_json::Value =
-        serde_json::from_str(error.raw_upstream_error().unwrap().as_str()).unwrap();
-    assert_eq!(raw["error"]["message"], "secret");
-    assert_eq!(raw["error"]["code"], "rate_limit_exceeded");
-    assert!(!format!("{error:?}").contains("secret"));
+        assert_eq!(
+            error.kind(),
+            gateway_core::error::ProviderErrorKind::RateLimited
+        );
+        assert_eq!(
+            error.upstream_code().map(|code| code.as_str()),
+            Some("rate_limit_exceeded")
+        );
+        let visible = error
+            .client_visible_upstream_error()
+            .expect("structured upstream message is client-visible");
+        assert_eq!(visible.message(), "secret");
+        assert_eq!(visible.code(), Some("rate_limit_exceeded"));
+        assert_eq!(visible.error_type(), expected_error_type);
+        let raw: serde_json::Value =
+            serde_json::from_str(error.raw_upstream_error().unwrap().as_str()).unwrap();
+        assert_eq!(raw, event);
+        assert!(!format!("{error:?}").contains("secret"));
+    }
 }
 
 #[test]
@@ -1628,6 +1631,18 @@ fn decoder_should_scrub_account_fingerprints_from_failure_messages() {
         visible.message(),
         "Too many requests for team [redacted] and model grok-4. Requests per Second (actual/limit): 2/2"
     );
+    let fields = error
+        .upstream_failure_fields()
+        .expect("original upstream fields");
+    assert_eq!(fields.status, None);
+    assert_eq!(fields.error_type, None);
+    assert!(
+        fields
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("00000000-0000-0000-0000-000000000013")
+    );
     assert!(!format!("{error:?}").contains("00000000-0000"));
 }
 
@@ -1641,6 +1656,7 @@ fn decoder_should_omit_client_details_for_unstructured_failures() {
         .push(body.as_bytes())
         .expect_err("failed response must surface");
 
+    assert_eq!(error.upstream_failure_fields().unwrap().message, None);
     assert!(error.client_visible_upstream_error().is_none());
     assert_eq!(
         error.upstream_code().map(|code| code.as_str()),

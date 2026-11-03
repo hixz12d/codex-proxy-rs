@@ -41,15 +41,11 @@ pub(crate) fn display_rate(value: f64) -> String {
     }
 }
 
-fn basis_points_rate(value: u64) -> f64 {
-    value as f64 / 10_000.0
-}
-
 pub(crate) fn outcome_name(outcome: &domain::RequestOutcome) -> &str {
     outcome.as_str()
 }
 
-pub(crate) fn request_metrics_view(metrics: &domain::RequestMetrics) -> RequestMetricsView {
+fn request_summary_metrics_view(metrics: &domain::RequestSummaryMetrics) -> RequestMetricsView {
     RequestMetricsView {
         request_count: metrics.request_count,
         success_count: metrics.success_count,
@@ -275,11 +271,11 @@ pub(crate) fn usage_list_record_view(
         account_notes: record.provider_account_notes,
         account_plan_type: record.provider_account_plan_type,
         account_plan_type_display: record.provider_account_plan_type_display,
+        account_upstream_peer: record.provider_account_upstream_peer,
         route: record.endpoint,
         model,
         requested_model: record.requested_model_id,
         upstream_model: record.upstream_model_id,
-        upstream_response_model: record.upstream_response_model,
         service_tier: record.service_tier,
         client_transport: record.client_transport,
         upstream_transport: record.upstream_transport,
@@ -377,7 +373,6 @@ pub(crate) fn usage_record_view(
         model,
         requested_model: record.requested_model_id,
         upstream_model: record.upstream_model_id,
-        upstream_response_model: record.upstream_response_model,
         service_tier: record.service_tier,
         status_code,
         client_transport: record.client_transport,
@@ -686,20 +681,10 @@ pub(crate) fn trend_point_view(
         tokens_value: point.metrics.total_tokens,
         errors: format_compact_number(point.service_failure_count),
         errors_value: point.service_failure_count,
-        latency: display_duration(point.average_latency_ms),
         latency_value: point.average_latency_ms,
-        max_latency: display_duration(point.metrics.max_latency_ms),
-        max_latency_value: point.metrics.max_latency_ms,
-        min_latency: display_duration(point.metrics.min_latency_ms),
-        min_latency_value: point.metrics.min_latency_ms,
         success_rate: success_rate_value
             .map_or_else(|| "—".to_owned(), |value| format!("{value:.1}%")),
         success_rate_value,
-        first_token_p50_ms: point
-            .metrics
-            .first_token_latency_percentiles
-            .p50_ms
-            .map(|value| value.as_f64()),
         first_token_p95_ms: point
             .metrics
             .first_token_latency_percentiles
@@ -711,20 +696,6 @@ pub(crate) fn trend_point_view(
             .p95_ms
             .map(|value| value.as_f64()),
         output_throughput_p50: point.metrics.output_throughput_p50,
-        admission_decision_p95_ms: point
-            .metrics
-            .admission_decision_percentiles
-            .p95_ms
-            .map(|value| value.as_f64()),
-        account_selection_wait_p95_ms: point
-            .metrics
-            .account_selection_wait_percentiles
-            .p95_ms
-            .map(|value| value.as_f64()),
-        capacity_utilization: point
-            .metrics
-            .capacity_utilization_p95_basis_points
-            .map(basis_points_rate),
     }
 }
 
@@ -735,34 +706,34 @@ pub(crate) fn trend_summary_view(
     match kind {
         TrendKind::Usage => vec![
             TrendSummaryView {
-                label: "输入".to_owned(),
+                metric: TrendMetric::InputTokens,
                 value: format_compact_number(summary.input_tokens),
                 ratio: None,
             },
             TrendSummaryView {
-                label: "输出".to_owned(),
+                metric: TrendMetric::OutputTokens,
                 value: format_compact_number(summary.output_tokens),
                 ratio: None,
             },
             TrendSummaryView {
-                label: "缓存".to_owned(),
+                metric: TrendMetric::CachedInputTokens,
                 value: format_compact_number(summary.cached_input_tokens),
                 ratio: None,
             },
         ],
         TrendKind::Latency => vec![
             TrendSummaryView {
-                label: "首字 P95".to_owned(),
+                metric: TrendMetric::FirstTokenP95Ms,
                 value: display_duration_f64(summary.peak_first_token_p95_ms),
                 ratio: None,
             },
             TrendSummaryView {
-                label: "总耗时 P95".to_owned(),
+                metric: TrendMetric::LatencyP95Ms,
                 value: display_duration_f64(summary.peak_latency_p95_ms),
                 ratio: None,
             },
             TrendSummaryView {
-                label: "速率 P50".to_owned(),
+                metric: TrendMetric::OutputThroughputP50,
                 value: summary
                     .minimum_output_throughput_p50
                     .map_or_else(|| "—".to_owned(), |value| format!("{value} tok/s")),
@@ -771,19 +742,19 @@ pub(crate) fn trend_summary_view(
         ],
         TrendKind::Errors => vec![
             TrendSummaryView {
-                label: "错误数".to_owned(),
+                metric: TrendMetric::Errors,
                 value: format_compact_number(summary.service_failure_count),
                 ratio: None,
             },
             TrendSummaryView {
-                label: "成功率".to_owned(),
+                metric: TrendMetric::SuccessRate,
                 value: "—".to_owned(),
                 ratio: summary
                     .success_rate
                     .map(|value| format!("{:.1}%", value * 100.0)),
             },
             TrendSummaryView {
-                label: "总请求".to_owned(),
+                metric: TrendMetric::Requests,
                 value: format_compact_number(summary.request_count),
                 ratio: None,
             },
@@ -875,7 +846,7 @@ pub(crate) fn wire_profile_view(
             .attributes
             .into_iter()
             .map(|attribute| DashboardWireAttributeView {
-                label: attribute.label,
+                key: attribute.key,
                 value: attribute.value,
             })
             .collect(),
@@ -928,8 +899,10 @@ pub(crate) fn dashboard_view(
             .filter(|window| window.used_percent.is_none())
             .and_then(|window| window.local_usage.as_ref())
             .map(|usage| usage.request_count);
-        let (metric_label, metric_value) = match local_requests {
+        let (metric, metric_value_raw, metric_label, metric_value) = match local_requests {
             Some(count) => (
+                DashboardAccountMetric::Requests,
+                Some(count),
                 "次数".to_owned(),
                 if count > 0 {
                     format_compact_number(count)
@@ -938,6 +911,8 @@ pub(crate) fn dashboard_view(
                 },
             ),
             None => (
+                DashboardAccountMetric::Tokens,
+                credential.total_tokens,
                 "今日 Token".to_owned(),
                 credential
                     .total_tokens
@@ -945,6 +920,9 @@ pub(crate) fn dashboard_view(
             ),
         };
         account_usage_views.push(DashboardAccountUsageView {
+            upstream: credential.upstream.map(|info| {
+                crate::admin::accounts::upstream_info_view(info, chrono::Utc::now(), time)
+            }),
             id: credential.account_id.clone(),
             provider: credential.provider_kind.clone(),
             authentication_kind: credential.authentication_kind.clone(),
@@ -952,6 +930,7 @@ pub(crate) fn dashboard_view(
                 .email
                 .clone()
                 .unwrap_or_else(|| credential.name.clone()),
+            notes: credential.notes,
             plan_type: credential.plan_type.clone(),
             plan_type_display: credential
                 .plan_type_display
@@ -971,8 +950,14 @@ pub(crate) fn dashboard_view(
             usage_window: credential
                 .quota_window
                 .map(|window| crate::admin::accounts::quota_window_view(window, time)),
+            metric,
+            metric_value_raw,
             metric_label,
             metric_value,
+            last_used_at: credential.last_used_at,
+            last_used_relative: credential
+                .last_used_at
+                .map(|value| time.relative_view(value, range.end)),
             last_used: time.relative_optional(credential.last_used_at, range.end),
         });
     }
@@ -1050,7 +1035,7 @@ pub(crate) fn usage_summary_view(
     summary: domain::UsageSummary,
     time: crate::time::TimePresenter,
 ) -> UsageSummaryView {
-    let overview = summary.overview;
+    let overview = summary.observation;
     UsageSummaryView {
         analytics: analytics_view(overview.analytics, time),
         total_requests: format_compact_number(overview.requests.request_count),
@@ -1060,8 +1045,20 @@ pub(crate) fn usage_summary_view(
         cache_write_input_tokens: format_compact_number(overview.requests.cache_write_input_tokens),
         total_tokens: format_compact_number(overview.requests.total_tokens),
         average_latency_ms: display_duration(summary.average_latency_ms),
-        logical_requests: request_metrics_view(&overview.requests),
+        average_latency_ms_value: summary.average_latency_ms,
+        logical_requests: request_summary_metrics_view(&overview.requests),
         attempts: attempt_metrics_view(&overview.attempts),
+    }
+}
+
+fn overview_load_view(load: &domain::UsageInsightsLoad) -> OverviewLoadView {
+    OverviewLoadView {
+        average_concurrency: load.average_concurrency,
+        peak_concurrency: load.peak_concurrency,
+        admission_decision_p95_ms: load.admission_decision_p95_ms.map(|value| value.as_f64()),
+        account_selection_wait_p95_ms: load
+            .account_selection_wait_p95_ms
+            .map(|value| value.as_f64()),
     }
 }
 
@@ -1069,22 +1066,6 @@ pub(crate) fn usage_insights_view(
     insights: domain::UsageInsights,
     time: crate::time::TimePresenter,
 ) -> UsageInsightsOverviewView {
-    let health_points = insights
-        .health
-        .points
-        .iter()
-        .map(|point| OverviewHealthPointView {
-            bucket: point.bucket_start,
-            label: time.label(point.bucket_start, "%m-%d %H:%M"),
-            total_requests: point.total_requests,
-            success_requests: point.success_requests,
-            failed_requests: point.failed_requests,
-            cancelled_requests: point.cancelled_requests,
-            incomplete_requests: point.incomplete_requests,
-            caller_error_requests: point.caller_error_requests,
-            error_rate: point.error_rate,
-        })
-        .collect();
     let performance_points = insights
         .performance
         .points
@@ -1107,31 +1088,10 @@ pub(crate) fn usage_insights_view(
                 .first_token_latency_percentiles
                 .p99_ms
                 .map(|value| value.as_f64()),
-            admission_decision_p50_ms: point
-                .admission_decision_percentiles
-                .p50_ms
-                .map(|value| value.as_f64()),
-            admission_decision_p95_ms: point
-                .admission_decision_percentiles
-                .p95_ms
-                .map(|value| value.as_f64()),
-            account_selection_wait_p50_ms: point
-                .account_selection_wait_percentiles
-                .p50_ms
-                .map(|value| value.as_f64()),
-            account_selection_wait_p95_ms: point
-                .account_selection_wait_percentiles
-                .p95_ms
-                .map(|value| value.as_f64()),
             output_throughput_p10: point.output_throughput_p10,
             output_throughput_p50: point.output_throughput_p50,
             output_throughput_p90: point.output_throughput_p90,
-            capacity_utilization: point
-                .capacity_utilization_avg_basis_points
-                .map(basis_points_rate),
-            capacity_utilization_p95: point
-                .capacity_utilization_p95_basis_points
-                .map(basis_points_rate),
+            load: overview_load_view(&point.load),
         })
         .collect();
     let cost_points = insights
@@ -1156,19 +1116,7 @@ pub(crate) fn usage_insights_view(
     UsageInsightsOverviewView {
         analytics: analytics_view(insights.analytics, time),
         granularity: granularity_name(insights.granularity).to_owned(),
-        health: OverviewHealthView {
-            total_requests: insights.health.total_requests,
-            success_requests: insights.health.success_requests,
-            failed_requests: insights.health.failed_requests,
-            cancelled_requests: insights.health.cancelled_requests,
-            incomplete_requests: insights.health.incomplete_requests,
-            caller_error_requests: insights.health.caller_error_requests,
-            success_rate: insights.health.success_rate,
-            completion_rate: insights.health.completion_rate,
-            request_change_rate: None,
-            success_rate_change: None,
-            points: health_points,
-        },
+        health: overview_health_view(&insights.health, time),
         performance: OverviewPerformanceView {
             latency_p50_ms: insights
                 .performance
@@ -1200,42 +1148,10 @@ pub(crate) fn usage_insights_view(
                 .first_token_latency_percentiles
                 .p99_ms
                 .map(|value| value.as_f64()),
-            admission_decision_p50_ms: insights
-                .performance
-                .admission_decision_percentiles
-                .p50_ms
-                .map(|value| value.as_f64()),
-            admission_decision_p95_ms: insights
-                .performance
-                .admission_decision_percentiles
-                .p95_ms
-                .map(|value| value.as_f64()),
-            account_selection_wait_p50_ms: insights
-                .performance
-                .account_selection_wait_percentiles
-                .p50_ms
-                .map(|value| value.as_f64()),
-            account_selection_wait_p95_ms: insights
-                .performance
-                .account_selection_wait_percentiles
-                .p95_ms
-                .map(|value| value.as_f64()),
             output_throughput_p10: insights.performance.output_throughput_p10,
             output_throughput_p50: insights.performance.output_throughput_p50,
             output_throughput_p90: insights.performance.output_throughput_p90,
-            capacity_utilization: insights
-                .performance
-                .capacity_utilization_avg_basis_points
-                .map(basis_points_rate),
-            capacity_utilization_p95: insights
-                .performance
-                .capacity_utilization_p95_basis_points
-                .map(basis_points_rate),
-            latency_coverage: insights.performance.latency_coverage,
-            first_token_coverage: insights.performance.first_token_coverage,
-            admission_decision_coverage: insights.performance.admission_decision_coverage,
-            account_selection_wait_coverage: insights.performance.account_selection_wait_coverage,
-            capacity_coverage: insights.performance.capacity_coverage,
+            load: overview_load_view(&insights.performance.load),
             points: performance_points,
         },
         cost: OverviewCostView {
@@ -1296,6 +1212,116 @@ pub(crate) fn usage_insights_view(
     }
 }
 
+pub(crate) fn usage_metric_view(
+    insight: domain::UsageInsight,
+    time: crate::time::TimePresenter,
+) -> UsageMetricView {
+    use domain::UsageInsightData;
+    let data = match insight.data {
+        UsageInsightData::Health(health) => {
+            UsageMetricDataView::Health(overview_health_view(&health, time))
+        }
+        UsageInsightData::Latency(series) => UsageMetricDataView::Latency(metric_series_view(
+            series,
+            time,
+            metric_latency_view,
+            metric_latency_view,
+        )),
+        UsageInsightData::FirstToken(series) => UsageMetricDataView::FirstToken(
+            metric_series_view(series, time, metric_latency_view, metric_latency_view),
+        ),
+        UsageInsightData::Throughput(series) => UsageMetricDataView::Throughput(
+            metric_series_view(series, time, metric_throughput_view, metric_throughput_view),
+        ),
+        UsageInsightData::Load(series) => UsageMetricDataView::Load(metric_series_view(
+            series,
+            time,
+            |value| overview_load_view(&value),
+            |value| overview_load_view(&value),
+        )),
+        UsageInsightData::Cost(series) => UsageMetricDataView::Cost(metric_series_view(
+            series,
+            time,
+            metric_cost_summary_view,
+            |value| UsageCostComparisonView {
+                estimated_cost: value.estimated_cost.as_ref().map(ToString::to_string),
+                no_cache_cost: value.no_cache_cost.as_ref().map(ToString::to_string),
+            },
+        )),
+        UsageInsightData::Savings(series) => UsageMetricDataView::Savings(metric_series_view(
+            series,
+            time,
+            metric_cost_summary_view,
+            |value| value.as_ref().map(ToString::to_string),
+        )),
+        UsageInsightData::Cache(series) => UsageMetricDataView::Cache(metric_series_view(
+            series,
+            time,
+            metric_cost_summary_view,
+            |value| UsageCacheView {
+                input_tokens: value.input_tokens,
+                cached_token_rate: value.cached_token_rate,
+                cache_hit_request_rate: value.cache_hit_request_rate,
+            },
+        )),
+    };
+    UsageMetricView {
+        analytics: analytics_view(insight.analytics, time),
+        granularity: granularity_name(insight.granularity).to_owned(),
+        data,
+    }
+}
+
+fn metric_series_view<S, P, SV, PV>(
+    series: domain::UsageMetricSeries<S, P>,
+    time: crate::time::TimePresenter,
+    summary: impl FnOnce(S) -> SV,
+    point: impl Fn(P) -> PV,
+) -> UsageMetricSeriesView<SV, PV> {
+    UsageMetricSeriesView {
+        summary: summary(series.summary),
+        points: series
+            .points
+            .into_iter()
+            .map(|value| UsageMetricPointView {
+                bucket: value.bucket_start,
+                label: time.label(value.bucket_start, "%m-%d %H:%M"),
+                request_count: value.request_count,
+                value: point(value.value),
+            })
+            .collect(),
+    }
+}
+
+fn metric_latency_view(value: domain::LatencyPercentiles) -> UsageLatencyView {
+    UsageLatencyView {
+        p50_ms: value.p50_ms.map(|value| value.as_f64()),
+        p95_ms: value.p95_ms.map(|value| value.as_f64()),
+        p99_ms: value.p99_ms.map(|value| value.as_f64()),
+    }
+}
+
+fn metric_throughput_view(value: domain::UsageThroughputPercentiles) -> UsageThroughputView {
+    UsageThroughputView {
+        p10: value.p10,
+        p50: value.p50,
+        p90: value.p90,
+    }
+}
+
+fn metric_cost_summary_view(value: domain::UsageCostSummary) -> UsageCostSummaryView {
+    UsageCostSummaryView {
+        estimated_cost: value.estimated_cost.as_ref().map(ToString::to_string),
+        cache_savings: value.cache_savings.as_ref().map(ToString::to_string),
+        tier_premium: value.tier_premium.as_ref().map(ToString::to_string),
+        cost_per_successful_request: value
+            .cost_per_successful_request
+            .as_ref()
+            .map(ToString::to_string),
+        coverage: cost_coverage_view(&value.coverage),
+    }
+}
+
 pub(crate) fn granularity_name(granularity: domain::Granularity) -> &'static str {
     match granularity {
         domain::Granularity::FifteenMinutes => "15m",
@@ -1317,6 +1343,7 @@ pub(crate) fn diagnostics_view(
             .into_iter()
             .map(|item| DiagnosticItemView {
                 key: item.key,
+                authentication_kind: item.account_authentication_kind,
                 name: if item.name == "__none__" {
                     "未知".to_owned()
                 } else {
@@ -1325,6 +1352,7 @@ pub(crate) fn diagnostics_view(
                 request_count: item.request_count,
                 account_plan_type: item.account_plan_type,
                 account_plan_type_display: item.account_plan_type_display,
+                account_upstream_peer: item.account_upstream_peer,
                 success_count: item.success_count,
                 error_count: item.error_count,
                 error_rate: item.error_rate,
@@ -1380,5 +1408,39 @@ pub(crate) fn analytics_view(
         percentiles_approximate: metadata.percentiles_approximate,
         schema_version: metadata.schema_version,
         histogram_version: metadata.histogram_version,
+    }
+}
+
+fn overview_health_view(
+    health: &domain::UsageInsightsHealth,
+    time: crate::time::TimePresenter,
+) -> OverviewHealthView {
+    let health_points = health
+        .points
+        .iter()
+        .map(|point| OverviewHealthPointView {
+            bucket: point.bucket_start,
+            label: time.label(point.bucket_start, "%m-%d %H:%M"),
+            total_requests: point.total_requests,
+            success_requests: point.success_requests,
+            failed_requests: point.failed_requests,
+            cancelled_requests: point.cancelled_requests,
+            incomplete_requests: point.incomplete_requests,
+            caller_error_requests: point.caller_error_requests,
+            error_rate: point.error_rate,
+        })
+        .collect();
+    OverviewHealthView {
+        total_requests: health.total_requests,
+        success_requests: health.success_requests,
+        failed_requests: health.failed_requests,
+        cancelled_requests: health.cancelled_requests,
+        incomplete_requests: health.incomplete_requests,
+        caller_error_requests: health.caller_error_requests,
+        success_rate: health.success_rate,
+        completion_rate: health.completion_rate,
+        request_change_rate: None,
+        success_rate_change: None,
+        points: health_points,
     }
 }

@@ -17,7 +17,7 @@
 </div>
 
 > [!NOTE]
-> 本项目提供 Responses API，不支持 `/v1/chat/completions`，接入前请确认客户端支持 Responses 协议
+> 本项目提供 Responses API 和 Chat Completions API；Chat Completions 请求通过 Responses 链路执行，支持范围见 [API 参考](docs/api.md#chat-completions-请求)
 
 ## 快速预览
 
@@ -39,6 +39,8 @@
 使用 Docker Compose 部署版本固定的发布镜像，同时启动 PostgreSQL 和 Redis
 
 以下命令适用于 Linux amd64/arm64，需要 Docker Engine、Docker Compose Plugin、curl 和 OpenSSL
+
+Windows x64 / ARM64 使用发行包部署，步骤见 [Windows 二进制部署](deploy/README.md#windows-二进制部署)
 
 已有部署请先看 [升级说明](deploy/README.md#镜像升级与源码构建)，不要覆盖原配置
 
@@ -80,7 +82,7 @@ INSTALL_DIR="$HOME/services/codex-proxy-rs" bash install.sh
 
 部署完成后，打开 `http://127.0.0.1:8080`，使用 `admin@cpr.local` 和管理员密码登录
 
-API Key 持有者可在登录页切换身份，查看自己的用量与额度，并通过「密钥配置」复制 Codex 配置或导入 CCSwitch
+API Key 持有者可在登录页切换身份，查看自己的用量与额度，并通过「密钥配置」复制 Codex 配置或导入 CC Switch
 
 默认地址只能在服务器本机访问，从其他设备使用时，需要配置
 [HTTPS 反向代理](deploy/README.md#公网访问)
@@ -93,11 +95,11 @@ API Key 持有者可在登录页切换身份，查看自己的用量与额度，
 
 ## 客户端接入
 
-**Codex CLI / 桌面端**：在「使用密钥」中按操作系统复制配置，或通过 CCSwitch 导入，合并配置后重启 Codex
+**Codex CLI / 桌面端**：在「使用密钥」中按操作系统复制配置，合并配置后重启 Codex；也可通过「导入到」把服务连接与密钥添加到 CC Switch
 
 完整步骤、生图配置与排障见[客户端配置](deploy/README.md#客户端配置)
 
-**其他 Responses API 客户端**：填写以下信息：
+**其他 Responses / Chat Completions API 客户端**：填写以下信息：
 
 | 配置 | 值 |
 | --- | --- |
@@ -118,17 +120,14 @@ curl http://127.0.0.1:8080/v1/models \
 | 部署与使用 | [部署、备份与恢复](deploy/README.md) · [客户端接入与生图](deploy/README.md#客户端配置) |
 | 接口集成 | [API 参考](docs/api.md) · [模型定价](docs/api.md#模型定价) |
 | 使用插件 | [安装、配置与使用](docs/plugins.md) |
-| 开发插件 | [SDK 与合同](backend/crates/gateway-plugin/sdk/README.md) · [打包工具](backend/apps/plugin-cli/README.md) |
+| 开发插件 | [SDK 与合同](backend/crates/gateway-plugin/sdk/README.md) · [打包工具](backend/apps/plugin-cli/README.md) · [官方示例](https://github.com/zyycn/codex-proxy-plugins/blob/main/README.md) |
+| 开发共用组件 | [组件库说明](https://github.com/zyycn/codex-proxy-ui/blob/main/README.md) · [组件参考](https://github.com/zyycn/codex-proxy-ui/blob/main/playground/components/index.md) · [Playground](https://zyycn.github.io/codex-proxy-ui/) |
 | 开发宿主 | [开发与源码联调](docs/development.md) · [系统架构](docs/architecture.md) · [管理端主题](docs/theme.md) · [数据库迁移](backend/migrations/README.md) |
 | 参与协作 | [贡献、审查与验证](CONTRIBUTING.md) |
 
 ## 社区
 
-欢迎到 [Discussions 讨论区](https://github.com/zyycn/codex-proxy-rs/discussions)交流：
-[使用问答](https://github.com/zyycn/codex-proxy-rs/discussions/categories/使用问答)、
-[想法讨论](https://github.com/zyycn/codex-proxy-rs/discussions/categories/想法讨论)、
-[实验反馈](https://github.com/zyycn/codex-proxy-rs/discussions/categories/实验反馈)与
-[经验分享](https://github.com/zyycn/codex-proxy-rs/discussions/categories/经验分享)
+问题反馈与功能建议请使用 [GitHub Issues](https://github.com/zyycn/codex-proxy-rs/issues)，填写要求见 [贡献说明](CONTRIBUTING.md#提交-issue)
 
 感谢 [LINUX DO](https://linux.do) 社区提供开放、友善的技术交流平台
 

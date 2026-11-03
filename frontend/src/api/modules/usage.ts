@@ -1,6 +1,7 @@
 import type { RequestOptions } from '../request'
 import type { AnalyticsMetadata } from './analytics'
-import request, { requestRaw } from '../request'
+import { API_BASE_URL } from '../constants'
+import request from '../request'
 
 export interface UsageTokenDetails {
   inputTokens: number | null
@@ -93,11 +94,11 @@ export interface UsageListRecord {
   accountNotes: string | null
   accountPlanType: string | null
   accountPlanTypeDisplay: string | null
+  accountUpstreamPeer: boolean | null
   route: string
   model: string | null
   requestedModel: string | null
   upstreamModel: string | null
-  upstreamResponseModel: string | null
   serviceTier: string | null
   clientTransport: string
   upstreamTransport: string | null
@@ -130,7 +131,6 @@ export interface UsageRecord {
   model: string | null
   requestedModel: string | null
   upstreamModel: string | null
-  upstreamResponseModel: string | null
   serviceTier: string | null
   statusCode: number | null
   clientTransport: string
@@ -228,6 +228,7 @@ export interface UsageSummaryResponse {
   cacheWriteInputTokens: string
   totalTokens: string
   averageLatencyMs: string
+  averageLatencyMsValue: number | null
 }
 
 export interface UsageOverviewHealthPoint {
@@ -256,47 +257,32 @@ export interface UsageOverviewHealth {
   points: UsageOverviewHealthPoint[]
 }
 
-export interface UsageOverviewPerformancePoint {
-  bucket: string
-  label: string
-  latencyP50Ms: number | null
-  latencyP95Ms: number | null
-  latencyP99Ms: number | null
-  firstTokenP50Ms: number | null
-  firstTokenP95Ms: number | null
-  firstTokenP99Ms: number | null
-  admissionDecisionP50Ms: number | null
+export interface UsageOverviewLoad {
+  averageConcurrency: number
+  peakConcurrency: number
   admissionDecisionP95Ms: number | null
-  accountSelectionWaitP50Ms: number | null
   accountSelectionWaitP95Ms: number | null
-  outputThroughputP10: number | null
-  outputThroughputP50: number | null
-  outputThroughputP90: number | null
-  capacityUtilization: number | null
-  capacityUtilizationP95: number | null
 }
 
-export interface UsageOverviewPerformance {
+export interface UsageOverviewPerformanceMetrics {
   latencyP50Ms: number | null
   latencyP95Ms: number | null
   latencyP99Ms: number | null
   firstTokenP50Ms: number | null
   firstTokenP95Ms: number | null
   firstTokenP99Ms: number | null
-  admissionDecisionP50Ms: number | null
-  admissionDecisionP95Ms: number | null
-  accountSelectionWaitP50Ms: number | null
-  accountSelectionWaitP95Ms: number | null
   outputThroughputP10: number | null
   outputThroughputP50: number | null
   outputThroughputP90: number | null
-  capacityUtilization: number | null
-  capacityUtilizationP95: number | null
-  latencyCoverage: number
-  firstTokenCoverage: number
-  admissionDecisionCoverage: number
-  accountSelectionWaitCoverage: number
-  capacityCoverage: number
+  load: UsageOverviewLoad
+}
+
+export interface UsageOverviewPerformancePoint extends UsageOverviewPerformanceMetrics {
+  bucket: string
+  label: string
+}
+
+export interface UsageOverviewPerformance extends UsageOverviewPerformanceMetrics {
   points: UsageOverviewPerformancePoint[]
 }
 
@@ -342,11 +328,44 @@ export interface UsageInsightsOverviewResponse {
   cost: UsageOverviewCost
 }
 
+export type UsagePerformanceMetric = 'latency' | 'firstToken' | 'throughput' | 'load'
+export type UsageCostMetric = 'cost' | 'savings' | 'cache'
+
+export interface UsageMetricSeries<S, P = S> {
+  summary: S
+  points: { bucket: string, label: string, requestCount: number, value: P }[]
+}
+
+interface UsageLatencyPercentiles {
+  p50Ms: number | null
+  p95Ms: number | null
+  p99Ms: number | null
+}
+
+type UsageCostSummary = Pick<UsageOverviewCost, 'estimatedCost' | 'cacheSavings' | 'tierPremium' | 'costPerSuccessfulRequest' | 'coverage'>
+
+interface UsageMetricData {
+  health: UsageOverviewHealth
+  latency: UsageMetricSeries<UsageLatencyPercentiles>
+  firstToken: UsageMetricSeries<UsageLatencyPercentiles>
+  throughput: UsageMetricSeries<{ p10: number | null, p50: number | null, p90: number | null }>
+  load: UsageMetricSeries<UsageOverviewLoad>
+  cost: UsageMetricSeries<UsageCostSummary, { estimatedCost: string | null, noCacheCost: string | null }>
+  savings: UsageMetricSeries<UsageCostSummary, string | null>
+  cache: UsageMetricSeries<UsageCostSummary, { inputTokens: number, cachedTokenRate: number, cacheHitRequestRate: number | null }>
+}
+
+export type UsageMetricResponse<M extends keyof UsageMetricData> = {
+  [K in M]: { analytics: AnalyticsMetadata, granularity: string, metric: K, data: UsageMetricData[K] }
+}[M]
+
 export interface UsageDiagnosticItem {
   key: string
   name: string
+  authenticationKind: string | null
   accountPlanType: string | null
   accountPlanTypeDisplay: string | null
+  accountUpstreamPeer: boolean | null
   requestCount: number
   successCount: number
   errorCount: number
@@ -375,8 +394,6 @@ interface UsageRangeQuery {
   startTime: string
   endTime: string
   provider?: string
-  model?: string
-  statusCode?: number
 }
 
 interface PageQuery {
@@ -384,13 +401,18 @@ interface PageQuery {
   pageSize: number
 }
 
-type UsagePageQuery = UsageRangeQuery & PageQuery & { search?: string, status?: UsageRecordStatus }
+type UsagePageQuery = UsageRangeQuery & PageQuery & {
+  clientApiKeyName?: string
+  accountName?: string
+  model?: string
+  status?: UsageRecordStatus
+}
 
 interface UsageDetailQuery {
   id: string
 }
 
-type UsageDiagnosticsQuery = UsageRangeQuery & { dimension: string }
+type UsageDiagnosticsQuery = UsageRangeQuery & { dimension: string, model?: string, statusCode?: number }
 
 type DiagnosticsDownloadParams = { requestId: string } | { errorId: string }
 
@@ -439,15 +461,33 @@ export function getUsageRecordInsightsDiagnostics(data: UsageDiagnosticsQuery, o
   })
 }
 
-export function downloadDiagnostics(data: DiagnosticsDownloadParams, options: RequestOptions = {}) {
-  return requestRaw({
-    url: '/api/admin/diagnostics/export',
+export function getUsageHealth(data: UsageRangeQuery, options: RequestOptions = {}) {
+  return request<UsageMetricResponse<'health'>>({
+    url: '/api/admin/usage/insights/health',
     method: 'GET',
     params: data,
-    timeout: 25_000,
     ...options,
-  }, {
-    maximumBytes: 16 * 1024 * 1024,
-    accept: response => response.status === 200 && !!response.header('content-type')?.startsWith('application/json'),
   })
+}
+
+export function getUsagePerformance<M extends UsagePerformanceMetric>(data: UsageRangeQuery & { metric: M }, options: RequestOptions = {}) {
+  return request<UsageMetricResponse<M>>({
+    url: '/api/admin/usage/insights/performance',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function getUsageCost<M extends UsageCostMetric>(data: UsageRangeQuery & { metric: M }, options: RequestOptions = {}) {
+  return request<UsageMetricResponse<M>>({
+    url: '/api/admin/usage/insights/cost',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function getDiagnosticsDownloadUrl(data: DiagnosticsDownloadParams) {
+  return `${API_BASE_URL}/api/admin/diagnostics/export?${new URLSearchParams(data)}`
 }

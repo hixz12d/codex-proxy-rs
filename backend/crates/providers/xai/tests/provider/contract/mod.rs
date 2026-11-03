@@ -1,5 +1,6 @@
 //! 验证 xAI 原生执行的协议转换、账号选择与交付状态隔离
 
+mod outbound;
 mod replay_tool_names;
 mod scheduling;
 mod selection_retry;
@@ -15,7 +16,7 @@ use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture, stream};
 use gateway_core::account::{
     AccountFeedbackStats, AccountRuntimeSignals, AccountSelectionPolicy, CredentialRevision,
-    CredentialState, ProviderAccountStore, RotationStrategy,
+    CredentialState, ProviderAccountId, ProviderAccountStore, RotationStrategy,
 };
 use gateway_core::engine::continuation::{
     ContinuationBinding, NativeContinuationPin, PreviousResponseId,
@@ -26,6 +27,7 @@ use gateway_core::engine::middleware::{
     MiddlewareNext, MiddlewarePlan, MiddlewareRequest, MiddlewareResponse,
 };
 use gateway_core::engine::provider::{Provider, ProviderRequest};
+use gateway_core::engine::upstream_adapter::UpstreamAdapterSelection;
 use gateway_core::engine::{
     AccountAttemptContext, AttemptContext, ContinuationAttempt, ModelRequestId,
 };
@@ -510,7 +512,7 @@ async fn attempt_middleware_runs_once_before_native_encoding() {
                 .headers()
                 .iter()
                 .filter(|header| header.name() == "x-business-context")
-                .map(|header| header.value().expose())
+                .map(|header| std::str::from_utf8(header.value()).unwrap())
                 .collect::<Vec<_>>(),
             vec!["tenant-public", "trace-public"],
         );
@@ -541,7 +543,7 @@ async fn attempt_middleware_runs_once_before_native_encoding() {
         .headers()
         .iter()
         .filter(|header| header.name().eq_ignore_ascii_case("authorization"))
-        .map(|header| header.value().expose())
+        .map(|header| std::str::from_utf8(header.value()).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(values, ["Bearer plugin-value"]);
     assert!(!format!("{:?}", requests[0].headers()).contains("Bearer plugin-value"));
@@ -1295,7 +1297,7 @@ async fn provider_with_recovery(
 
 async fn provider_with_catalog_transport(
     selector: Arc<dyn GrokSessionSelector>,
-    transport: Arc<StubInferenceTransport>,
+    transport: Arc<dyn GrokInferenceTransport>,
     recovery: Arc<StubRecovery>,
     catalog_transport: Arc<dyn GrokModelCatalogTransport>,
 ) -> Arc<GrokBuildProvider> {
@@ -2467,7 +2469,7 @@ async fn compaction_should_pin_recorded_account_and_forward_session_headers() {
             .headers()
             .iter()
             .find(|header| header.name().eq_ignore_ascii_case(name))
-            .map(|header| header.value().expose())
+            .map(|header| std::str::from_utf8(header.value()).unwrap())
     };
     assert_eq!(header("x-grok-conv-id"), Some("cache-session"));
     assert_eq!(header("x-grok-session-id"), Some("cache-session"));
@@ -3314,7 +3316,7 @@ async fn selection_failures_carry_a_distinguishable_client_error_code() {
         assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
         if expected_code == "account_cooling_down" {
             assert!(
-                detail.message().contains("retry in 13s"),
+                detail.message().contains("retry in 13 seconds."),
                 "{}",
                 detail.message()
             );
@@ -4176,7 +4178,7 @@ async fn provider_should_expose_safe_request_normalization_field_before_selectio
             detail.error_type()
         )),
         Some((
-            "Grok Build request field `tools` could not be normalized safely",
+            "The request field `tools` could not be converted to the Grok Build format.",
             Some("invalid_request_normalization"),
             Some("invalid_request_error"),
         )),
@@ -4205,6 +4207,7 @@ async fn provider_compiles_realtime_catalog_capabilities() {
         .presentation()
         .expect("Grok model presentation");
     assert_eq!(presentation.display_name(), Some("Grok 4.5"));
+    assert!(presentation.reasoning_summary());
     assert_eq!(
         presentation.supported_reasoning_efforts(),
         ["low", "medium", "high", "xhigh"]
@@ -4379,12 +4382,14 @@ async fn configured_request_profile_reaches_inference_headers() {
     let requests = transport.requests.lock().unwrap();
     let headers = requests[0].headers();
     let header = |name| {
-        headers
-            .iter()
-            .find(|header| header.name() == name)
-            .unwrap()
-            .value()
-            .expose()
+        std::str::from_utf8(
+            headers
+                .iter()
+                .find(|header| header.name() == name)
+                .unwrap()
+                .value(),
+        )
+        .unwrap()
     };
     assert_eq!(header("x-grok-client-version"), "9.8.7");
     assert_eq!(header("x-grok-client-identifier"), "profile-contract");
@@ -4395,6 +4400,7 @@ async fn configured_request_profile_reaches_inference_headers() {
 #[derive(Debug)]
 struct AdapterProbe {
     polls: Arc<std::sync::atomic::AtomicUsize>,
+    account_scoped: bool,
 }
 
 impl gateway_core::engine::upstream_adapter::UpstreamAdapterPlan for AdapterProbe {
@@ -4403,13 +4409,18 @@ impl gateway_core::engine::upstream_adapter::UpstreamAdapterPlan for AdapterProb
         _: &AttemptContext,
         provider: &ProviderKind,
         _: &UpstreamModelId,
-    ) -> Result<
-        Option<Arc<dyn gateway_core::engine::upstream_adapter::UpstreamAdapter>>,
-        gateway_core::error::ProviderError,
-    > {
+        account: Option<&ProviderAccountId>,
+    ) -> Result<UpstreamAdapterSelection, gateway_core::error::ProviderError> {
         assert_eq!(provider.as_str(), "xai");
-        Ok(Some(Arc::new(Self {
+        if self.account_scoped && account.is_none() {
+            return Ok(UpstreamAdapterSelection::PendingAccount);
+        }
+        if let Some(account) = account {
+            assert_eq!(account.as_str(), "acct_provider");
+        }
+        Ok(UpstreamAdapterSelection::Adapter(Arc::new(Self {
             polls: self.polls.clone(),
+            account_scoped: self.account_scoped,
         })))
     }
 }
@@ -4417,6 +4428,10 @@ impl gateway_core::engine::upstream_adapter::UpstreamAdapterPlan for AdapterProb
 impl gateway_core::engine::upstream_adapter::UpstreamAdapter for AdapterProbe {
     fn transport(&self) -> &str {
         "http_sse"
+    }
+
+    fn supports_authentication(&self, kind: &str) -> bool {
+        kind == "oauth"
     }
 
     fn execute(
@@ -4476,20 +4491,22 @@ impl gateway_core::engine::upstream_adapter::UpstreamAdapter for AdapterProbe {
 
 #[tokio::test]
 async fn upstream_adapter_reuses_selected_native_account_inside_attempt_onion_and_stays_cold() {
-    assert_upstream_adapter_stays_cold(operation()).await;
-    for protocol in ["openai", "example-source"] {
-        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
-            ProtocolPayload::json_object(
-                protocol,
-                object(json!({"model": MODEL, "input": "hello", "generate": false})),
-            )
-            .unwrap(),
-        ));
-        assert_upstream_adapter_stays_cold(operation).await;
+    for account_scoped in [false, true] {
+        assert_upstream_adapter_stays_cold(operation(), account_scoped).await;
+        for protocol in ["openai", "example-source"] {
+            let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+                ProtocolPayload::json_object(
+                    protocol,
+                    object(json!({"model": MODEL, "input": "hello", "generate": false})),
+                )
+                .unwrap(),
+            ));
+            assert_upstream_adapter_stays_cold(operation, account_scoped).await;
+        }
     }
 }
 
-async fn assert_upstream_adapter_stays_cold(operation: Operation) {
+async fn assert_upstream_adapter_stays_cold(operation: Operation, account_scoped: bool) {
     let selector = StubSelector::success();
     let transport = StubInferenceTransport::success();
     let provider = provider(selector.clone(), transport.clone()).await;
@@ -4515,6 +4532,7 @@ async fn assert_upstream_adapter_stays_cold(operation: Operation) {
             gateway_core::engine::upstream_adapter::FrozenUpstreamAdapterPlan::new(
                 Arc::new(AdapterProbe {
                     polls: polls.clone(),
+                    account_scoped,
                 }),
                 lease.clone(),
             ),

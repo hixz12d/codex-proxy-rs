@@ -104,6 +104,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                     "max_waiting_per_key".to_owned(),
                     "max_waiting_per_account".to_owned(),
                     "concurrency_wait_timeout_seconds".to_owned(),
+                    "max_retry_after_seconds".to_owned(),
                     "openai_guardian_reserved_concurrency".to_owned(),
                     "openai_account_affinity".to_owned(),
                     "max_account_rotations".to_owned(),
@@ -114,7 +115,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                     "min_codex_desktop_version".to_owned(),
                     "min_codex_cli_version".to_owned(),
                     "retention".to_owned(),
-                    "account_auto_freeze".to_owned(),
+                    "account_error_protection".to_owned(),
                 ],
             ),
         };

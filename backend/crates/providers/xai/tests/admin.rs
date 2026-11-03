@@ -541,6 +541,7 @@ async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() 
     assert!(quota.windows.is_empty());
     store
         .compare_and_swap_quota(gateway_core::account::QuotaObservation {
+            expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
             expected_revision: account.revision(),
@@ -994,28 +995,12 @@ impl ProviderCooldownPort for TestCooldown {
         Box::pin(async { Ok(false) })
     }
 
-    fn record_capacity_failure<'a>(
-        &'a self,
-        _account_id: &'a ProviderAccountId,
-        _window: Duration,
-        _in_flight: u32,
-    ) -> BoxFuture<'a, Result<u32, ProviderStoreError>> {
-        Box::pin(async { Ok(0) })
-    }
-
     fn clear_after_success<'a>(
         &'a self,
         _account_id: &'a ProviderAccountId,
         _through_revision: gateway_core::account::CredentialRevision,
     ) -> BoxFuture<'a, Result<(), ProviderStoreError>> {
         Box::pin(async { Ok(()) })
-    }
-
-    fn capacity_peak_in_flight<'a>(
-        &'a self,
-        _account_id: &'a ProviderAccountId,
-    ) -> BoxFuture<'a, Result<Option<u32>, ProviderStoreError>> {
-        Box::pin(async { Ok(None) })
     }
 }
 
@@ -1185,21 +1170,18 @@ mod errors {
     async fn manual_refresh_keeps_expired_and_changed_credentials_distinct_without_network() {
         for expired in [true, false] {
             let store = MemoryProviderAccountStore::shared();
-            let mut input = create_input("refresh_error", "synthetic-subject");
+            let input = create_input("refresh_error", "synthetic-subject");
+            let mut prepared = crate::support::prepare_input(&input).unwrap();
             if expired {
-                let now = Utc::now();
-                input.account.access_token_expires_at = now + chrono::Duration::seconds(1);
-                input.account.refresh_token_expires_at = Some(now + chrono::Duration::seconds(2));
+                // 此处验证已存账号的刷新失败，直接设置持久化期限以免等待真实时间
+                let mut credential = prepared.credential.expose_to_provider().clone();
+                credential.insert(
+                    "refresh_token_expires_at".to_owned(),
+                    json!(Utc::now() - chrono::Duration::minutes(1)),
+                );
+                prepared.credential = gateway_core::account::PlaintextCredential::new(credential);
             }
-            seed_input(&store, &input).await.unwrap();
-            if expired {
-                // 新导入不接受已过期凭据；等待合法存入的短期凭据自然过期，验证历史账号刷新
-                let remaining = input.account.refresh_token_expires_at.unwrap() - Utc::now();
-                tokio::time::sleep(
-                    remaining.to_std().unwrap_or_default() + Duration::from_millis(10),
-                )
-                .await;
-            }
+            store.create_account(prepared).await.unwrap();
             let before = store.account(&input.account_id).unwrap();
             let mut account = account_record(&before);
             if !expired {

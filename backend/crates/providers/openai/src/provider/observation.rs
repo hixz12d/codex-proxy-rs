@@ -33,7 +33,6 @@ pub(super) struct OpenAiResponseObservationState {
     stream: bool,
     requested_service_tier: Option<String>,
     upstream_service_tier: Option<String>,
-    upstream_response_model: Option<String>,
     rate_limit_headers: Vec<(String, String)>,
     timings: ProviderResponseTimings,
     terminal: Option<OpenAiResponseTerminal>,
@@ -80,7 +79,6 @@ impl OpenAiResponseObservationState {
             stream: request.stream(),
             requested_service_tier: normalize_service_tier(request.service_tier()),
             upstream_service_tier: None,
-            upstream_response_model: response.response_metadata.effective_model.clone(),
             rate_limit_headers: selected_observation_headers(&response.rate_limit_headers),
             timings: openai_response_timings(
                 &response.transport_metrics,
@@ -123,21 +121,7 @@ impl OpenAiResponseObservationState {
         if let Some(service_tier) = &self.requested_service_tier {
             observation = observation.with_service_tier_if_valid(service_tier.clone());
         }
-        if let Some(model) = &self.upstream_response_model {
-            observation = observation.with_upstream_response_model_if_valid(model);
-        }
         Some(observation)
-    }
-
-    pub(super) fn observe_upstream_response_model(&mut self, model: Option<&str>) -> bool {
-        let Some(model) = model else {
-            return false;
-        };
-        if self.upstream_response_model.as_deref() == Some(model) {
-            return false;
-        }
-        self.upstream_response_model = Some(model.to_owned());
-        true
     }
 
     pub(super) fn observe_stream_chunk(&mut self, chunk: &[u8], started_at: Instant) -> bool {
@@ -262,17 +246,6 @@ impl OpenAiResponseObservationState {
             && let Some(request_id) = &self.diagnostics.request_id
         {
             metadata.insert("websocketOpeningRequestId".to_owned(), json!(request_id));
-        }
-        if let Some(model) = self
-            .response_metadata
-            .effective_model
-            .as_deref()
-            .filter(|model| !model.is_empty())
-        {
-            metadata.insert(
-                "upstreamReportedModel".to_owned(),
-                Value::String(model.to_owned()),
-            );
         }
         metadata.insert(
             "modelsEtag".to_owned(),
@@ -459,7 +432,7 @@ pub(super) fn openai_response_request_summary(
     let body = request.body();
     let input = body.get("input");
     let tools = body.get("tools");
-    let semantics = request.semantics();
+    let semantics = request.semantics(None);
     json!({
         "model": request.model(),
         "stream": request.stream(),
@@ -705,6 +678,7 @@ pub(super) fn codex_request_context<'a>(
     account_selection: CodexAccountSelectionTelemetry<'a>,
 ) -> CodexRequestContext<'a> {
     CodexRequestContext {
+        response_control: None,
         trace: None,
         authorization: authorization.expose_secret(),
         account_id: account.upstream_account_id(),
@@ -815,9 +789,16 @@ fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
         ProviderDiagnostic::new(error.to_string()).with_classification("account_selection", code)
     });
     let mapped = match error {
-        CredentialSelectionError::Cancelled => provider_error(ProviderErrorKind::Cancelled, UpstreamSendState::NotSent).with_retry_prohibited(),
-        CredentialSelectionError::ContinuationOwnerChanged => continuation_replay_required_error("scope_unavailable"),
-        CredentialSelectionError::SessionBound(error) => selection_failure(error).with_retry_prohibited(),
+        CredentialSelectionError::Cancelled => {
+            provider_error(ProviderErrorKind::Cancelled, UpstreamSendState::NotSent)
+                .with_retry_prohibited()
+        }
+        CredentialSelectionError::ContinuationOwnerChanged => {
+            continuation_replay_required_error("scope_unavailable")
+        }
+        CredentialSelectionError::SessionBound(error) => {
+            selection_failure(error).with_retry_prohibited()
+        }
         CredentialSelectionError::QueueRejected(error) => {
             provider_error(error.provider_kind(), UpstreamSendState::NotSent)
         }
@@ -837,7 +818,7 @@ fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
         )
         .with_retry_prohibited()
         .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
-            "No account is available for this session because of an earlier upstream cyber_policy rejection. Do not repeatedly retry this session. This does not indicate an account ban or a service-wide outage.",
+            "No account is available for this session after an upstream cyber policy rejection.",
             Some("cyber_policy".to_owned()),
             Some("invalid_request_error".to_owned()),
         )),
@@ -850,7 +831,7 @@ fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
             UpstreamSendState::NotSent,
         )
         .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
-            "All eligible accounts have exhausted their quota. Retry after quota resets or add an available account.",
+            "All eligible accounts have exhausted their quota.",
             Some("usage_limit_reached".to_owned()),
             Some("usage_limit_reached".to_owned()),
         )),
@@ -870,14 +851,15 @@ fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
             ProviderErrorKind::ProviderInfrastructureUnavailable,
             UpstreamSendState::NotSent,
         ),
-        CredentialSelectionError::PolicyRejected | CredentialSelectionError::PolicyFiltered => provider_error(
-            ProviderErrorKind::RequestPolicyDenied,
-            UpstreamSendState::NotSent,
-        ),
-        CredentialSelectionError::PolicyUnavailable => provider_error(
-            ProviderErrorKind::Unavailable,
-            UpstreamSendState::NotSent,
-        ),
+        CredentialSelectionError::PolicyRejected | CredentialSelectionError::PolicyFiltered => {
+            provider_error(
+                ProviderErrorKind::RequestPolicyDenied,
+                UpstreamSendState::NotSent,
+            )
+        }
+        CredentialSelectionError::PolicyUnavailable => {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        }
     };
     match diagnostic {
         Some(diagnostic) => mapped.with_diagnostic(diagnostic),

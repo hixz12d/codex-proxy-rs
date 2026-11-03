@@ -40,10 +40,42 @@ use tar::{Builder, EntryType, Header};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const BINARY_NAME: &str = if cfg!(windows) {
+    "codex-proxy-rs.exe"
+} else {
+    "codex-proxy-rs"
+};
+
 const OLD_RELEASE_MANIFEST: &str = r#"{"gateway_version":"1.0.0"}"#;
 
 const TARGET_VERSION: &str = "1.9.9";
 const CROSS_MAJOR_VERSION: &str = "2.0.0";
+
+#[derive(Default)]
+struct RecordingDiagnostics {
+    failures: std::sync::Mutex<Vec<gateway_core::diagnostics::OperationalFailure>>,
+    reject: bool,
+}
+
+#[async_trait::async_trait]
+impl gateway_core::diagnostics::OperationalDiagnostics for RecordingDiagnostics {
+    async fn record_failure(
+        &self,
+        failure: gateway_core::diagnostics::OperationalFailure,
+    ) -> Result<(), gateway_core::error::StoreError> {
+        self.failures
+            .lock()
+            .expect("diagnostic failures")
+            .push(failure);
+        if self.reject {
+            Err(gateway_core::error::StoreError::new(
+                gateway_core::error::StoreErrorKind::Unavailable,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 struct AllowingUpdatePreflight;
 #[async_trait::async_trait]
@@ -227,7 +259,11 @@ impl Fixture {
     }
 
     fn executable(&self) -> PathBuf {
-        self.root.path().join("codex-proxy-rs")
+        self.root.path().join(BINARY_NAME)
+    }
+
+    fn backup(&self) -> PathBuf {
+        self.root.path().join(format!("{BINARY_NAME}.backup"))
     }
 
     fn web(&self) -> PathBuf {
@@ -367,7 +403,7 @@ impl Fixture {
 #[derive(Clone, Copy)]
 enum ArchiveKind {
     Safe,
-    UnsafePath,
+    UnsafePath(&'static str),
     MissingOfficialManifest,
     NestedOfficialAsset,
     OfficialSymlink,
@@ -383,7 +419,7 @@ enum ChecksumKind {
 fn release_archive(kind: ArchiveKind) -> Vec<u8> {
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut tar = Builder::new(encoder);
-    append_file(&mut tar, "codex-proxy-rs", b"new-binary", false);
+    append_file(&mut tar, BINARY_NAME, b"new-binary", false);
     append_file(&mut tar, "web/dist/index.html", b"new-web", false);
     if !matches!(kind, ArchiveKind::MissingOfficialManifest) {
         append_file(
@@ -399,8 +435,8 @@ fn release_archive(kind: ArchiveKind) -> Vec<u8> {
         b"new-plugin",
         false,
     );
-    if matches!(kind, ArchiveKind::UnsafePath) {
-        append_file(&mut tar, "safe", b"escape", true);
+    if let ArchiveKind::UnsafePath(name) = kind {
+        append_file(&mut tar, name, b"escape", true);
     }
     if matches!(kind, ArchiveKind::NestedOfficialAsset) {
         append_file(
@@ -435,13 +471,19 @@ fn append_symlink(tar: &mut Builder<GzEncoder<Vec<u8>>>, name: &str, target: &st
 fn append_file(tar: &mut Builder<GzEncoder<Vec<u8>>>, name: &str, data: &[u8], unsafe_path: bool) {
     let mut header = Header::new_gnu();
     header.set_entry_type(EntryType::Regular);
-    header.set_mode(0o755);
+    header.set_mode(if name.starts_with("plugins/official/") {
+        0o444
+    } else {
+        0o755
+    });
     header.set_size(u64::try_from(data.len()).expect("size"));
-    header.set_path(name).expect("path");
+    header
+        .set_path(if unsafe_path { "safe" } else { name })
+        .expect("path");
     if unsafe_path {
         let bytes = header.as_mut_bytes();
         bytes[..100].fill(0);
-        bytes[..9].copy_from_slice(b"../escape");
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
     }
     header.set_cksum();
     tar.append(&header, data).expect("append");

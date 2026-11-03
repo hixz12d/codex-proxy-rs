@@ -424,7 +424,7 @@ impl ProxyStore for PgProxyRepository {
         // 在同一条更新中校验绑定，避免旧弹窗清除账号后来选择的其他代理
         let updated = sqlx::query(
             "update provider_accounts
-             set outbound_proxy_id = null, outbound_proxy_url = null,
+             set outbound_proxy_id = null, outbound_proxy_url = null, provider_quota_json = null, quota_observed_at = null,
                  updated_at = greatest(now(), updated_at)
              where id = $1 and outbound_proxy_id = $2",
         )
@@ -507,6 +507,7 @@ impl ProxyStore for PgProxyRepository {
         .into_iter()
         .map(|row| {
             Ok(ProxyAccountRef {
+                upstream: None,
                 id: row.try_get("id").map_err(|source| invalid().with_source(source))?,
                 name: row.try_get("name").map_err(|source| invalid().with_source(source))?,
                 email: row.try_get("email").map_err(|source| invalid().with_source(source))?,
@@ -760,6 +761,8 @@ impl ProxyStore for PgProxyRepository {
                 return Err(store_error(conflict(&command.id)));
             }
         }
+        let enabled_changed: bool = sqlx::query_scalar("select coalesce($2::boolean is not null and enabled is distinct from $2, false) from outbound_proxies where id = $1")
+            .bind(&command.id).bind(command.enabled).fetch_optional(&mut *transaction).await.map_err(|source| store_error(unavailable(source)))?.unwrap_or(false);
         let changed = sqlx::query(
             "update outbound_proxies set name = $3, proxy_url = coalesce($4, proxy_url), revision = revision + 1, updated_at = now(),
              auto_location = coalesce($5, auto_location), enabled = coalesce($6, enabled), max_websocket_connections = coalesce($7, max_websocket_connections),
@@ -778,7 +781,12 @@ impl ProxyStore for PgProxyRepository {
             .bind(command.enabled).bind(command.max_websocket_connections.map(i64::from))
             .execute(&mut *transaction).await.map_err(|source| store_error(unavailable(source)))?;
         if changed.rows_affected() != 1 {
-            return Err(store_error(conflict(&command.id)));
+            // 返回版本冲突前释放事务锁，避免误挡紧接着的导入预留
+            let error = match transaction.rollback().await {
+                Ok(()) => conflict(&command.id),
+                Err(cleanup) => conflict(&command.id).with_cleanup(cleanup),
+            };
+            return Err(store_error(error));
         }
         if let Some(location) = &command.location {
             save_location(&mut transaction, &command.id, location.as_ref())
@@ -793,8 +801,8 @@ impl ProxyStore for PgProxyRepository {
                 .await
                 .map_err(store_error)?;
         }
-        sqlx::query("update provider_accounts a set outbound_proxy_url = p.proxy_url, updated_at = greatest(now(), a.updated_at) from outbound_proxies p where p.id = $1 and a.outbound_proxy_id = p.id and a.outbound_proxy_url is distinct from p.proxy_url")
-            .bind(&command.id).execute(&mut *transaction).await.map_err(|source| store_error(unavailable(source)))?;
+        sqlx::query("update provider_accounts a set outbound_proxy_url = p.proxy_url, provider_quota_json = null, quota_observed_at = null, updated_at = case when a.outbound_proxy_url is distinct from p.proxy_url or a.provider_quota_json is not null then greatest(now(), a.updated_at) else a.updated_at end from outbound_proxies p where p.id = $1 and a.outbound_proxy_id = p.id and (a.outbound_proxy_url is distinct from p.proxy_url or $2)")
+            .bind(&command.id).bind(enabled_changed).execute(&mut *transaction).await.map_err(|source| store_error(unavailable(source)))?;
         audit(
             &mut transaction,
             context,
@@ -849,10 +857,15 @@ impl ProxyStore for PgProxyRepository {
         .await
         .map_err(|source| store_error(unavailable(source)))?;
         if locked.is_none() {
-            return Err(store_error(conflict(id)));
+            // 返回版本冲突前释放事务锁，避免误挡紧接着的删除或编辑
+            let error = match transaction.rollback().await {
+                Ok(()) => conflict(id),
+                Err(cleanup) => conflict(id).with_cleanup(cleanup),
+            };
+            return Err(store_error(error));
         }
         let account_ids: Vec<String> = sqlx::query_scalar(
-            "update provider_accounts set outbound_proxy_id = null, outbound_proxy_url = null,
+            "update provider_accounts set outbound_proxy_id = null, outbound_proxy_url = null, provider_quota_json = null, quota_observed_at = null,
              updated_at = greatest(now(), updated_at) where outbound_proxy_id = $1 returning id",
         )
         .bind(id)

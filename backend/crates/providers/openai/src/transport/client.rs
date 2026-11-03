@@ -1,4 +1,4 @@
-//! Codex HTTP/SSE 上游客户端、请求头构造、TLS 与自定义 CA
+//! Codex 上游客户端的共享状态、连接配置、请求头与传输合同
 
 use std::{
     collections::HashMap,
@@ -195,6 +195,8 @@ impl fmt::Debug for CodexClientVisibleUpstreamResponse {
 /// Codex 上游 HTTP 客户端错误
 #[derive(Error)]
 pub enum CodexClientError {
+    #[error("outbound request preparation failed")]
+    Outbound(Box<gateway_core::error::ProviderError>),
     #[error("privacy policy rejected the request: {0}")]
     Privacy(#[from] gateway_core::settings::privacy::PrivacyError),
     #[error("connection recovery budget exhausted")]
@@ -224,7 +226,6 @@ pub enum CodexClientError {
     /// 请求头值无效
     #[error("invalid request header value: {0}")]
     InvalidHeaderValue(#[from] reqwest::header::InvalidHeaderValue),
-    /// 中间件业务头试图覆盖 Provider 已构造的受管头
     /// SSE 响应解析失败
     #[error("invalid upstream SSE response: {0}")]
     InvalidSse(#[from] SseError),
@@ -278,6 +279,7 @@ pub enum CodexClientError {
 impl fmt::Debug for CodexClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Outbound(_) => formatter.write_str("CodexClientError::Outbound([REDACTED])"),
             Self::ConnectionBudgetExhausted => {
                 formatter.write_str("CodexClientError::ConnectionBudgetExhausted")
             }
@@ -348,7 +350,8 @@ impl CodexClientError {
             Self::Upstream { transport, .. } | Self::ErrorBodyRead { transport, .. } => {
                 Some(*transport)
             }
-            Self::Privacy(_)
+            Self::Outbound(_)
+            | Self::Privacy(_)
             | Self::ConnectionBudgetExhausted
             | Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
@@ -461,6 +464,8 @@ impl<'a> CodexAccountSelectionTelemetry<'a> {
 /// 单次 Codex 上游请求的上下文
 #[derive(Clone, Copy)]
 pub struct CodexRequestContext<'a> {
+    /// 本次根执行的控制与下游连接生命周期，不由共享 HTTP client 持有
+    pub response_control: Option<&'a gateway_core::engine::response_control::ResponseControl>,
     /// 显式传递的请求诊断上下文，跨连接任务共享
     pub trace: Option<&'a gateway_core::diagnostics::TraceContext>,
     /// Provider 已构造并脱敏持有的完整 Authorization 值
@@ -509,6 +514,7 @@ impl<'a> CodexRequestContext<'a> {
     ) -> Self {
         Self {
             trace: None,
+            response_control: None,
             authorization,
             account_id,
             request_id,
@@ -532,6 +538,15 @@ impl<'a> CodexRequestContext<'a> {
     #[must_use]
     pub const fn with_trace(mut self, trace: &'a gateway_core::diagnostics::TraceContext) -> Self {
         self.trace = Some(trace);
+        self
+    }
+
+    #[must_use]
+    pub fn with_response_control(
+        mut self,
+        control: Option<&'a gateway_core::engine::response_control::ResponseControl>,
+    ) -> Self {
+        self.response_control = control;
         self
     }
 }
@@ -615,6 +630,7 @@ pub type CodexResponseMetadataUpdates = CodexWebSocketResponseMetadataUpdates;
 
 /// Codex Responses 上游流式响应
 pub struct CodexBackendStreamingResponse {
+    pub(crate) routing_affinity: Option<super::routing_affinity::ChatGptRoutingAffinity>,
     /// HTTP 为 SSE 字节块，WebSocket 为完整 UTF-8 文本消息
     pub body: CodexBackendSseStream,
     /// 实际使用的上游传输
@@ -681,12 +697,12 @@ impl OpenAiUpstreamProtocol {
 /// Codex HTTP/SSE 上游客户端
 #[derive(Clone)]
 pub struct CodexBackendClient {
+    pub(super) routing_affinity: Option<super::routing_affinity::ChatGptRoutingAffinity>,
     pub(super) privacy: Option<(
         Arc<dyn gateway_core::settings::privacy::CompiledPrivacyPolicy>,
         gateway_core::lifecycle::CancellationToken,
     )>,
     pub(super) timezone: gateway_core::time::DeploymentTimeZone,
-    pub(super) response_control: Option<gateway_core::engine::response_control::ResponseControl>,
     pub(super) connection_budget: Option<gateway_core::engine::connection::ConnectionBudget>,
     pub(super) client: Client,
     pub(super) direct_client: Client,
@@ -700,23 +716,85 @@ pub struct CodexBackendClient {
     pub(super) outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub(super) egress_key: String,
     pub(super) middleware_headers: Vec<MiddlewareHeader>,
+    pub(super) outbound_middleware: Option<gateway_core::engine::middleware::outbound::Pipeline>,
 }
 
 impl CodexBackendClient {
+    pub(crate) const fn profile_state(&self) -> &CodexWireProfileState {
+        &self.profile
+    }
+
+    /// 请求只持有自己的画像副本；连接池和 HTTP client 继续共享既有资源
+    pub fn with_request_profile(mut self, profile: super::profile::CodexWireProfile) -> Self {
+        self.profile = CodexWireProfileState::new(profile);
+        self
+    }
+
+    /// 构造客户端
+    pub fn new(
+        client: Client,
+        base_url: impl Into<String>,
+        profile: CodexWireProfileState,
+    ) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        Self {
+            routing_affinity: None,
+            privacy: None,
+            timezone: Default::default(),
+            connection_budget: None,
+            direct_client: client.clone(),
+            client,
+            websocket_origin_key: websocket_origin_key(&base_url),
+            outbound_proxy: None,
+            egress_key: String::new(),
+            middleware_headers: Vec::new(),
+            outbound_middleware: None,
+            base_url,
+            official_base_url: super::endpoints::OFFICIAL_CODEX_BASE_URL.to_owned(),
+            protocol: OpenAiUpstreamProtocol::Codex,
+            profile,
+            websocket_pool: None,
+            websocket_origin_breaker: WebSocketOriginBreaker::default(),
+        }
+    }
+
+    /// 为 Responses WebSocket 请求启用连接池
+    pub fn with_websocket_pool(mut self, pool: Arc<CodexWebSocketPool>) -> Self {
+        self.websocket_pool = Some(pool);
+        self
+    }
+
+    /// 附加当前 attempt 经 Core 复核的业务请求头
+    #[must_use]
+    pub(crate) fn with_middleware_headers(
+        mut self,
+        middleware_headers: Vec<gateway_core::engine::middleware::MiddlewareHeader>,
+    ) -> Self {
+        self.middleware_headers = middleware_headers;
+        self
+    }
+
+    /// 驱逐指定账号的 Responses WebSocket 池连接
+    pub async fn evict_websocket_account(&self, account_id: &str) {
+        if let Some(pool) = &self.websocket_pool {
+            pool.evict_account(account_id).await;
+        }
+    }
+
+    pub(crate) fn with_routing_affinity(
+        mut self,
+        affinity: Option<super::routing_affinity::ChatGptRoutingAffinity>,
+    ) -> Self {
+        self.routing_affinity = affinity;
+        self
+    }
+
     #[must_use]
     pub(crate) fn with_timezone(
         mut self,
         timezone: gateway_core::time::DeploymentTimeZone,
     ) -> Self {
         self.timezone = timezone;
-        self
-    }
-
-    pub(crate) fn with_response_control(
-        mut self,
-        control: Option<gateway_core::engine::response_control::ResponseControl>,
-    ) -> Self {
-        self.response_control = control;
         self
     }
 
@@ -961,7 +1039,8 @@ pub(super) async fn http_json_upstream_error(
 ) -> CodexClientError {
     let status = response.status();
     let headers = response.headers();
-    let diagnostics = super::response_meta::diagnostics(Some(status.as_u16()), headers);
+    let diagnostics = super::response_meta::diagnostics(Some(status.as_u16()), headers)
+        .with_response_origin(Some(response.url().clone()));
     let set_cookie_headers = super::response_meta::set_cookie_headers(headers);
     let rate_limit_headers = super::response_meta::rate_limit_headers(headers);
     let retry_after_seconds = retry_after_seconds(headers, None);

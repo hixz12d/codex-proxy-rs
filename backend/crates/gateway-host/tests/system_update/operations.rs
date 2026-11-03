@@ -3,6 +3,120 @@
 use super::*;
 
 #[tokio::test]
+async fn update_and_rollback_preserve_a_running_executable() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    fs::copy(
+        env!("CARGO_BIN_EXE_gateway-host-process-worker"),
+        fixture.executable(),
+    )
+    .expect("running executable");
+    let original = fs::read(fixture.executable()).expect("original executable");
+    fs::write(fixture.root.path().join("mode"), b"update-probe").expect("worker mode");
+    let mut child = tokio::process::Command::new(fixture.executable())
+        .current_dir(fixture.root.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start old executable");
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            child.stdout.as_mut().unwrap().read_u8()
+        )
+        .await
+        .expect("worker ready")
+        .expect("ready byte"),
+        b'R'
+    );
+    fixture
+        .mount_release(
+            &server,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Valid,
+        )
+        .await;
+    let service = fixture.service(&server);
+    let status = complete_update(&service, TARGET_VERSION).await;
+    assert_eq!(
+        status.operation.status,
+        SystemOperationStatus::Succeeded,
+        "{status:?}"
+    );
+    assert!(status.need_restart);
+    assert_eq!(fs::read(fixture.backup()).expect("backup"), original);
+    assert_eq!(
+        fs::read(fixture.executable()).expect("installed"),
+        b"new-binary"
+    );
+    assert!(child.try_wait().expect("old process state").is_none());
+
+    service
+        .rollback(Arc::new(AllowingUpdatePreflight))
+        .await
+        .expect("rollback running executable");
+    assert_eq!(
+        fs::read(fixture.executable()).expect("restored executable"),
+        original
+    );
+    assert!(
+        !service
+            .update_status()
+            .await
+            .expect("restored status")
+            .need_restart
+    );
+
+    service
+        .perform_update(
+            Some(TARGET_VERSION.to_owned()),
+            None,
+            Arc::new(ChangingRevisionPreflight {
+                confirmations: AtomicUsize::new(0),
+            }),
+        )
+        .await
+        .expect("second update accepted");
+    let failed = wait_for_update(&service).await;
+    assert_eq!(
+        failed.operation.status,
+        SystemOperationStatus::Failed,
+        "{failed:?}"
+    );
+    assert_eq!(
+        fs::read(fixture.executable()).expect("restored after failure"),
+        original
+    );
+    assert_eq!(
+        fs::read(fixture.web().join("index.html")).expect("restored web"),
+        b"old-web"
+    );
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_u8(b'X')
+        .await
+        .expect("release old process");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("worker exited")
+            .expect("exit status")
+            .success()
+    );
+    assert_eq!(
+        fs::read(fixture.root.path().join("unblocked")).expect("old process result"),
+        b"still-running"
+    );
+}
+
+#[tokio::test]
 async fn restart_should_not_shutdown_when_replacement_spawn_fails() {
     let fixture = Fixture::new();
     let mut config = fixture.config("http://127.0.0.1:1/repos");
@@ -38,11 +152,123 @@ async fn restart_should_request_process_restart_inside_docker() {
         .expect("shutdown requested");
 }
 
+#[tokio::test(start_paused = true)]
+async fn accepted_restart_excludes_system_operations_until_service_release() {
+    let fixture = Fixture::new();
+    let mut config = fixture.config("http://127.0.0.1:1/repos");
+    config.self_restart_enabled = true;
+    config.deployment_mode = "docker".to_owned();
+    let shutdown = CancellationToken::new();
+    let service = ProcessSystemOperations::new(shutdown.clone(), config.clone());
+    service
+        .restart(Arc::new(AllowingUpdatePreflight))
+        .await
+        .expect("restart accepted");
+
+    assert!(!shutdown.is_cancelled(), "response delivery still has time");
+    assert_system_operations_rejected(&service, "服务正在重启").await;
+    assert!(fixture.lock().exists());
+    let competing = ProcessSystemOperations::new(CancellationToken::new(), config);
+    assert_eq!(
+        competing
+            .restart(Arc::new(AllowingUpdatePreflight))
+            .await
+            .expect_err("another service cannot replace files during restart")
+            .kind(),
+        SystemOperationErrorKind::Conflict
+    );
+
+    shutdown.cancelled().await;
+    assert_system_operations_rejected(&service, "服务正在重启").await;
+    service
+        .update_status()
+        .await
+        .expect("status remains readable");
+    assert!(fixture.lock().exists(), "draining retains the file lock");
+
+    drop(service);
+    assert!(
+        !fixture.lock().exists(),
+        "service release clears the file lock"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_rejects_new_system_operations() {
+    let fixture = Fixture::new();
+    let mut config = fixture.config("http://127.0.0.1:1/repos");
+    config.self_restart_enabled = true;
+    config.deployment_mode = "docker".to_owned();
+    let shutdown = CancellationToken::new();
+    let service = ProcessSystemOperations::new(shutdown.clone(), config);
+    shutdown.cancel();
+
+    assert_system_operations_rejected(&service, "服务正在关闭").await;
+    assert!(!fixture.lock().exists());
+}
+
+#[tokio::test]
+async fn shutdown_during_restart_preflight_does_not_schedule_replacement() {
+    struct CancellingPreflight(CancellationToken);
+    #[async_trait::async_trait]
+    impl gateway_admin::ports::system::SystemRestartPreflight for CancellingPreflight {
+        async fn prepare(
+            &self,
+            _: Option<SystemUpdateCandidate>,
+        ) -> Result<(), SystemOperationError> {
+            self.0.cancel();
+            Ok(())
+        }
+    }
+
+    let fixture = Fixture::new();
+    let mut config = fixture.config("http://127.0.0.1:1/repos");
+    config.self_restart_enabled = true;
+    config.deployment_mode = "docker".to_owned();
+    let shutdown = CancellationToken::new();
+    let service = ProcessSystemOperations::new(shutdown.clone(), config);
+    let error = service
+        .restart(Arc::new(CancellingPreflight(shutdown)))
+        .await
+        .expect_err("shutdown won during preflight");
+
+    assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
+    assert_eq!(error.message(), "服务正在关闭");
+    assert!(!fixture.lock().exists());
+}
+
+async fn assert_system_operations_rejected(service: &ProcessSystemOperations, reason: &str) {
+    for result in [
+        service.restart(Arc::new(AllowingUpdatePreflight)).await,
+        service.rollback(Arc::new(AllowingUpdatePreflight)).await,
+        service
+            .perform_test_update(Some(TARGET_VERSION.to_owned()))
+            .await,
+    ] {
+        let error = result.expect_err("system operation must not be accepted");
+        assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
+        assert_eq!(error.message(), reason);
+    }
+    assert_eq!(
+        service
+            .restart_candidate()
+            .await
+            .expect_err("no restart plan")
+            .message(),
+        reason
+    );
+}
+
 #[tokio::test]
 async fn restart_should_spawn_replacement_before_shutdown_outside_docker() {
     let fixture = Fixture::new();
     let replacement_marker = fixture.root.path().join("replacement-ran");
-    fixture.write_executable("#!/bin/sh\n: > \"${0%/*}/replacement-ran\"\n");
+    fs::copy(
+        env!("CARGO_BIN_EXE_gateway-host-process-worker"),
+        fixture.executable(),
+    )
+    .expect("replacement executable");
+    fs::write(fixture.root.path().join("restart-probe"), b"").expect("restart probe");
     let mut config = fixture.config("http://127.0.0.1:1/repos");
     config.self_restart_enabled = true;
     let shutdown = CancellationToken::new();
@@ -59,6 +285,21 @@ async fn restart_should_spawn_replacement_before_shutdown_outside_docker() {
     tokio::time::timeout(Duration::from_secs(2), shutdown.cancelled())
         .await
         .expect("shutdown requested after spawn");
+    #[cfg(windows)]
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture.root.path().join("replacement-waiting").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement waiting for old service");
+        assert!(
+            !replacement_marker.exists(),
+            "new service must wait for resource release"
+        );
+    }
+    drop(service);
     tokio::time::timeout(Duration::from_secs(2), async {
         while !replacement_marker.is_file() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -82,7 +323,7 @@ async fn restart_should_use_startup_path_after_running_executable_is_renamed() {
         let output = std::process::Command::new(child)
             .args([
                 "--exact",
-                "system_update::restart_should_use_startup_path_after_running_executable_is_renamed",
+                "system_update::operations::restart_should_use_startup_path_after_running_executable_is_renamed",
             ])
             .env(CHILD_ENV, "1")
             .env("CPR_RESTART_DELAY_MS", "1200")
@@ -116,7 +357,7 @@ async fn restart_should_use_startup_path_after_running_executable_is_renamed() {
     config.self_restart_enabled = true;
     let service = ProcessSystemOperations::new(CancellationToken::new(), config);
 
-    let backup = fixture.root.path().join("codex-proxy-rs.backup");
+    let backup = fixture.backup();
     fs::rename(fixture.executable(), &backup).expect("back up running executable");
     fixture.write_executable("#!/bin/sh\nprintf new > \"${0%/*}/replacement-version\"\n");
     assert_eq!(std::env::current_exe().expect("renamed executable"), backup);
@@ -670,24 +911,42 @@ async fn update_should_reject_release_archive_from_untrusted_host() {
 
 #[tokio::test]
 async fn update_should_reject_release_archive_with_unsafe_path() {
-    let server = MockServer::start().await;
-    let fixture = Fixture::new();
-    fixture
-        .mount_release(
-            &server,
-            TARGET_VERSION,
-            ArchiveKind::UnsafePath,
-            ChecksumKind::Valid,
-        )
-        .await;
+    for unsafe_path in [
+        "../escape",
+        #[cfg(windows)]
+        "web/dist/index.html:payload",
+        #[cfg(windows)]
+        "web/dist/NUL.txt",
+        #[cfg(windows)]
+        "web/dist/COM¹",
+        #[cfg(windows)]
+        "web/dist/trailing. ",
+        #[cfg(windows)]
+        "C:/escape",
+    ] {
+        let server = MockServer::start().await;
+        let fixture = Fixture::new();
+        fixture
+            .mount_release(
+                &server,
+                TARGET_VERSION,
+                ArchiveKind::UnsafePath(unsafe_path),
+                ChecksumKind::Valid,
+            )
+            .await;
 
-    assert_eq!(
-        complete_update(&fixture.service(&server), TARGET_VERSION)
-            .await
-            .operation
-            .status,
-        SystemOperationStatus::Failed,
-    );
+        assert_eq!(
+            complete_update(&fixture.service(&server), TARGET_VERSION)
+                .await
+                .operation
+                .status,
+            SystemOperationStatus::Failed,
+        );
+        assert_eq!(
+            fs::read(fixture.executable()).expect("unchanged binary"),
+            b"old-binary"
+        );
+    }
 }
 
 #[tokio::test]
@@ -826,6 +1085,7 @@ async fn update_and_rollback_should_use_the_default_api_asset_directory() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn update_should_replace_web_assets_across_filesystems() {
     let Ok(external) = tempfile::tempdir_in("/dev/shm") else {
@@ -873,7 +1133,7 @@ async fn update_should_restore_web_assets_when_binary_backup_fails() {
             ChecksumKind::Valid,
         )
         .await;
-    fs::create_dir(fixture.executable().with_extension("backup")).expect("blocking backup dir");
+    fs::create_dir(fixture.backup()).expect("blocking backup dir");
 
     assert_eq!(
         complete_update(&fixture.service(&server), TARGET_VERSION)

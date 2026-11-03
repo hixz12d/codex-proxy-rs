@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import type { AccountQuotaWindow } from '@/api/index'
+
 import type { AccountUsageWindowVariant } from '@/components/account/account-usage-window/presenter'
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import AccountRequestTimeline from '@/components/account/account-usage-window/AccountRequestTimeline.vue'
 import { resolveAccountUsageWindowPresentation } from '@/components/account/account-usage-window/presenter'
 
@@ -21,6 +23,8 @@ const props = withDefaults(
   },
 )
 
+const { t } = useI18n({ useScope: 'global' })
+
 const view = computed(() => resolveAccountUsageWindowPresentation({
   window: props.window,
   variant: props.variant,
@@ -37,7 +41,7 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
           :class="view.classes.label"
           :title="showNativeTooltip ? view.labelTooltip : undefined"
         >
-          {{ window.labelDisplay }}
+          {{ view.label }}
         </span>
         <span
           v-if="view.compactValues"
@@ -45,9 +49,9 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
         >
           <span
             v-if="view.quota.localUsageVisible"
-            class="text-right text-cp-text-quaternary"
+            class="text-right text-z-text-quaternary"
             :class="view.classes.value"
-            :title="showNativeTooltip ? `窗口消耗：${view.quota.localUsageDisplay}` : undefined"
+            :title="showNativeTooltip ? t('accounts.quota.usageInThisWindow', { localUsageDisplay: view.quota.localUsageDisplay }) : undefined"
           >
             {{ view.quota.localUsageDisplay }}
           </span>
@@ -55,7 +59,7 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
             v-if="showPercentage && view.quota.valueVisible"
             class="text-right"
             :class="[view.classes.value, view.quota.percentTextClass]"
-            :title="showNativeTooltip ? `额度已使用：${window.usedPercentDisplay}` : undefined"
+            :title="showNativeTooltip ? t('accounts.quota.quotaUsed', { rate: window.usedPercentDisplay }) : undefined"
           >
             {{ window.usedPercentDisplay }}
           </span>
@@ -66,7 +70,7 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
         >
           <span
             v-if="view.quota.localUsageVisible"
-            class="text-cp-text-quaternary"
+            class="text-z-text-quaternary"
             :class="view.classes.value"
           >
             {{ view.quota.localUsageDisplay }}
@@ -83,7 +87,7 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
         class="col-span-full"
         :class="[view.classes.track, view.classes.trackOffset]"
         role="progressbar"
-        :aria-label="window.labelDisplay"
+        :aria-label="view.label"
         aria-valuemin="0"
         aria-valuemax="100"
         :aria-valuenow="window.usedPercent ?? undefined"
@@ -96,9 +100,9 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
       </div>
       <div
         v-if="view.quota.resetVisible"
-        class="mt-3 text-cp-sm font-emphasis text-cp-text-secondary"
+        class="mt-3 text-z-sm font-emphasis text-z-text-secondary"
       >
-        重置时间: {{ window.resetAtDisplay }}
+        {{ t('accounts.quota.resets', { resetAtDisplay: window.resetAtDisplay }) }}
       </div>
     </template>
 
@@ -109,7 +113,7 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
         </span>
         <strong
           v-if="view.local.requestValueVisible"
-          class="shrink-0 font-mono tabular-nums text-cp-text"
+          class="shrink-0 font-mono tabular-nums text-z-text"
           :class="view.classes.value"
         >
           {{ view.local.requestDisplay }}
@@ -124,8 +128,16 @@ const view = computed(() => resolveAccountUsageWindowPresentation({
       />
     </template>
 
-    <div v-else :class="view.classes.header">
-      <span class="min-w-0 text-cp-text-secondary">额度待观测</span>
-    </div>
+    <template v-else>
+      <div :class="view.classes.header" aria-hidden="true">
+        <span class="h-3.5" />
+      </div>
+      <div
+        class="col-span-full"
+        :class="[view.classes.track, view.classes.trackOffset]"
+        role="progressbar"
+        :aria-label="t('accounts.quota.unobserved')"
+      />
+    </template>
   </div>
 </template>
