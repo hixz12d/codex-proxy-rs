@@ -148,14 +148,19 @@ pub(crate) fn derive_codex_session_affinity(
     })
 }
 
-/// 只有用户、开发者或系统消息的输入是新对话；助手消息、推理、工具调用与压缩项都来自上游历史
+/// 只有助手消息、推理、压缩项、工具调用及其结果来自上游历史；
+/// 用户、开发者、系统消息和客户端声明类条目（如新对话首轮的 additional_tools）都不算
 fn carries_conversation_history(body: &Map<String, Value>) -> bool {
     body.get("input")
         .and_then(Value::as_array)
         .is_some_and(|items| {
             items.iter().any(|item| {
                 let kind = item.get("type").and_then(Value::as_str).unwrap_or("message");
-                kind != "message" || item.get("role").and_then(Value::as_str) == Some("assistant")
+                match kind {
+                    "message" => item.get("role").and_then(Value::as_str) == Some("assistant"),
+                    "reasoning" | "compaction" | "compaction_summary" | "item_reference" => true,
+                    _ => kind.ends_with("_call") || kind.ends_with("_call_output"),
+                }
             })
         })
 }
