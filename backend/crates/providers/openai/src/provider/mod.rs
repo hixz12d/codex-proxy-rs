@@ -986,6 +986,25 @@ impl CodexProvider {
             account_scope,
             verified_turn_state.as_deref(),
         );
+        // 会话从其他账号迁入：旧账号的加密推理不能发给新账号，按分界点剥离后只保留明文历史
+        if let Some(through) = lease.strip_bound_history_through() {
+            let stripped = crate::credential::strip_bound_history_through(
+                upstream_request.body_mut(),
+                through,
+            );
+            if stripped > 0 {
+                tracing::info!(
+                    request_id = %context.request_id(),
+                    account_id = %lease.account_id(),
+                    stripped_items = stripped,
+                    "OpenAI strict session history stripped for migrated account"
+                );
+            }
+            context.trace().record(
+                "provider.request.bound_history_stripped",
+                serde_json::json!({"strippedItems": stripped}),
+            );
+        }
         // 父响应的可信关联只恢复此字段，不把首次 Guardian 请求的其他账号状态视为可信
         if let Some((response_id, _)) = &guardian_parent
             && let Some(Value::Object(metadata)) =

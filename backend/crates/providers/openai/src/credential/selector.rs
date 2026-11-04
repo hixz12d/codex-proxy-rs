@@ -28,7 +28,7 @@ use secrecy::ExposeSecret;
 use thiserror::Error;
 use url::Url;
 
-use super::affinity::CodexSessionAffinity;
+use super::affinity::{CodexSessionAffinity, bound_history_marker_alias, bound_history_marker_key};
 use super::catalog::CodexCredentialCatalogService;
 use super::codec::CodexRuntimeAuthentication;
 use super::cookie::CodexCookiePolicy;
@@ -825,7 +825,8 @@ impl CodexCredentialSelector {
                     )
                 });
             // strict 会话不跨账号：历史里的加密推理和压缩项都出自主账号，迁移到别的账号会把这些账号关联起来；
-            // 主账号丢失或长时间冷却时要求客户端新开对话，绑定已过期的带历史请求同样不能落到新账号；
+            // 主账号丢失、长时间冷却或绑定已过期时，剥离这些加密内容后迁移到新账号，等同于用户新开对话但保留明文历史；
+            // 历史含压缩项或服务端条目引用时剥离会丢失记忆，仍要求客户端新开对话。
             // 没有这类内容的请求（新对话、Chat Completions 转换来的明文历史）换号不会关联账号，按普通会话选号和迁移
             let strict_session = !diagnostic
                 && affinity_mode == AccountAffinity::Strict
@@ -847,7 +848,7 @@ impl CodexCredentialSelector {
                         .duration_since(SystemTime::now())
                         .unwrap_or_default()
                 });
-            if strict_session
+            let migration_tail = if strict_session
                 && match binding.as_ref() {
                     Some(_) => {
                         affinity.bound_account_lost()
@@ -855,10 +856,17 @@ impl CodexCredentialSelector {
                                 .is_some_and(|wait| wait > STRICT_SESSION_COOLDOWN_WAIT)
                     }
                     None => true,
-                }
-            {
-                return Err(CredentialSelectionError::SessionAccountLost);
-            }
+                } {
+                Some(
+                    request
+                        .session_affinity_observation
+                        .and_then(CodexSessionAffinity::portable_history_tail)
+                        .ok_or(CredentialSelectionError::SessionAccountLost)?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
             // 根线程主账号已删除、停用、失效或额度耗尽时，后代线程不再等根线程迁移：
             // 根线程常在等子代理结果，互相等待只会让子代理反复排队超时，改按普通会话请求选号并迁移绑定
             let follow_only = follow_only && !affinity.bound_account_lost();
@@ -871,6 +879,12 @@ impl CodexCredentialSelector {
                 .and_then(|scope| scope.state.as_ref())
             {
                 excluded.extend(state.excluded_accounts().iter().cloned());
+            }
+            // 剥离迁移必须落到其他账号，冷却中的主账号不能被当作恢复后的同号续用
+            if migration_tail.is_some()
+                && let Some(binding) = binding.as_ref()
+            {
+                excluded.insert(binding.account_id().clone());
             }
             // 原生续写归属和显式固定账号优先于会话偏好，不能把增量状态发送给其他账号
             if let Some(required) = pinned_account.as_ref() {
@@ -1081,6 +1095,7 @@ impl CodexCredentialSelector {
                 let selected = selection.candidate();
                 // 主账号仍可恢复（本次重试已排除、短暂冷却或繁忙）时不换号，交回原失败或让客户端稍后重试
                 if strict_session
+                    && migration_tail.is_none()
                     && let Some(bound) = binding.as_ref().map(ProviderSessionBinding::account_id)
                     && selected.account.id() != bound
                 {
@@ -1140,6 +1155,18 @@ impl CodexCredentialSelector {
                         busy_accounts.insert(account.id().clone());
                     }
                     ProviderLeaseAcquisition::Acquired(guard) => {
+                        let session_ttl = request
+                            .attempt
+                            .account_selection_policy()
+                            .openai_session_affinity_ttl();
+                        // 分界点先于绑定写入：绑定一旦迁到新账号，后续请求必须能读到分界点
+                        if let (Some(key), Some(tail)) = (binding_key, migration_tail.as_deref())
+                            && !self
+                                .store_bound_history_marker(key, account.id(), tail, session_ttl)
+                                .await?
+                        {
+                            return Err(CredentialSelectionError::SessionAccountLost);
+                        }
                         if let Some(key) = binding_key
                             && !self
                                 .admit_session(
@@ -1153,15 +1180,42 @@ impl CodexCredentialSelector {
                                                 && !affinity.bound_account_lost()
                                         })
                                         .map_or(account.id(), ProviderSessionBinding::account_id),
-                                    request
-                                        .attempt
-                                        .account_selection_policy()
-                                        .openai_session_affinity_ttl(),
+                                    session_ttl,
                                 )
                                 .await?
                         {
                             drop(guard);
                             continue 'capacity;
+                        }
+                        // 已迁移会话的客户端每轮仍会重发旧账号的加密内容，每次都按分界点剥离并续期分界点
+                        let strip_bound_history_through = match (binding_key, &migration_tail) {
+                            (_, Some(tail)) => Some(tail.clone()),
+                            (Some(key), None)
+                                if !diagnostic && affinity_mode == AccountAffinity::Strict =>
+                            {
+                                let marker =
+                                    self.load_bound_history_marker(key, account.id()).await?;
+                                if let Some(marker) = marker.as_deref() {
+                                    self.store_bound_history_marker(
+                                        key,
+                                        account.id(),
+                                        marker,
+                                        session_ttl,
+                                    )
+                                    .await?;
+                                }
+                                marker
+                            }
+                            _ => None,
+                        };
+                        if let Some(through) = strip_bound_history_through.as_deref() {
+                            request.attempt.trace().record(
+                                "account.bound_history_migration",
+                                serde_json::json!({
+                                    "migrated": migration_tail.is_some(),
+                                    "boundary": through.get(..12).unwrap_or(through),
+                                }),
+                            );
                         }
                         let affinity_telemetry = affinity.telemetry(account.id());
                         let affinity_observation = request.session_affinity_observation;
@@ -1220,6 +1274,7 @@ impl CodexCredentialSelector {
                             allows_account_state_mutation,
                             affinity_telemetry,
                             admitted_session: binding_key.cloned(),
+                            strip_bound_history_through,
                             capacity: capacity.map(AccountCapacitySnapshot::with_acquired_request),
                             _guard: guard,
                         });
@@ -1327,6 +1382,51 @@ impl CodexCredentialSelector {
         .await
         .map_err(binding_store_error)?
         .map(|binding| binding.is_some())
+        .map_err(binding_store_error)
+    }
+
+    /// 读取会话迁入该账号时记下的剥离分界点，读失败按无分界点处理会把旧账号内容发给新账号，
+    /// 因此和绑定一样作为存储错误返回
+    async fn load_bound_history_marker(
+        &self,
+        key: &ProviderSessionAffinityKey,
+        account: &ProviderAccountId,
+    ) -> Result<Option<String>, CredentialSelectionError> {
+        let Some(marker_key) = bound_history_marker_key(key, account.as_str()) else {
+            return Ok(None);
+        };
+        tokio::time::timeout(
+            SESSION_AFFINITY_TIMEOUT,
+            self.session_affinity
+                .load_alias(&self.provider_kind, &marker_key),
+        )
+        .await
+        .map_err(binding_store_error)?
+        .map(|alias| alias.map(|alias| alias.session_key.expose_to_store().to_owned()))
+        .map_err(binding_store_error)
+    }
+
+    /// 首次写入或同一分界点续期；同一会话再次迁入该账号且分界点不同时返回 false
+    async fn store_bound_history_marker(
+        &self,
+        key: &ProviderSessionAffinityKey,
+        account: &ProviderAccountId,
+        tail: &str,
+        session_ttl: Duration,
+    ) -> Result<bool, CredentialSelectionError> {
+        let (Some(marker_key), Some(alias)) = (
+            bound_history_marker_key(key, account.as_str()),
+            bound_history_marker_alias(tail),
+        ) else {
+            return Ok(false);
+        };
+        tokio::time::timeout(
+            SESSION_AFFINITY_TIMEOUT,
+            self.session_affinity
+                .bind_alias(&self.provider_kind, &marker_key, &alias, session_ttl),
+        )
+        .await
+        .map_err(binding_store_error)?
         .map_err(binding_store_error)
     }
 
@@ -1831,6 +1931,8 @@ pub struct CodexCredentialLease {
     affinity_telemetry: AffinityTelemetry,
     // 已准入请求允许完成；只有中间件改变会话身份时才需要再次认领
     admitted_session: Option<ProviderSessionAffinityKey>,
+    // 会话已从其他账号迁入时，发送前要剥离的旧账号加密内容分界点
+    strip_bound_history_through: Option<String>,
     capacity: Option<AccountCapacitySnapshot>,
     _guard: Box<dyn ProviderLeaseGuard>,
 }
@@ -1892,6 +1994,10 @@ impl CodexCredentialLease {
     #[must_use]
     pub const fn account_switch(&self) -> bool {
         self.affinity_telemetry.account_switch
+    }
+
+    pub(crate) fn strip_bound_history_through(&self) -> Option<&str> {
+        self.strip_bound_history_through.as_deref()
     }
 
     #[must_use]

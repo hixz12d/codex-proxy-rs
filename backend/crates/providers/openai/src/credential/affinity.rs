@@ -22,6 +22,7 @@ pub(crate) struct CodexSessionAffinity {
     session_id: Option<String>,
     follow_only: bool,
     carries_history: bool,
+    portable_history_tail: Option<String>,
 }
 
 impl CodexSessionAffinity {
@@ -40,6 +41,7 @@ impl CodexSessionAffinity {
             session_id: None,
             follow_only: root.is_some() || alias.follow_only,
             carries_history: false,
+            portable_history_tail: None,
             turn_alias: Some((turn, alias)),
         }
     }
@@ -72,6 +74,12 @@ impl CodexSessionAffinity {
     /// 请求历史里带有主账号生成的不透明内容；strict 下只有这类请求不能落到会话主账号以外的账号
     pub(crate) const fn carries_history(&self) -> bool {
         self.carries_history
+    }
+
+    /// 历史里最后一段主账号加密内容的指纹；历史含压缩项或服务端条目引用时为 None，
+    /// 这类内容剥离后会丢失记忆，不能靠剥离换号
+    pub(crate) fn portable_history_tail(&self) -> Option<&str> {
+        self.portable_history_tail.as_deref()
     }
 
     #[must_use]
@@ -144,7 +152,115 @@ pub(crate) fn derive_codex_session_affinity(
     .map(|affinity| {
         let mut affinity = affinity.with_follow_only(request.client_account_follow_only);
         affinity.carries_history = carries_conversation_history(request.body());
+        affinity.portable_history_tail = affinity
+            .carries_history
+            .then(|| portable_history_tail(request.body()))
+            .flatten();
         affinity
+    })
+}
+
+fn encrypted_content(value: &Value) -> Option<&str> {
+    value
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+}
+
+fn content_fingerprint(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-bound-history-v1\0");
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// 条目自身及其消息片段里的全部加密内容，按出现顺序
+fn item_encrypted_contents(item: &Value) -> impl Iterator<Item = &str> {
+    encrypted_content(item).into_iter().chain(
+        item.get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(encrypted_content),
+    )
+}
+
+fn portable_history_tail(body: &Map<String, Value>) -> Option<String> {
+    let items = body.get("input")?.as_array()?;
+    if items.iter().any(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("compaction" | "compaction_summary" | "item_reference")
+        )
+    }) {
+        return None;
+    }
+    items
+        .iter()
+        .flat_map(item_encrypted_contents)
+        .last()
+        .map(content_fingerprint)
+}
+
+/// 删除迁移分界点（含）之前旧账号生成的加密内容：加密推理条目整条删除，
+/// 消息里的加密片段单独删除，分界内条目的上游 id 一并去掉；明文消息和工具调用保留。
+/// 找不到分界点（如之后已在新账号压缩）时不改动，返回删除的加密内容数
+pub(crate) fn strip_bound_history_through(body: &mut Map<String, Value>, through: &str) -> usize {
+    let Some(Value::Array(items)) = body.get_mut("input") else {
+        return 0;
+    };
+    let Some(boundary) = items.iter().rposition(|item| {
+        item_encrypted_contents(item).any(|content| content_fingerprint(content) == through)
+    }) else {
+        return 0;
+    };
+    let mut stripped = 0;
+    let mut kept = Vec::with_capacity(items.len());
+    for (index, mut item) in std::mem::take(items).into_iter().enumerate() {
+        if index > boundary {
+            kept.push(item);
+            continue;
+        }
+        if encrypted_content(&item).is_some() {
+            stripped += 1;
+            continue;
+        }
+        if let Some(object) = item.as_object_mut() {
+            object.remove("id");
+            if let Some(Value::Array(parts)) = object.get_mut("content") {
+                let before = parts.len();
+                parts.retain(|part| encrypted_content(part).is_none());
+                if parts.len() != before {
+                    stripped += before - parts.len();
+                    if parts.is_empty() {
+                        continue;
+                    }
+                }
+            }
+        }
+        kept.push(item);
+    }
+    *items = kept;
+    stripped
+}
+
+/// 已剥离迁移会话的分界点存放键：按会话和迁入账号区分，旧账号换回时不会读到其他账号的分界点
+pub(crate) fn bound_history_marker_key(
+    session: &ProviderSessionAffinityKey,
+    account_id: &str,
+) -> Option<ProviderSessionAffinityKey> {
+    opaque_affinity_key(
+        "bound-history-marker",
+        &format!("{}\0{account_id}", session.expose_to_store()),
+    )
+}
+
+/// 分界点指纹本身就是小写十六进制，可直接存成别名目标键
+pub(crate) fn bound_history_marker_alias(tail: &str) -> Option<ProviderSessionAlias> {
+    Some(ProviderSessionAlias {
+        session_key: ProviderSessionAffinityKey::try_new(tail).ok()?,
+        root_session_key: None,
+        follow_only: false,
     })
 }
 
@@ -283,6 +399,7 @@ fn session_affinity(
         session_id,
         follow_only: false,
         carries_history: false,
+        portable_history_tail: None,
     })
 }
 
