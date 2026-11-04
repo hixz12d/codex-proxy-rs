@@ -825,8 +825,13 @@ impl CodexCredentialSelector {
                     )
                 });
             // strict 会话不跨账号：历史里的加密推理和压缩项都出自主账号，迁移到别的账号会把这些账号关联起来；
-            // 主账号丢失或长时间冷却时要求客户端新开对话，绑定已过期的带历史请求同样不能落到新账号
-            let strict_session = !diagnostic && affinity_mode == AccountAffinity::Strict;
+            // 主账号丢失或长时间冷却时要求客户端新开对话，绑定已过期的带历史请求同样不能落到新账号；
+            // 没有这类内容的请求（新对话、Chat Completions 转换来的明文历史）换号不会关联账号，按普通会话选号和迁移
+            let strict_session = !diagnostic
+                && affinity_mode == AccountAffinity::Strict
+                && request
+                    .session_affinity_observation
+                    .is_some_and(CodexSessionAffinity::carries_history);
             let bound_cooldown = binding
                 .as_ref()
                 .filter(|_| affinity.escape_reason == Some(AffinityEscapeReason::Cooldown))
@@ -846,11 +851,10 @@ impl CodexCredentialSelector {
                 && match binding.as_ref() {
                     Some(_) => {
                         affinity.bound_account_lost()
-                            || bound_cooldown.is_some_and(|wait| wait > STRICT_SESSION_COOLDOWN_WAIT)
+                            || bound_cooldown
+                                .is_some_and(|wait| wait > STRICT_SESSION_COOLDOWN_WAIT)
                     }
-                    None => request
-                        .session_affinity_observation
-                        .is_some_and(CodexSessionAffinity::carries_history),
+                    None => true,
                 }
             {
                 return Err(CredentialSelectionError::SessionAccountLost);

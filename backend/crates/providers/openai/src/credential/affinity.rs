@@ -69,7 +69,7 @@ impl CodexSessionAffinity {
         self
     }
 
-    /// 请求已携带上游生成的对话历史；strict 下这类请求不能落到会话主账号以外的账号
+    /// 请求历史里带有主账号生成的不透明内容；strict 下只有这类请求不能落到会话主账号以外的账号
     pub(crate) const fn carries_history(&self) -> bool {
         self.carries_history
     }
@@ -148,20 +148,31 @@ pub(crate) fn derive_codex_session_affinity(
     })
 }
 
-/// 只有助手消息、推理、压缩项、工具调用及其结果来自上游历史；
-/// 用户、开发者、系统消息和客户端声明类条目（如新对话首轮的 additional_tools）都不算
+/// 只有上游账号生成的不透明内容会把历史绑在主账号上：加密推理、压缩项、服务端条目引用，
+/// 以及消息里的加密片段。助手文本、工具调用及其结果换号重放不会关联账号，
+/// Chat Completions 等转换来的历史只有这类明文条目，不算
 fn carries_conversation_history(body: &Map<String, Value>) -> bool {
+    let has_encrypted = |value: &Value| {
+        value
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty())
+    };
     body.get("input")
         .and_then(Value::as_array)
         .is_some_and(|items| {
-            items.iter().any(|item| {
-                let kind = item.get("type").and_then(Value::as_str).unwrap_or("message");
-                match kind {
-                    "message" => item.get("role").and_then(Value::as_str) == Some("assistant"),
-                    "reasoning" | "compaction" | "compaction_summary" | "item_reference" => true,
-                    _ => kind.ends_with("_call") || kind.ends_with("_call_output"),
-                }
-            })
+            items
+                .iter()
+                .any(|item| match item.get("type").and_then(Value::as_str) {
+                    Some("compaction" | "compaction_summary" | "item_reference") => true,
+                    _ => {
+                        has_encrypted(item)
+                            || item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|parts| parts.iter().any(has_encrypted))
+                    }
+                })
         })
 }
 
