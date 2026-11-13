@@ -1,4 +1,4 @@
-//! 使用与 Provider 请求一致的显式代理或直连路径，执行有超时和响应大小限制的出口测试
+//! 按指定出口，执行有超时和响应大小限制的出口测试
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -9,10 +9,19 @@ use std::{
 use async_trait::async_trait;
 use gateway_admin::{
     model::proxies::{ProxyLocationDetection, ProxyTestResult},
-    ports::proxy::ProxyProbe,
+    ports::proxy::{ProbeRoute, ProxyProbe},
 };
-use gateway_core::account::{OutboundProxy, RequestLocation};
+use gateway_core::account::RequestLocation;
 use serde::Deserialize;
+
+fn probe_client(route: ProbeRoute<'_>) -> Result<reqwest::ClientBuilder, &'static str> {
+    match route {
+        ProbeRoute::Direct => Ok(reqwest::Client::builder().no_proxy()),
+        ProbeRoute::Deployment => gateway_egress::http_client(None),
+        ProbeRoute::Proxy(proxy) => gateway_egress::http_client(Some(proxy)),
+    }
+    .map_err(|_| "代理地址不合法")
+}
 
 enum ProbeStrategy {
     Single(String),
@@ -69,32 +78,25 @@ impl HttpProxyProbe {
         mut self,
         build: impl Fn(reqwest::ClientBuilder) -> Result<reqwest::Client, E> + Send + Sync + 'static,
     ) -> Self {
-        self.build_client = Arc::new(move |builder| {
-            build(builder).map_err(|_| "无法创建代理连接，请检查证书信任配置")
-        });
+        self.build_client = Arc::new(move |builder| build(builder).map_err(|_| "无法创建代理连接"));
         self
     }
 
     async fn exit_ip_at(
         &self,
-        proxy: Option<&OutboundProxy>,
+        proxy: ProbeRoute<'_>,
         endpoint: &str,
     ) -> Result<IpAddr, &'static str> {
-        let mut builder = reqwest::Client::builder()
-            .no_proxy()
+        let builder = probe_client(proxy)?
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(12))
             .redirect(reqwest::redirect::Policy::none());
-        if let Some(proxy) = proxy {
-            builder = builder
-                .proxy(reqwest::Proxy::all(proxy.expose_url()).map_err(|_| "代理地址不合法")?);
-        }
         let client = (self.build_client)(builder)?;
         let mut response = client.get(endpoint).send().await.map_err(|error| {
             if error.is_timeout() {
                 "出口连接超时"
             } else {
-                "出口连接失败，请检查网络或代理配置"
+                "出口连接失败"
             }
         })?;
         if !response.status().is_success() {
@@ -127,7 +129,7 @@ impl HttpProxyProbe {
 impl HttpProxyProbe {
     async fn timed_exit_ip_at(
         &self,
-        proxy: Option<&OutboundProxy>,
+        proxy: ProbeRoute<'_>,
         endpoint: &str,
     ) -> (Result<IpAddr, &'static str>, u64) {
         let started = Instant::now();
@@ -136,7 +138,7 @@ impl HttpProxyProbe {
         (result, latency_ms)
     }
 
-    async fn test_connection(&self, proxy: Option<&OutboundProxy>) -> ProxyTestResult {
+    async fn test_connection(&self, proxy: ProbeRoute<'_>) -> ProxyTestResult {
         let started = Instant::now();
         let timeout_limit = Duration::from_secs(15);
 
@@ -278,39 +280,34 @@ impl HttpProxyProbe {
 
     async fn location_for_ip(
         &self,
-        proxy: Option<&OutboundProxy>,
+        proxy: ProbeRoute<'_>,
         ip: IpAddr,
     ) -> Result<RequestLocation, &'static str> {
-        // 出口 IP 已由探测确认；按这个固定 IP 从服务端查询位置，避免代理出口屏蔽位置服务
-        // 部署环境无法直连位置服务时仍尝试原代理路径
-        match self.lookup_location(ip, None).await {
+        // 查询的是已经验证的 IP，不要求被测代理能访问位置服务。
+        // 服务器直连探测保持直连，其余探测先按部署环境查询，必要时再用被测代理。
+        if !matches!(proxy, ProbeRoute::Proxy(_)) {
+            return self.lookup_location(ip, proxy).await;
+        }
+        match self.lookup_location(ip, ProbeRoute::Deployment).await {
             Ok(location) => Ok(location),
-            Err(direct_error) if proxy.is_some() => {
-                self.lookup_location(ip, proxy).await.or(Err(direct_error))
-            }
-            Err(error) => Err(error),
+            Err(error) => self.lookup_location(ip, proxy).await.or(Err(error)),
         }
     }
 
     async fn lookup_location(
         &self,
         ip: IpAddr,
-        proxy: Option<&OutboundProxy>,
+        proxy: ProbeRoute<'_>,
     ) -> Result<RequestLocation, &'static str> {
-        let timeout = if proxy.is_some() {
+        let timeout = if !matches!(proxy, ProbeRoute::Direct) {
             Duration::from_secs(4)
         } else {
             Duration::from_secs(3)
         };
-        let mut builder = reqwest::Client::builder()
-            .no_proxy()
+        let builder = probe_client(proxy)?
             .connect_timeout(timeout)
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none());
-        if let Some(proxy) = proxy {
-            builder = builder
-                .proxy(reqwest::Proxy::all(proxy.expose_url()).map_err(|_| "代理地址不合法")?);
-        }
         let client = (self.build_client)(builder)?;
         // 查询已检测到的具体出口，不能再次查询“我的 IP”，轮换代理可能换到另一个出口
         let url = format!("{}/{ip}", self.location_endpoint.trim_end_matches('/'));
@@ -319,7 +316,7 @@ impl HttpProxyProbe {
             .query(&[("fields", "ip,success,country_code,region,city,timezone.id")])
             .send()
             .await
-            .map_err(|_| "位置查询失败，请手动重试")?;
+            .map_err(|_| "位置查询失败")?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err("位置查询服务限流，请稍后手动重试");
         }
@@ -369,7 +366,7 @@ impl HttpProxyProbe {
 
     async fn detect_location(
         &self,
-        proxy: Option<&OutboundProxy>,
+        proxy: ProbeRoute<'_>,
         result: &ProxyTestResult,
     ) -> ProxyLocationDetection {
         let lookup = async |ip: Option<IpAddr>| match ip {
@@ -399,7 +396,7 @@ impl HttpProxyProbe {
 
 #[async_trait]
 impl ProxyProbe for HttpProxyProbe {
-    async fn test(&self, proxy: Option<&OutboundProxy>, detect_location: bool) -> ProxyTestResult {
+    async fn test(&self, proxy: ProbeRoute<'_>, detect_location: bool) -> ProxyTestResult {
         let mut result = self.test_connection(proxy).await;
         if detect_location {
             result.location = if result.success {

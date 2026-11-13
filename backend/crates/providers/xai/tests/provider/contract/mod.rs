@@ -6,6 +6,7 @@ mod scheduling;
 mod selection_retry;
 mod timing;
 
+use gateway_core::engine::probe::AccountProbeTarget;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1854,6 +1855,7 @@ impl ProviderLeasePort for DiagnosticLeasePort {
                                 in_flight: 0,
                                 last_started_at: None,
                                 quota_reset_at: None,
+                                quota_reset_windows: None,
                                 quota_remaining_rank: None,
                                 cooldown: None,
                                 failure_rate_basis_points: None,
@@ -1978,7 +1980,11 @@ fn diagnostic_context(request_id: &str, account_suffix: &str) -> AttemptContext 
         NonZeroU32::new(1).expect("attempt"),
         SystemTime::now() + Duration::from_secs(30),
         selection_policy(),
-        AccountAttemptContext::diagnostic(BTreeSet::new(), account_id(account_suffix), None),
+        AccountAttemptContext::diagnostic(
+            BTreeSet::new(),
+            AccountProbeTarget::ConnectionTest(account_id(account_suffix)),
+            None,
+        ),
         None,
         CancellationToken::new(),
     )
@@ -2007,54 +2013,6 @@ async fn account_selection_uses_the_exact_routed_model() {
             .as_slice(),
         ["grok-4.6-latest"]
     );
-}
-
-#[tokio::test]
-async fn request_observation_preserves_raw_xai_reasoning_effort() {
-    let provider = provider(StubSelector::success(), StubInferenceTransport::success()).await;
-
-    let client_key_id =
-        gateway_core::policy::ClientApiKeyId::new("key_xai_observation").expect("client key");
-    let observation = provider.request_observation(
-        &operation_with_reasoning_effort("future-value"),
-        &client_key_id,
-    );
-
-    assert_eq!(
-        observation.reasoning_effort.as_deref(),
-        Some("future-value")
-    );
-}
-
-#[tokio::test]
-async fn request_observation_preserves_codex_semantics_for_xai() {
-    let provider = provider(StubSelector::success(), StubInferenceTransport::success()).await;
-    let payload = ProtocolPayload::json_object(
-        "openai",
-        object(json!({
-            "model": "client-model",
-            "reasoning": {"effort": "xhigh"},
-            "input": [
-                {"type": "message", "role": "user", "content": "history"},
-                {"type": "compaction_trigger"}
-            ]
-        })),
-    )
-    .expect("OpenAI payload")
-    .with_context(Map::from_iter([(
-        "turn_metadata".to_owned(),
-        json!("{\"request_kind\":\"compaction\",\"subagent_kind\":\"compact\"}"),
-    )]));
-    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
-
-    let client_key_id =
-        gateway_core::policy::ClientApiKeyId::new("key_xai_observation").expect("client key");
-    let observation = provider.request_observation(&operation, &client_key_id);
-
-    assert_eq!(observation.reasoning_effort.as_deref(), Some("xhigh"));
-    assert_eq!(observation.request_kind.as_deref(), Some("compaction"));
-    assert_eq!(observation.subagent_kind.as_deref(), Some("compact"));
-    assert!(observation.compact);
 }
 
 fn operation_with_state(body: serde_json::Value, state: ProviderSessionState) -> Operation {

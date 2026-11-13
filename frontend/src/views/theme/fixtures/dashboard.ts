@@ -109,6 +109,14 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
     id: options.id,
     logicalOutcome: 'succeeded',
     errorCode: null,
+    errorOrigin: 'unknown',
+    clientStatusCode: null,
+    upstreamStatusCode: null,
+    errorKind: null,
+    websocketCloseCode: null,
+    continuationUnavailableReason: null,
+    upstreamConnectionExitReason: null,
+    recovered: false,
     errorMessage: null,
     clientApiKeyName: t('appearance.preview.dashboard.demoKey'),
     provider: options.provider,
@@ -357,6 +365,7 @@ export const themeDashboardSummary = computed<DashboardSummaryResponse>(() => ({
       usageWindow: {
         key: 'short',
         group: 'shortTerm',
+        accountWide: true,
         limitId: null,
         limitName: null,
         role: 'primary',
@@ -400,6 +409,7 @@ export const themeDashboardSummary = computed<DashboardSummaryResponse>(() => ({
       usageWindow: {
         key: 'free-rolling-24h',
         group: 'shortTerm',
+        accountWide: true,
         limitId: null,
         limitName: null,
         role: null,
@@ -448,6 +458,7 @@ export const themeDashboardSummary = computed<DashboardSummaryResponse>(() => ({
       usageWindow: {
         key: 'short',
         group: 'shortTerm',
+        accountWide: true,
         limitId: null,
         limitName: null,
         role: 'primary',
@@ -677,6 +688,7 @@ export const themeDashboardSummary = computed<DashboardSummaryResponse>(() => ({
   poolSummary: {
     total: 52,
     normal: 47,
+    quotaPaused: 0,
     quotaExhausted: 3,
     rateLimited: 1,
     disabled: 0,

@@ -54,6 +54,7 @@ impl UpstreamConnection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamInfoFailure {
     Unauthorized,
+    SharingDisabled,
     Unsupported,
     RateLimited,
     InvalidResponse,
@@ -65,6 +66,7 @@ impl UpstreamInfoFailure {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
+            Self::SharingDisabled => "sharing_disabled",
             Self::Unsupported => "unsupported",
             Self::RateLimited => "rate_limited",
             Self::InvalidResponse => "invalid_response",
@@ -76,15 +78,19 @@ impl UpstreamInfoFailure {
 /// 调度侧只消费已发布的中立观测，不读取协议、凭据或持久存储
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UpstreamSchedulingSignal {
+    pub concurrency_limit: Option<super::AccountConcurrencyLimit>,
     pub exhausted: bool,
     pub remaining_percent: Option<f64>,
 }
 
 pub trait UpstreamInfoSource: Send + Sync {
+    /// 当前连接是否已识别为互联节点，不以额度快照的新鲜度代替身份
+    fn is_peer(&self, account: &ProviderAccount) -> bool;
+
     fn signal(
         &self,
         account: &ProviderAccount,
-        model: &str,
+        model: Option<&str>,
         now: SystemTime,
     ) -> Option<UpstreamSchedulingSignal>;
 }
@@ -107,10 +113,17 @@ impl UpstreamInfoReader {
 }
 
 impl UpstreamInfoSource for UpstreamInfoReader {
+    fn is_peer(&self, account: &ProviderAccount) -> bool {
+        self.source
+            .get()
+            .and_then(Weak::upgrade)
+            .is_some_and(|source| source.is_peer(account))
+    }
+
     fn signal(
         &self,
         account: &ProviderAccount,
-        model: &str,
+        model: Option<&str>,
         now: SystemTime,
     ) -> Option<UpstreamSchedulingSignal> {
         self.source.get()?.upgrade()?.signal(account, model, now)

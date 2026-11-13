@@ -86,8 +86,16 @@ pub struct ImageBillingView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageListRecordView {
+    pub error_origin: &'static str,
+    pub client_status_code: Option<u16>,
+    pub upstream_status_code: Option<u16>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub error_kind: Option<String>,
+    pub websocket_close_code: Option<u16>,
+    pub continuation_unavailable_reason: Option<String>,
+    pub upstream_connection_exit_reason: Option<String>,
+    pub recovered: bool,
     pub logical_outcome: String,
     pub client_api_key_name: Option<String>,
     pub id: String,
@@ -122,10 +130,31 @@ pub struct UsageListRecordView {
     pub user_agent: Option<String>,
 }
 
+/// 受控详情中的原始上游错误字段
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageUpstreamErrorView {
+    pub code: Option<String>,
+    pub error_type: Option<String>,
+    pub message: Option<String>,
+    pub param: Option<String>,
+    pub close_reason: Option<String>,
+    pub last_event_type: Option<String>,
+}
+
 /// 单条逻辑请求详情展示
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordView {
+    pub error_origin: &'static str,
+    pub upstream_error: Option<UsageUpstreamErrorView>,
+    pub retry_after_ms: Option<u64>,
+    pub error_code: Option<String>,
+    pub error_kind: Option<String>,
+    pub websocket_close_code: Option<u16>,
+    pub continuation_unavailable_reason: Option<String>,
+    pub upstream_connection_exit_reason: Option<String>,
+    pub recovered: bool,
     pub id: String,
     pub request_id: String,
     pub client_api_key_id: Option<String>,
@@ -243,7 +272,7 @@ pub struct UsageAttemptView {
     pub transport: String,
     pub send_state: String,
     pub outcome: String,
-    pub downstream_committed: bool,
+    pub downstream_committed: Option<bool>,
     pub status_code: Option<u16>,
     pub provider_error_code: Option<String>,
     pub failure_class: Option<String>,
@@ -431,6 +460,7 @@ pub struct DashboardAccountUsageView {
 pub struct DashboardPoolSummaryView {
     pub total: u64,
     pub normal: u64,
+    pub quota_paused: u64,
     pub quota_exhausted: u64,
     pub rate_limited: u64,
     pub disabled: u64,
@@ -631,7 +661,7 @@ pub struct OverviewHealthPointView {
     pub cancelled_requests: u64,
     pub incomplete_requests: u64,
     pub caller_error_requests: u64,
-    pub error_rate: f64,
+    pub error_rate: Option<f64>,
 }
 
 /// 洞察健康摘要
@@ -644,7 +674,7 @@ pub struct OverviewHealthView {
     pub cancelled_requests: u64,
     pub incomplete_requests: u64,
     pub caller_error_requests: u64,
-    pub success_rate: f64,
+    pub success_rate: Option<f64>,
     pub completion_rate: f64,
     pub request_change_rate: Option<f64>,
     pub success_rate_change: Option<f64>,
@@ -854,7 +884,7 @@ pub struct DiagnosticItemView {
     pub request_count: u64,
     pub success_count: u64,
     pub error_count: u64,
-    pub error_rate: f64,
+    pub error_rate: Option<f64>,
     pub request_share: f64,
     pub average_latency_ms: Option<u64>,
     pub latency_p95_ms: Option<u64>,

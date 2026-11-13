@@ -9,7 +9,7 @@ use crate::{
     PackageLimits, RpcLimits, RpcSession,
     callback::{
         PluginAccountPortSlot, PluginAffinityPortSlot, PluginClientIdentityPortSlot,
-        PluginClientKeyPortSlot, PluginModelPortSlot,
+        PluginClientKeyPortSlot, PluginModelPortSlot, PluginProxyPortSlot,
     },
 };
 use gateway_admin::{
@@ -51,6 +51,7 @@ pub struct PluginRuntimeConfig {
 
 /// 只索引有主人的候选；当前代次仅由 Core 的发布视图持有
 pub struct PluginRuntime {
+    pub(super) usage_ports: Arc<crate::callback::usage::UsagePorts>,
     pub(super) request_limits: Arc<crate::callback::request_limits::RequestLimits>,
     pub(super) service_ports: Arc<crate::callback::services::ServicePorts>,
     pub(super) store: Arc<dyn PluginStore>,
@@ -68,6 +69,7 @@ pub struct PluginRuntime {
     pub(super) configuration_schemas: Arc<super::configuration::ConfigurationSchemas>,
     pub(super) log_slots: Arc<Semaphore>,
     pub(super) account_ports: Arc<PluginAccountPortSlot>,
+    pub(super) proxy_ports: Arc<PluginProxyPortSlot>,
     pub(super) client_key_ports: Arc<PluginClientKeyPortSlot>,
     pub(super) resource_ports: Arc<crate::callback::PluginResourcePorts>,
     pub(super) client_identity_port: Arc<PluginClientIdentityPortSlot>,
@@ -91,6 +93,7 @@ impl PluginRuntime {
     ) -> Self {
         let restart_circuit = config.restart_circuit;
         Self {
+            usage_ports: Arc::default(),
             store,
             state,
             log_slots: Arc::new(Semaphore::new(
@@ -113,6 +116,7 @@ impl PluginRuntime {
             request_limits: Arc::default(),
             service_ports: Arc::new(crate::callback::services::ServicePorts::default()),
             account_ports: Arc::new(PluginAccountPortSlot::new()),
+            proxy_ports: Arc::new(PluginProxyPortSlot::new()),
             client_key_ports: Arc::new(PluginClientKeyPortSlot::new()),
             resource_ports: Arc::new(crate::callback::PluginResourcePorts::new()),
             client_identity_port: Arc::new(PluginClientIdentityPortSlot::new()),
@@ -156,11 +160,26 @@ impl PluginRuntime {
         self.service_ports.bind(registry)
     }
 
+    pub fn bind_usage_queries(
+        &self,
+        service: &Arc<dyn gateway_admin::UsageDataService>,
+    ) -> Result<(), AdminError> {
+        self.usage_ports.bind(service)
+    }
+
     pub fn bind_account_ports(
         &self,
         access: &Arc<dyn PluginAccountAccess>,
     ) -> Result<(), AdminError> {
         self.account_ports.bind(access)
+    }
+
+    /// 代理读取由 Admin 提供并保活，Runtime 不依赖账号绑定
+    pub fn bind_proxy_ports(
+        &self,
+        access: &Arc<dyn gateway_admin::ports::proxy::PluginProxyAccess>,
+    ) -> Result<(), AdminError> {
+        self.proxy_ports.bind(access)
     }
 
     /// Key 目录与预算端口由 Admin 组合并保活，完整字段由对应公开合同返回

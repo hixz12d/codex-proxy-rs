@@ -55,6 +55,7 @@ fn account_id(id: &str) -> ProviderAccountId {
 
 fn candidate(id: &str) -> AccountCandidate {
     AccountCandidate {
+        inherited_concurrency: None,
         account: ProviderAccount::new(
             account_id(id),
             ProviderKind::new("openai").unwrap(),
@@ -76,6 +77,7 @@ fn candidate(id: &str) -> AccountCandidate {
             in_flight: 0,
             last_started_at: None,
             quota_reset_at: None,
+            quota_reset_windows: None,
             quota_remaining_rank: None,
             cooldown: None,
             failure_rate_basis_points: None,

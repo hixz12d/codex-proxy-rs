@@ -489,7 +489,7 @@ impl GrokCredentialRefreshService {
             .upstream_user_id()
             .ok_or(GrokCredentialRepositoryError::InvalidCredentialData(None))?
             .to_owned();
-        let prepared = GrokCredentialAdmin
+        let mut prepared = GrokCredentialAdmin
             .prepare_rotation(&RotateManagedGrokCredential {
                 current,
                 secret: GrokOAuthSecret {
@@ -512,6 +512,7 @@ impl GrokCredentialRefreshService {
                 },
             })
             .map_err(GrokCredentialRefreshError::from)?;
+        prepared.credential = prepared.credential.preserving_profile();
         Ok(prepared.with_refresh_guards(capacity_guard, account_guard))
     }
 
@@ -544,7 +545,7 @@ impl GrokCredentialRefreshService {
             {
                 return Err(GrokCredentialRefreshError::Preparation);
             }
-            // 直连发现失败不能阻止其他出口上的账号刷新
+            // 默认出口发现失败不能阻止其他出口上的账号刷新
             credentials.retain(|credential| {
                 if credential.outbound_proxy.is_some() {
                     return true;

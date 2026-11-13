@@ -16,6 +16,10 @@ use serde::Deserialize as _;
 pub(super) const MAX_AGE: Duration = Duration::from_secs(30 * 60);
 pub(super) const FRESH_FOR: Duration = Duration::from_secs(5 * 60);
 
+pub(super) fn is_discovered(peer: Option<&PeerLink>, failure: Option<UpstreamInfoFailure>) -> bool {
+    peer.is_some() || failure == Some(UpstreamInfoFailure::Unauthorized)
+}
+
 // 不支持协议是连接的识别结果，复用观测存储与版本保护，不伪造上游额度快照
 pub(super) fn unsupported(connection: &UpstreamConnection) -> OpaqueProviderData {
     OpaqueProviderData::new(serde_json::Map::from_iter([
@@ -28,17 +32,42 @@ pub(super) fn unsupported(connection: &UpstreamConnection) -> OpaqueProviderData
     ]))
 }
 
-pub(super) fn is_unsupported(data: &OpaqueProviderData, connection: &UpstreamConnection) -> bool {
+// 授权撤销或共享关闭后只保存连接与失败原因，丢弃全部共享数据
+pub(super) fn unavailable(
+    connection: &UpstreamConnection,
+    reason: UpstreamInfoFailure,
+) -> OpaqueProviderData {
+    OpaqueProviderData::new(serde_json::Map::from_iter([
+        ("object".into(), "cpr.peer.unavailable".into()),
+        ("schema_version".into(), 1.into()),
+        (
+            "connection_revision".into(),
+            connection.revision.clone().into(),
+        ),
+        ("reason".into(), reason.as_str().into()),
+    ]))
+}
+
+pub(super) fn stored_failure(
+    data: &OpaqueProviderData,
+    connection: &UpstreamConnection,
+) -> Option<UpstreamInfoFailure> {
     let fields = data.expose_to_provider();
-    fields.get("object").and_then(serde_json::Value::as_str) == Some("cpr.peer.unsupported")
-        && fields
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            == Some(1)
-        && fields
-            .get("connection_revision")
-            .and_then(serde_json::Value::as_str)
-            == Some(connection.revision.as_str())
+    if fields.get("schema_version")?.as_u64()? != 1
+        || fields.get("connection_revision")?.as_str()? != connection.revision
+    {
+        return None;
+    }
+    match fields.get("object")?.as_str()? {
+        "cpr.peer.unsupported" => Some(UpstreamInfoFailure::Unsupported),
+        "cpr.peer.unavailable" => match fields.get("reason")?.as_str()? {
+            "unauthorized" => Some(UpstreamInfoFailure::Unauthorized),
+            "sharing_disabled" => Some(UpstreamInfoFailure::SharingDisabled),
+            "unsupported" => Some(UpstreamInfoFailure::Unsupported),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub(super) fn timestamp(value: &str) -> Option<SystemTime> {
@@ -54,10 +83,12 @@ pub(super) fn datetime(value: &str) -> Option<DateTime<Utc>> {
 }
 
 pub(super) fn fresh(observed: &str, now: SystemTime) -> bool {
-    timestamp(observed).is_some_and(|observed| {
-        observed <= now + Duration::from_secs(60)
-            && now.duration_since(observed).unwrap_or_default() <= FRESH_FOR
-    })
+    timestamp(observed).is_some_and(|observed| fresh_at(observed, now))
+}
+
+pub(super) fn fresh_at(observed: SystemTime, now: SystemTime) -> bool {
+    observed <= now + Duration::from_secs(60)
+        && now.duration_since(observed).unwrap_or_default() <= FRESH_FOR
 }
 
 pub(super) fn component_fresh(
@@ -127,6 +158,9 @@ pub(super) fn parse(
     }
     // 未授权能力不能借同名数据块越过逐层公开边界
     let disclosed = |capability| peer.capabilities.iter().any(|value| value == capability);
+    if !disclosed("key_limits") {
+        peer.key_limits = None;
+    }
     if !disclosed("key_usage") {
         peer.usage = None;
     }

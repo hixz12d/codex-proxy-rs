@@ -2,7 +2,7 @@ import type { RelativeTimeView } from '../../types/time'
 import type { AccountGroupRef } from '../groups'
 
 export type AccountStatus
-  = 'normal' | 'quota_exhausted' | 'rate_limited' | 'disabled' | 'error'
+  = 'normal' | 'quota_paused' | 'quota_exhausted' | 'rate_limited' | 'disabled' | 'error'
 
 export type AccountErrorReason
   = 'account_unverified'
@@ -12,6 +12,7 @@ export type AccountErrorReason
     | 'account_banned'
 
 export interface AccountQuotaWindow {
+  accountWide: boolean
   sourceAccountId?: string | null
   amount?: { usedDisplay: string, remainingDisplay: string, totalDisplay: string } | null
   observedAtDisplay?: string | null
@@ -51,6 +52,7 @@ export interface AccountQuota {
   rateLimitedUntil: string | null
   rateLimitRecoveryDisplay: string | null
   rateLimitReason: 'upstream_rate_limit' | 'error_protection' | null
+  pausedWindows: string[]
   protectionRules: AccountProtectionRule[]
   recoveryProbeRequired: boolean
   windows: AccountQuotaWindow[]
@@ -92,7 +94,7 @@ export interface AccountModelUsage {
   partialCostCount: number
   unknownCostCount: number
   costs: AccountCurrencyCost[]
-  lastUsedAt: string
+  lastUsedAt: string | null
   lastUsedAtDisplay: string
   lastUsedAtFullDisplay: string | null
 }
@@ -138,6 +140,8 @@ export interface AccountModelAccess {
 }
 
 export interface Account {
+  quotaLimits: Record<string, number>
+  autoUseQuotaCredits: boolean
   upstream: AccountUpstream | null
   capabilities: AccountCapabilities
   outboundProxyId: string | null
@@ -181,13 +185,16 @@ export interface Account {
 }
 
 export interface AccountUpstream {
+  // 明确关闭共享或不支持互联时为 false，普通鉴权失败保留已识别身份
   discovered: boolean
   observedAt: string | null
   observedAtDisplay: string
   observedAtRelative: RelativeTimeView | null
   stale: boolean
   connectionRevision: string
-  lastError: 'unauthorized' | 'unsupported' | 'rate_limited' | 'invalid_response' | 'unavailable' | null
+  lastError: 'unauthorized' | 'sharing_disabled' | 'unsupported' | 'rate_limited' | 'invalid_response' | 'unavailable' | null
+  maxConcurrency: number | null
+  requestsPerMinute: number | null
   pool: {
     accountCount: number
     states: { ready: number, cooldown: number, exhausted: number, disabled: number, error: number, unknown: number }
@@ -196,6 +203,8 @@ export interface AccountUpstream {
 }
 
 export interface AccountCapabilities {
+  quotaLimitsSupported: boolean
+  quotaCredits: boolean
   quota: boolean
   quotaRefresh: boolean
   profile: boolean

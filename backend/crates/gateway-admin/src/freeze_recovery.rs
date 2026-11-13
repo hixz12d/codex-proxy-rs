@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
 use gateway_core::account::{AccountErrorProtection, ProviderAccountId};
+use gateway_core::engine::probe::AccountProbeTarget;
 use gateway_core::routing::UpstreamModelId;
 use gateway_core::task::{
     ScheduledTask, WorkerContribution, WorkerCycleContext, WorkerId, WorkerKind,
@@ -161,7 +162,11 @@ impl FreezeRecoveryTask {
         let probe_succeeded = match self
             .deps
             .accounts
-            .test_connection(account.clone(), model, Default::default())
+            .test_connection(
+                AccountProbeTarget::FreezeRecovery(account.clone()),
+                model,
+                Default::default(),
+            )
             .await
         {
             Ok(events) => drain_probe(events).await,

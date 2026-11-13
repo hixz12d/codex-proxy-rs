@@ -258,8 +258,16 @@ pub(crate) fn usage_list_record_view(
         .clone()
         .or_else(|| record.requested_model_id.clone());
     UsageListRecordView {
+        error_origin: record.error_origin().as_str(),
+        client_status_code: record.client_status_code,
+        upstream_status_code: record.upstream_status_code,
         error_code: record.error_code,
         error_message: record.error_message,
+        error_kind: record.error_kind,
+        websocket_close_code: record.websocket_close_code,
+        continuation_unavailable_reason: record.continuation_unavailable_reason,
+        upstream_connection_exit_reason: record.upstream_connection_exit_reason,
+        recovered: record.recovered,
         logical_outcome: record.outcome.as_str().to_owned(),
         client_api_key_name: record.client_api_key_name,
         id: record.id,
@@ -357,6 +365,24 @@ pub(crate) fn usage_record_view(
         .or_else(|| record.requested_model_id.clone());
     let metadata = provider_metadata_fields(record.provider_metadata_json.as_deref());
     UsageRecordView {
+        error_origin: record.error_origin().as_str(),
+        upstream_error: record
+            .upstream_error
+            .map(|error| super::wire::UsageUpstreamErrorView {
+                code: error.code,
+                error_type: error.error_type,
+                message: error.message,
+                param: error.param,
+                close_reason: error.close_reason,
+                last_event_type: error.last_event_type,
+            }),
+        retry_after_ms: record.retry_after_ms,
+        error_code: record.provider_error_code,
+        error_kind: record.error_kind,
+        websocket_close_code: record.websocket_close_code,
+        continuation_unavailable_reason: record.continuation_unavailable_reason,
+        upstream_connection_exit_reason: record.upstream_connection_exit_reason,
+        recovered: record.recovered,
         id: record.id.clone(),
         request_id: record.id,
         client_api_key_id: Some(record.client_api_key_ref),
@@ -679,8 +705,8 @@ pub(crate) fn trend_point_view(
         cached_input_tokens_value: point.metrics.cached_input_tokens,
         cache_hit_rate_value: point.cached_token_rate,
         tokens_value: point.metrics.total_tokens,
-        errors: format_compact_number(point.service_failure_count),
-        errors_value: point.service_failure_count,
+        errors: format_compact_number(point.error_count),
+        errors_value: point.error_count,
         latency_value: point.average_latency_ms,
         success_rate: success_rate_value
             .map_or_else(|| "—".to_owned(), |value| format!("{value:.1}%")),
@@ -743,7 +769,7 @@ pub(crate) fn trend_summary_view(
         TrendKind::Errors => vec![
             TrendSummaryView {
                 metric: TrendMetric::Errors,
-                value: format_compact_number(summary.service_failure_count),
+                value: format_compact_number(summary.error_count),
                 ratio: None,
             },
             TrendSummaryView {
@@ -1016,6 +1042,7 @@ pub(crate) fn dashboard_view(
         pool_summary: DashboardPoolSummaryView {
             total: provider_accounts.total,
             normal: provider_accounts.normal,
+            quota_paused: provider_accounts.quota_paused,
             quota_exhausted: provider_accounts.quota_exhausted,
             rate_limited: provider_accounts.rate_limited,
             disabled: provider_accounts.disabled,

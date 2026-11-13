@@ -10,10 +10,18 @@ use std::time::SystemTime;
 pub(super) struct TestPeerInfo(pub Arc<Mutex<Option<ProviderQuota>>>);
 
 impl UpstreamInfoSource for TestPeerInfo {
+    fn is_peer(&self, _: &ProviderAccount) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|quota| quota.upstream.as_ref().is_some_and(|info| info.discovered))
+    }
+
     fn signal(
         &self,
         _: &ProviderAccount,
-        _: &str,
+        _: Option<&str>,
         _: SystemTime,
     ) -> Option<UpstreamSchedulingSignal> {
         None
@@ -22,6 +30,14 @@ impl UpstreamInfoSource for TestPeerInfo {
 
 #[async_trait]
 impl PeerUpstreamService for TestPeerInfo {
+    fn observed_concurrency_limit(
+        &self,
+        _: &gateway_core::account::QuotaObservationVersion,
+        _: std::time::SystemTime,
+    ) -> Option<gateway_core::account::AccountConcurrencyLimit> {
+        None
+    }
+
     async fn account_changed(&self, _: &ProviderAccountId) -> Result<(), StoreError> {
         Ok(())
     }

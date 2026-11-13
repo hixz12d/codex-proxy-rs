@@ -23,6 +23,7 @@ use crate::{Revision, StoreError, StoreResult, redis_unavailable, require_nonemp
 
 use super::{MAX_REDIS_EXACT_INTEGER, namespace, resource_fingerprint};
 
+mod cleanup;
 mod details;
 
 const SIGNAL_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
@@ -248,6 +249,20 @@ pub struct CredentialLeaseGuard {
     grant: Option<CredentialLeaseGrant>,
 }
 
+impl gateway_core::provider_ports::ProviderLeaseGuard for CredentialLeaseGuard {
+    fn release(
+        self: Box<Self>,
+    ) -> futures::future::BoxFuture<'static, Result<(), ProviderStoreError>> {
+        Box::pin(async move {
+            (*self)
+                .release()
+                .await
+                .map(|_| ())
+                .map_err(|source| crate::provider_unavailable("release credential lease", source))
+        })
+    }
+}
+
 impl CredentialLeaseGuard {
     /// 自动续期仅属于返回 guard；丢失租约会取消依赖该槽位的请求
     pub fn maintain(
@@ -255,6 +270,17 @@ impl CredentialLeaseGuard {
         deadline: gateway_core::lifecycle::Deadline,
         cancellation: gateway_core::lifecycle::CancellationToken,
     ) -> StoreResult<impl gateway_core::provider_ports::ProviderLeaseGuard> {
+        Ok(RenewingSchedulingLease {
+            _renewal: self.renewal(deadline, cancellation)?,
+            _guard: self,
+        })
+    }
+
+    fn renewal(
+        &self,
+        deadline: gateway_core::lifecycle::Deadline,
+        cancellation: gateway_core::lifecycle::CancellationToken,
+    ) -> StoreResult<crate::lease_renewal::LeaseRenewal> {
         let repository = self.repository.clone();
         let lease_request = self.request.clone();
         let grant = self
@@ -265,7 +291,7 @@ impl CredentialLeaseGuard {
                 entity: "credential lease",
                 message: "lease has already been released".to_owned(),
             })?;
-        let renewal = crate::lease_renewal::LeaseRenewal::spawn(
+        Ok(crate::lease_renewal::LeaseRenewal::spawn(
             deadline,
             Some((
                 cancellation,
@@ -283,11 +309,7 @@ impl CredentialLeaseGuard {
                         .map(|grant| grant.is_some())
                 })
             },
-        );
-        Ok(RenewingSchedulingLease {
-            _renewal: renewal,
-            _guard: self,
-        })
+        ))
     }
 
     #[must_use]
@@ -309,6 +331,16 @@ struct RenewingSchedulingLease {
     // 先停止续期再释放 Redis 成员，防止释放与续期交错
     _renewal: crate::lease_renewal::LeaseRenewal,
     _guard: CredentialLeaseGuard,
+}
+
+impl gateway_core::provider_ports::ProviderLeaseGuard for RenewingSchedulingLease {
+    fn release(
+        self: Box<Self>,
+    ) -> futures::future::BoxFuture<'static, Result<(), ProviderStoreError>> {
+        let Self { _renewal, _guard } = *self;
+        drop(_renewal);
+        Box::new(_guard).release()
+    }
 }
 
 impl fmt::Debug for CredentialLeaseGuard {
@@ -422,7 +454,12 @@ impl RedisCredentialLeaseRepository {
         client_api_key_id: &ClientApiKeyId,
         provider_kind: &ProviderKind,
     ) -> StoreResult<u64> {
-        let key = self.scheduling_cursor_key(client_api_key_id, provider_kind)?;
+        let key = super::scheduling_cursor_key(
+            &self.namespace,
+            client_api_key_id,
+            provider_kind,
+            "cursor",
+        )?;
         let mut connection = self.connection.clone();
         let cursor = Script::new(ADVANCE_SCHEDULING_CURSOR_SCRIPT)
             .key(key)
@@ -462,21 +499,6 @@ impl RedisCredentialLeaseRepository {
             "{owner}|{}|{}",
             grant.lease_id,
             grant.fencing_token.get()
-        ))
-    }
-
-    fn scheduling_cursor_key(
-        &self,
-        client_api_key_id: &ClientApiKeyId,
-        provider_kind: &ProviderKind,
-    ) -> StoreResult<String> {
-        let fingerprint = resource_fingerprint(
-            "provider scheduling cursor",
-            &format!("{}\0{}", client_api_key_id.as_str(), provider_kind.as_str()),
-        )?;
-        Ok(format!(
-            "{}:scheduler:client-provider:{{{fingerprint}}}:cursor",
-            self.namespace
         ))
     }
 
@@ -591,6 +613,7 @@ pub(crate) struct RedisProviderLeaseCoordinator {
     repository: RedisCredentialLeaseRepository,
     process_id: String,
     sequence: AtomicU64,
+    cleanup: cleanup::SchedulingLeaseCleanup,
 }
 
 impl RedisProviderLeaseCoordinator {
@@ -600,7 +623,12 @@ impl RedisProviderLeaseCoordinator {
             repository,
             process_id: format!("gateway_{}", Uuid::now_v7().simple()),
             sequence: AtomicU64::new(0),
+            cleanup: cleanup::SchedulingLeaseCleanup::default(),
         }
+    }
+
+    pub(crate) fn cleanup_worker(&self) -> impl gateway_core::task::DaemonTask + use<> {
+        self.cleanup.clone()
     }
 
     fn owner_id(&self, operation: &str) -> String {
@@ -648,6 +676,7 @@ impl RedisProviderLeaseCoordinator {
                         in_flight: signal.in_flight,
                         last_started_at: signal.last_started_at.map(Into::into),
                         quota_reset_at: None,
+                        quota_reset_windows: None,
                         quota_remaining_rank: None,
                         cooldown: None,
                         failure_rate_basis_points: None,
@@ -662,6 +691,12 @@ impl RedisProviderLeaseCoordinator {
         &self,
         request: &ProviderSchedulingLeaseRequest,
     ) -> Result<ProviderLeaseAcquisition, ProviderStoreError> {
+        let _acquisition = self.cleanup.acquire().await.ok_or_else(|| {
+            ProviderStoreError::new(
+                ProviderStoreErrorKind::Unavailable,
+                "account lease coordinator is shutting down",
+            )
+        })?;
         let ttl = request.deadline().bounded(REQUEST_LEASE_TTL);
         if ttl.is_zero() {
             return Err(ProviderStoreError::new(
@@ -685,13 +720,18 @@ impl RedisProviderLeaseCoordinator {
             .map_err(|source| crate::provider_unavailable("acquire scheduling lease", source))?;
         Ok(match acquisition {
             CredentialBoundedLeaseAcquisition::Acquired(guard) => {
-                ProviderLeaseAcquisition::Acquired(Box::new(
-                    guard
-                        .maintain(request.deadline(), request.cancellation())
-                        .map_err(|source| {
-                            crate::provider_unavailable("maintain scheduling lease", source)
-                        })?,
-                ))
+                let renewal = guard
+                    .renewal(request.deadline(), request.cancellation())
+                    .map_err(|source| {
+                        crate::provider_unavailable("maintain scheduling lease", source)
+                    })?;
+                ProviderLeaseAcquisition::Acquired(Box::new(self.cleanup.track(
+                    request.cancellation(),
+                    async move {
+                        drop(renewal);
+                        guard.release().await
+                    },
+                )))
             }
             CredentialBoundedLeaseAcquisition::Busy { retry_after } => {
                 ProviderLeaseAcquisition::Busy { retry_after }

@@ -4,7 +4,10 @@ import type {
   ThemeComponentOverrides,
   ThemeCustomization,
   ThemeMode,
+  ThemePresetId,
   ThemeScheme,
+  ThemeSeedColors,
+  ThemeSeedDimensions,
   ThemeSeedOverrides,
   ThemeTokenName,
 } from '@codex-proxy/ui/theme'
@@ -15,10 +18,13 @@ import {
   createThemeVars,
   defaultThemeColorId,
   defaultThemeMode,
+  defaultThemePresetId,
   defaultThemePrimaryColor,
   isThemeColorId,
   isThemeMode,
+  isThemePresetId,
   normalizeThemeCustomization,
+  resolveThemeProfile,
 } from '@codex-proxy/ui/theme'
 
 import { storeToRefs } from 'pinia'
@@ -37,20 +43,20 @@ export type ThemeEditorComponent
     | 'layout'
 
 export interface ThemeEditorDraft {
+  preset: ThemePresetId
   mode: ThemeMode
   color: ThemeColorId
   customColor: string
   customization: ThemeCustomization
 }
 
-type NumericSeedKey = 'fontSize' | 'sizeUnit' | 'sizeStep' | 'controlHeight' | 'borderRadius' | 'shadowStrength'
 type ComponentNumberKey = keyof ThemeComponentOverrides
-type ColorSeedKey = Exclude<keyof ThemeSeedOverrides, NumericSeedKey>
 
 export function useThemeEditor() {
   const themeStore = useThemeStore()
   const {
     themeMode,
+    themePreset,
     themeColor,
     customThemeColor,
     themeCustomization,
@@ -68,6 +74,7 @@ export function useThemeEditor() {
 
   const resolvedPreview = computed(() => createTheme({
     scheme: previewTheme.value,
+    preset: draft.value.preset,
     colorId: draft.value.color,
     primaryColor: draft.value.customColor,
     customization: draft.value.customization,
@@ -82,6 +89,7 @@ export function useThemeEditor() {
   watch(
     [
       themeMode,
+      themePreset,
       themeColor,
       customThemeColor,
       themeCustomization,
@@ -104,6 +112,7 @@ export function useThemeEditor() {
 
   function createStoreDraft(): ThemeEditorDraft {
     return {
+      preset: themePreset.value,
       mode: themeMode.value,
       color: themeColor.value,
       customColor: customThemeColor.value,
@@ -111,11 +120,21 @@ export function useThemeEditor() {
     }
   }
 
-  function selectPreset(color: ThemeColorPresetId) {
+  function selectMaterial(preset: ThemePresetId) {
+    draft.value = { ...draft.value, preset }
+  }
+
+  function applyProfile(color: ThemeColorPresetId) {
     draft.value = {
       ...draft.value,
       color,
+      customColor: defaultThemePrimaryColor,
+      ...resolveThemeProfile(color, draft.value.customization.seed),
     }
+  }
+
+  function resetPrimaryColor() {
+    draft.value = { ...draft.value, color: defaultThemeColorId, customColor: defaultThemePrimaryColor }
   }
 
   function setPrimaryColor(color: string) {
@@ -136,14 +155,14 @@ export function useThemeEditor() {
       : mode
   }
 
-  function setSeedColor(key: ColorSeedKey, color: string) {
+  function setSeedColor(key: keyof ThemeSeedColors, color: string) {
     const normalized = normalizeHexColor(color)
     if (!normalized)
       return
     updateSeed({ [key]: normalized })
   }
 
-  function setSeedNumber(key: NumericSeedKey, value: number) {
+  function setSeedNumber(key: keyof ThemeSeedDimensions, value: number) {
     if (!Number.isFinite(value))
       return
     updateSeed({ [key]: value })
@@ -217,6 +236,7 @@ export function useThemeEditor() {
 
   function restoreDefaults() {
     draft.value = {
+      preset: defaultThemePresetId,
       mode: defaultThemeMode,
       color: defaultThemeColorId,
       customColor: defaultThemePrimaryColor,
@@ -272,7 +292,9 @@ export function useThemeEditor() {
     previewStyle,
     modificationCount,
     dirty,
-    selectPreset,
+    selectMaterial,
+    applyProfile,
+    resetPrimaryColor,
     setPrimaryColor,
     setMode,
     setSeedColor,
@@ -290,9 +312,10 @@ export function useThemeEditor() {
 
 function normalizeDraft(value: ThemeEditorDraft): ThemeEditorDraft | null {
   const customColor = normalizeHexColor(value.customColor)
-  if (!isThemeMode(value.mode) || !isThemeColorId(value.color) || !customColor)
+  if (!isThemePresetId(value.preset) || !isThemeMode(value.mode) || !isThemeColorId(value.color) || !customColor)
     return null
   return {
+    preset: value.preset,
     mode: value.mode,
     color: value.color,
     customColor,
@@ -319,6 +342,8 @@ function cloneDraft(value: ThemeEditorDraft): ThemeEditorDraft {
 
 function countDraftChanges(saved: ThemeEditorDraft, draft: ThemeEditorDraft) {
   let count = 0
+  if (saved.preset !== draft.preset)
+    count += 1
   if (saved.mode !== draft.mode)
     count += 1
   if (saved.color !== draft.color || saved.customColor !== draft.customColor)

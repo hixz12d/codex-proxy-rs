@@ -2,6 +2,7 @@
 
 mod capacity;
 mod cooldown_reads;
+mod scheduling_projection;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -10,11 +11,11 @@ use std::time::{Duration, SystemTime};
 
 use futures::executor::block_on;
 use gateway_core::account::{
-    AccountAttemptFeedback, AccountConcurrencyLimit, AccountErrorReason, AccountFeedbackStats,
-    AccountSelectionPolicy, AccountStateChange, AccountWeight, CredentialState, OpaqueProviderData,
-    ProviderAccount, ProviderAccountId, ProviderAccountStore as _, QuotaAccessChange,
-    QuotaAccessState, QuotaEvidence, QuotaObservation, QuotaState, QuotaWriteOutcome,
-    RotationStrategy,
+    AccountAffinity, AccountAttemptFeedback, AccountConcurrencyLimit, AccountErrorReason,
+    AccountFeedbackStats, AccountSelectionPolicy, AccountStateChange, AccountWeight,
+    CredentialState, OpaqueProviderData, ProviderAccount, ProviderAccountId,
+    ProviderAccountStore as _, QuotaAccessChange, QuotaAccessState, QuotaEvidence,
+    QuotaObservation, QuotaState, QuotaWriteOutcome, RotationStrategy,
 };
 use gateway_core::engine::continuation::{
     ContinuationBinding, NativeContinuationPin, PreviousResponseId,
@@ -144,6 +145,9 @@ async fn smart_reselection_respects_native_and_required_account_boundaries() {
         selector_with_affinity(&store, Arc::new(TestLeaseCoordinator::default()), affinity);
     let request_url = Url::parse(OFFICIAL_CODEX_BASE_URL).unwrap();
     for binding in ["soft", "required", "native"] {
+        if binding != "soft" {
+            store.fail_provider_listing();
+        }
         let continuation = (binding == "native").then(|| {
             ContinuationBinding::Pinned(NativeContinuationPin::new(
                 PreviousResponseId::new("client_response"),
@@ -225,6 +229,7 @@ fn selector_with_runtime(
         arch: "x86_64".to_owned(),
         terminal: "selector-contract".to_owned(),
         exact_user_agent: None,
+        installation_seed: None,
         residency: None,
         account_routing_override: None,
         verified_at: chrono::Utc::now(),
@@ -258,6 +263,7 @@ fn selector_with_runtime(
         cooldowns,
         account_feedback,
         CodexCookiePolicy::official().expect("official cookie policy"),
+        store.clone(),
     )
 }
 
@@ -790,8 +796,8 @@ fn selector_does_not_retry_invalid_credential_data() {
     assert!(leases.requests.lock().expect("lease requests").is_empty());
 }
 
-#[test]
-fn selector_round_robin_cursor_advances_across_requests() {
+#[tokio::test]
+async fn selector_round_robin_cursor_advances_across_requests() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_first", "at-first");
     create_account(&store, "acct_second", "at-second");
@@ -802,13 +808,15 @@ fn selector_round_robin_cursor_advances_across_requests() {
 
     for _ in 0..4 {
         let attempt = round_robin_attempt();
-        let lease = block_on(selector.select(&SelectCodexCredential {
-            upstream_model: "gpt-5.4",
-            request_url: &request_url,
-            attempt: &attempt,
-            session_affinity_key: None,
-        }))
-        .expect("select round robin account");
+        let lease = selector
+            .select(&SelectCodexCredential {
+                upstream_model: "gpt-5.4",
+                request_url: &request_url,
+                attempt: &attempt,
+                session_affinity_key: None,
+            })
+            .await
+            .expect("select round robin account");
         selected.push(lease.account_id().as_str().to_owned());
     }
 
@@ -816,6 +824,86 @@ fn selector_round_robin_cursor_advances_across_requests() {
         selected,
         ["acct_first", "acct_second", "acct_first", "acct_second"]
     );
+}
+
+#[tokio::test]
+async fn strict_round_robin_rotates_each_new_session_across_eligible_accounts() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_fallback", "at-fallback");
+    create_account(&store, "acct_first", "at-first");
+    create_account(&store, "acct_second", "at-second");
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let selector = selector_with_affinity(
+        &store,
+        Arc::clone(&leases),
+        Arc::new(MemorySessionAffinity::default()),
+    );
+    let request_url =
+        Url::parse("https://chatgpt.com/backend-api/codex/responses").expect("request URL");
+
+    assert_eq!(
+        select_strict_round_robin_session(&selector, &request_url, "session-1").await,
+        "acct_fallback"
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            select_strict_round_robin_session(&selector, &request_url, "session-1").await,
+            "acct_fallback"
+        );
+    }
+    assert_eq!(
+        select_strict_round_robin_session(&selector, &request_url, "session-2").await,
+        "acct_first"
+    );
+    assert_eq!(
+        select_strict_round_robin_session(&selector, &request_url, "session-1").await,
+        "acct_fallback"
+    );
+    assert_eq!(
+        select_strict_round_robin_session(&selector, &request_url, "session-3").await,
+        "acct_second"
+    );
+    assert_eq!(
+        select_strict_round_robin_session(&selector, &request_url, "session-4").await,
+        "acct_fallback"
+    );
+}
+
+async fn select_strict_round_robin_session(
+    selector: &CodexCredentialSelector,
+    request_url: &Url,
+    key: &str,
+) -> String {
+    let attempt = AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new("req_codex_round_robin_session").expect("request id"),
+            ClientApiKeyId::new("key_codex_contract").expect("client key id"),
+        ),
+        NonZeroU32::new(1).expect("attempt"),
+        SystemTime::now() + Duration::from_secs(30),
+        AccountSelectionPolicy::new(
+            RotationStrategy::RoundRobin,
+            NonZeroU32::new(2).expect("concurrency"),
+        )
+        .with_openai_account_affinity(AccountAffinity::Strict),
+        AccountAttemptContext::new(BTreeSet::new(), None, None)
+            .with_account_scope(contract_account_scope()),
+        None,
+        CancellationToken::new(),
+    );
+    let affinity_key = ProviderSessionAffinityKey::try_new(key).expect("affinity key");
+    selector
+        .select(&SelectCodexCredential {
+            upstream_model: "gpt-5.4",
+            request_url,
+            attempt: &attempt,
+            session_affinity_key: Some(&affinity_key),
+        })
+        .await
+        .expect("select round robin session")
+        .account_id()
+        .as_str()
+        .to_owned()
 }
 
 #[tokio::test]
@@ -1127,6 +1215,7 @@ fn selector_uses_only_the_required_account() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_first", "at-first");
     create_account(&store, "acct_second", "at-second");
+    store.fail_provider_listing();
     let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
     let required = ProviderAccountId::new("acct_second").expect("account id");
     let attempt = attempt_with_required(BTreeSet::new(), Some(required.clone()));
@@ -1142,32 +1231,50 @@ fn selector_uses_only_the_required_account() {
         )
         .expect("select required account");
     assert_eq!(lease.account_id(), &required);
+    let capacity = lease.capacity_snapshot().expect("fixed account capacity");
+    assert_eq!(capacity.used_slots(), 1);
+    assert_eq!(capacity.total_slots(), 2);
 }
 
 #[test]
 fn unavailable_required_account_never_falls_back() {
-    let store = Arc::new(MemoryAccountStore::default());
-    create_account(&store, "acct_available", "at-available");
-    let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
-    let attempt = attempt_with_required(
-        BTreeSet::new(),
-        Some(ProviderAccountId::new("acct_missing").expect("account id")),
-    );
-    let error =
-        block_on(
-            selector.select(&SelectCodexCredential {
-                upstream_model: "gpt-5.4",
-                request_url: &Url::parse("https://chatgpt.com/backend-api/codex/responses")
-                    .expect("request URL"),
-                attempt: &attempt,
-                session_affinity_key: None,
-            }),
-        )
-        .expect_err("missing required account must not fall back");
-    assert!(matches!(
-        error,
-        CredentialSelectionError::NoEligibleCredential
-    ));
+    for state in ["missing", "disabled", "outside_scope", "excluded"] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_available", "at-available");
+        let required = ProviderAccountId::new(if state == "outside_scope" {
+            "acct_outside"
+        } else {
+            "acct_missing"
+        })
+        .expect("account id");
+        if state != "missing" {
+            create_account(&store, required.as_str(), "at-required");
+        }
+        if state == "disabled" {
+            block_on(store.set_enabled(&required, false)).unwrap();
+        }
+        store.fail_provider_listing();
+        let leases = Arc::new(TestLeaseCoordinator::default());
+        let selector = selector(&store, leases.clone());
+        let excluded = if state == "excluded" {
+            BTreeSet::from([required.clone()])
+        } else {
+            BTreeSet::new()
+        };
+        let attempt = attempt_with_required(excluded, Some(required));
+        let error = block_on(selector.select(&SelectCodexCredential {
+            upstream_model: "gpt-5.4",
+            request_url: &Url::parse(OFFICIAL_CODEX_BASE_URL).expect("request URL"),
+            attempt: &attempt,
+            session_affinity_key: None,
+        }))
+        .expect_err("unavailable required account must not fall back");
+        assert!(
+            matches!(error, CredentialSelectionError::NoEligibleCredential),
+            "{state}: {error:?}"
+        );
+        assert!(leases.requests.lock().unwrap().is_empty(), "{state}");
+    }
 }
 
 #[test]
@@ -1600,6 +1707,7 @@ fn native_continuation_surfaces_the_original_accounts_quota_signal_to_the_coordi
     });
     let observed_at = SystemTime::now();
     let outcome = block_on(store.compare_and_swap_quota(QuotaObservation {
+        quota_pause: None,
         expected_connection: None,
         plan_type: None,
         account_id: original.id().clone(),

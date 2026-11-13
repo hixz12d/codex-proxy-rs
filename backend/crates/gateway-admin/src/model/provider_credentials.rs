@@ -304,6 +304,12 @@ impl PendingAuthorizationMutation {
                 "outbound_proxy_url".to_owned(),
                 Value::String(proxy.expose_url().to_owned()),
             );
+            if proxy.max_websocket_connections() != 0 {
+                document.insert(
+                    "outbound_proxy_max_websocket_connections".to_owned(),
+                    Value::from(proxy.max_websocket_connections()),
+                );
+            }
         }
         if let Some(id) = &self.outbound_proxy_id {
             document.insert("outbound_proxy_id".to_owned(), Value::String(id.clone()));
@@ -344,6 +350,11 @@ impl PendingAuthorizationMutation {
             .map(gateway_core::account::OutboundProxy::parse)
             .transpose()
             .map_err(|_| invalid())?;
+        let proxy = match (proxy, document.outbound_proxy_max_websocket_connections) {
+            (Some(proxy), Some(limit)) => Some(proxy.with_max_websocket_connections(limit)),
+            (None, Some(_)) => return Err(invalid()),
+            (proxy, None) => proxy,
+        };
         Ok(Self::new(
             provider_kind,
             target,
@@ -366,6 +377,8 @@ struct StoredAuthorizationMutationV1 {
     started_request_id: String,
     #[serde(default)]
     outbound_proxy_url: Option<String>,
+    #[serde(default)]
+    outbound_proxy_max_websocket_connections: Option<u32>,
     #[serde(default)]
     outbound_proxy_id: Option<String>,
 }
@@ -806,11 +819,12 @@ pub struct ProviderQuotaWindow {
     pub provider_data: Option<ProviderDocument>,
 }
 
-/// 账号用量统计周期，按周优先、月次之选择；短期限流窗口不参与统计面板
+/// 账号用量统计周期，完整周/月额度优先，随后使用 Provider 提供的本地滚动日统计
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AccountUsagePeriod {
     Weekly,
     Monthly,
+    Daily,
 }
 
 /// Provider 解释 quota 所需的公共请求事实
@@ -831,6 +845,7 @@ pub struct ProviderQuotaReadRequest<'a> {
 /// Provider 已解析的 quota 结果及其不透明差异字段
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ProviderQuota {
+    pub paused_windows: Vec<String>,
     pub upstream: Option<super::upstream_info::ProviderUpstreamInfo>,
     /// 上游额度响应明确提供的套餐，可用于补全账号展示
     pub plan_type: Option<String>,
@@ -838,7 +853,7 @@ pub struct ProviderQuota {
     pub refresh_token_expires_at: Option<DateTime<Utc>>,
     pub windows: Vec<ProviderQuotaWindow>,
     pub credits: Option<ProviderQuotaCredits>,
-    /// 展示用快照级触顶事实（顶层或任一窗口触顶）；不参与账号五态派生
+    /// 展示用快照级触顶事实（顶层或任一窗口触顶）；不参与账号状态派生
     pub limit_reached: bool,
     pub provider_data: Option<ProviderDocument>,
 }
@@ -998,16 +1013,27 @@ impl ProviderQuota {
         }
     }
 
-    /// 选择账号用量统计的周/月窗口，同时返回展示所需的周期事实
+    /// 选择账号用量统计窗口，同时返回展示所需的周期事实
     ///
-    /// 只使用边界完整、可归属到整个账号的窗口；周优先于月，同周期保持
-    /// Provider 投影顺序
-    /// 没有符合条件的窗口时不回退到短期或历史累计
+    /// 周/月额度使用边界完整、可归属到整个账号的窗口
+    /// 周优先于月，同周期保持 Provider 投影顺序
+    /// Provider 提供的无固定重置点的滚动日统计可独立展示
     #[must_use]
     pub fn usage_window(&self) -> Option<(&ProviderQuotaWindow, AccountUsagePeriod)> {
         self.usage_windows()
             .filter(|(window, _)| window.local_usage.is_some())
             .min_by_key(|(_, period)| *period)
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .find(|window| {
+                        window.local_usage_attribution == QuotaLocalUsageAttribution::AccountWide
+                            && window.window_seconds == Some(86_400)
+                            && window.reset_at.is_none()
+                            && window.local_usage.is_some()
+                    })
+                    .map(|window| (window, AccountUsagePeriod::Daily))
+            })
     }
 
     /// 互联账号按最长的 Key 消费周期统计本地用量，池内账号窗口不代表此 Key 的周期
@@ -1025,7 +1051,7 @@ impl ProviderQuota {
             .max_by_key(|window| window.window_seconds)
     }
 
-    /// 统计与预测共用窗口归属规则，避免把模型专属桶或短期限流当作账号容量
+    /// 周/月额度的归属规则，供额度周期统计与容量预测共用
     pub(crate) fn usage_windows(
         &self,
     ) -> impl Iterator<Item = (&ProviderQuotaWindow, AccountUsagePeriod)> {

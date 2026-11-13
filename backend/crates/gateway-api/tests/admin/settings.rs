@@ -56,7 +56,9 @@ fn update_body() -> Value {
         "openaiAccountAffinity": "relaxed",
         "maxAccountRotations": 3,
         "openaiSessionAffinityTtlHours": 24,
-        "concurrencyWaitTimeoutSeconds": 30,
+        "keyQueueTimeoutSeconds": 30,
+        "accountQueueTimeoutSeconds": 30,
+        "switchAccountOnQueueFailure": false,
         "maxRetryAfterSeconds": 240,
         "responsesMaxDecompressedBodyBytes": 67108864,
         "rotationStrategy": "round_robin",
@@ -68,7 +70,7 @@ fn update_body() -> Value {
         "auditRetentionDays": 91,
         "accountErrorProtection": gateway_core::account::AccountErrorProtection::default(),
         "accountWarmupEnabled": false,
-        "accountWarmupScheduleTime": "08:00",
+        "accountWarmupCron": "0 8 * * *",
         "accountWarmupModel": null,
         "resetCreditLeadMinutes": 10,
         "resetCreditMaxWeeklyRemainingPercent": null
@@ -266,7 +268,7 @@ async fn smart_settings_round_trip_and_invalid_updates_leave_the_saved_value_int
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     let mut body = update_body();
-    let custom = json!({"loadWeight": 2.0, "quotaWeight": 0.0, "healthWeight": 1.0, "latencyWeight": 0.5, "resetWeight": 1.2, "queueWeight": 2.3});
+    let custom = json!({"loadWeight": 2.0, "quotaWeight": 0.0, "healthWeight": 1.0, "latencyWeight": 0.5, "resetWeight": 1.2, "queueWeight": 2.3, "resetWindowWeights":{"fiveHour":0.0,"weekly":1.5,"monthly":0.0}});
     body["smartScheduling"] = custom.clone();
     let response = app(fixture.state())
         .oneshot(request(
@@ -298,6 +300,19 @@ async fn smart_settings_round_trip_and_invalid_updates_leave_the_saved_value_int
         let mut missing = custom.clone();
         missing.as_object_mut().unwrap().remove(field);
         invalid_values.push(missing);
+    }
+    for windows in [
+        json!({}),
+        json!({"weekly":1}),
+        json!(null),
+        json!({"fiveHour":0,"weekly":1.23,"monthly":0}),
+        json!({"fiveHour":-1,"weekly":1,"monthly":0}),
+        json!({"fiveHour":0,"weekly":1,"monthly":10.1}),
+        json!({"fiveHour":0,"weekly":1,"monthly":0,"daily":1}),
+    ] {
+        let mut invalid = custom.clone();
+        invalid["resetWindowWeights"] = windows;
+        invalid_values.push(invalid);
     }
     for invalid in invalid_values {
         body["smartScheduling"] = invalid;
@@ -398,6 +413,43 @@ fn settings_request_accepts_unlimited_default_account_concurrency() {
     let request: UpdateRuntimeSettingsRequest =
         serde_json::from_value(body).expect("decode settings");
     request.validate().expect("zero means unlimited");
+}
+
+#[test]
+fn settings_request_validates_cron_and_allows_disabled_empty_schedule() {
+    for (enabled, cron, valid) in [
+        (false, "", true),
+        (true, "", false),
+        (false, "08:00", false),
+        (true, "0 8 * * MON-FRI", true),
+        (true, "60 8 * * *", false),
+        (true, "0 8 * * *;30 13 * * *", true),
+        (true, "0 8 * * *\n30 13 * * *", false),
+        (true, "0 8 * * *;60 13 * * *", false),
+        (false, "0 8 * * *;", false),
+        (true, "0 8 * * *;;30 13 * * *", false),
+        (true, "0 8 * * *\r\n30 13 * * *", false),
+    ] {
+        let mut body = update_body();
+        body["accountWarmupEnabled"] = json!(enabled);
+        body["accountWarmupCron"] = json!(cron);
+        body["accountWarmupModel"] = json!("test-model");
+        let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
+        let result = request.validate();
+        assert_eq!(result.is_ok(), valid, "{enabled}: {cron:?}");
+        if let Err(error) = result {
+            assert_eq!(error.field(), "accountWarmupCron");
+        }
+    }
+    let mut oversized = update_body();
+    oversized["accountWarmupCron"] = json!(["* * * * *"; 26].join(";"));
+    let request: UpdateRuntimeSettingsRequest = serde_json::from_value(oversized).unwrap();
+    assert_eq!(request.validate().unwrap_err().field(), "accountWarmupCron");
+
+    let mut legacy = update_body();
+    legacy.as_object_mut().unwrap().remove("accountWarmupCron");
+    legacy["accountWarmupScheduleTime"] = json!("08:00");
+    assert!(serde_json::from_value::<UpdateRuntimeSettingsRequest>(legacy).is_err());
 }
 
 #[test]
@@ -659,8 +711,10 @@ fn concurrency_queue_fields_validate_bounds_and_accept_disabled_queues() {
     for (field, invalid) in [
         ("maxWaitingPerKey", 1001),
         ("maxWaitingPerAccount", 1001),
-        ("concurrencyWaitTimeoutSeconds", 0),
-        ("concurrencyWaitTimeoutSeconds", 121),
+        ("keyQueueTimeoutSeconds", 0),
+        ("accountQueueTimeoutSeconds", 0),
+        ("keyQueueTimeoutSeconds", 121),
+        ("accountQueueTimeoutSeconds", 121),
     ] {
         let mut body = update_body();
         body[field] = json!(invalid);
@@ -670,7 +724,7 @@ fn concurrency_queue_fields_validate_bounds_and_accept_disabled_queues() {
     let mut body = update_body();
     body["maxWaitingPerKey"] = json!(0);
     body["maxWaitingPerAccount"] = json!(1000);
-    body["concurrencyWaitTimeoutSeconds"] = json!(120);
+    body["accountQueueTimeoutSeconds"] = json!(120);
     serde_json::from_value::<UpdateRuntimeSettingsRequest>(body)
         .unwrap()
         .validate()
@@ -1507,11 +1561,14 @@ fn reset_credit_weekly_threshold_accepts_unset_and_zero_to_one_hundred() {
             .reset_credit_max_weekly_remaining_percent
             .is_none()
     );
+    assert!(!request.values.reset_credit_on_low_weekly_quota);
     for value in [json!(null), json!(0), json!(70), json!(100)] {
         let mut body = update_body();
+        body["resetCreditOnLowWeeklyQuota"] = json!(true);
         body["resetCreditMaxWeeklyRemainingPercent"] = value.clone();
         let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
         request.validate().unwrap();
+        assert!(request.values.reset_credit_on_low_weekly_quota);
         assert_eq!(
             serde_json::to_value(request.values.reset_credit_max_weekly_remaining_percent).unwrap(),
             value

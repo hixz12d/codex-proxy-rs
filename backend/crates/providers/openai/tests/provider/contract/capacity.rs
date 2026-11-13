@@ -14,10 +14,12 @@ fn queued_context(request_id: &str) -> AttemptContext {
         ),
         NonZeroU32::new(1).unwrap(),
         SystemTime::now() + Duration::from_secs(5),
-        account_policy().with_queue(ConcurrencyQueuePolicy {
-            max_waiting: 1,
-            timeout: Duration::from_secs(2),
-        }),
+        account_policy()
+            .with_switch_account_on_queue_failure(true)
+            .with_queue(ConcurrencyQueuePolicy {
+                max_waiting: 1,
+                timeout: Duration::from_secs(2),
+            }),
         AccountAttemptContext::new(BTreeSet::new(), None, None)
             .with_account_scope(contract_account_scope()),
         None,
@@ -192,6 +194,7 @@ async fn guardian_and_normal_requests_use_independent_capacity_and_observations(
         in_flight,
         last_started_at: None,
         quota_reset_at: None,
+        quota_reset_windows: None,
         quota_remaining_rank: None,
         cooldown: None,
         failure_rate_basis_points: None,
@@ -324,6 +327,7 @@ async fn a_full_capacity_pool_does_not_block_the_other_pools_queue() {
                 in_flight: if guardian_waits { 1 } else { 2 },
                 last_started_at: None,
                 quota_reset_at: None,
+                quota_reset_windows: None,
                 quota_remaining_rank: None,
                 cooldown: None,
                 failure_rate_basis_points: None,

@@ -7,7 +7,6 @@ use gateway_core::account::OpaqueProviderData;
 
 use gateway_admin::model::{
     PageSize, Revision,
-    accounts::AccountUsage,
     auth::LoginCommand,
     client_keys::ClientKeyPageSize,
     observability::{DecimalAmount, RequestOutcome, TimeRange},
@@ -107,6 +106,7 @@ fn provider_document_debug_should_not_expose_opaque_material() {
 #[test]
 fn representative_quota_should_prefer_short_window_and_highest_usage() {
     let quota = ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -130,6 +130,7 @@ fn representative_quota_should_prefer_account_wide_window_over_model_specific_wi
     let mut model_specific = quota_window("shortTerm", Some(18_000), Some(64.0));
     model_specific.local_usage_attribution = QuotaLocalUsageAttribution::Unavailable;
     let quota = ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -147,59 +148,9 @@ fn representative_quota_should_prefer_account_wide_window_over_model_specific_wi
 }
 
 #[test]
-fn usage_window_should_not_use_daily_rolling_usage_for_weekly_statistics() {
-    let usage = AccountUsage {
-        account_id: "acct_xai".to_owned(),
-        request_count: 5,
-        success_count: 5,
-        input_tokens: Some(100),
-        output_tokens: Some(20),
-        cached_input_tokens: Some(80),
-        cache_write_input_tokens: Some(0),
-        reasoning_output_tokens: Some(0),
-        image_input_tokens: Some(0),
-        image_output_tokens: Some(0),
-        image_request_count: 0,
-        image_request_failed_count: 0,
-        total_tokens: Some(120),
-        cost_coverage: Default::default(),
-        costs: Vec::new(),
-        last_used_at: Some(Utc::now()),
-        request_buckets: Vec::new(),
-        models: Vec::new(),
-    };
-    let quota = ProviderQuota {
-        upstream: None,
-        credits: None,
-        plan_type: None,
-        observed_at: None,
-        refresh_token_expires_at: None,
-        windows: vec![ProviderQuotaWindow {
-            upstream: None,
-            key: "free-rolling-24h".to_owned(),
-            group: "shortTerm".to_owned(),
-            label: "日限额".to_owned(),
-            limit_id: None,
-            limit_name: None,
-            role: None,
-            local_usage_attribution: QuotaLocalUsageAttribution::AccountWide,
-            window_seconds: Some(86_400),
-            used_percent: None,
-            reset_at: None,
-            limit_reached: false,
-            local_usage: Some(usage),
-            provider_data: None,
-        }],
-        limit_reached: false,
-        provider_data: None,
-    };
-
-    assert_eq!(quota.usage_window(), None);
-}
-
-#[test]
 fn exhausted_quota_should_project_full_usage_to_only_the_representative_window() {
     let mut quota = ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -230,6 +181,7 @@ fn exhausted_quota_should_preserve_the_provider_identified_reached_window() {
     let mut reached = quota_window("monthly", Some(2_592_000), Some(98.0));
     reached.limit_reached = true;
     let mut quota = ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,

@@ -15,6 +15,7 @@ import { getAccountModels, refreshAccountModels, streamAccountConnectionTests } 
 import { ApiError } from '@/api/request'
 import { useIdSet } from '@/composables/useIdSet'
 import { useRequestState } from '@/composables/useRequestState'
+import { t } from '@/i18n'
 import { notification as ZNotification } from '@/utils/notification'
 import { errorMessage, withMinimumDuration } from '@/utils/operation'
 
@@ -37,6 +38,7 @@ interface ConnectionTestLog {
   text: string
   tone: ConnectionTestLogTone
   detail: string
+  failureMessage?: string
 }
 
 interface ConnectionTestTimestamp { occurredAtDisplay?: string, timeDisplay?: string }
@@ -83,6 +85,17 @@ const CONNECTION_TEST_SOURCE_LABEL: Record<AccountConnectionTestFailureSource, s
 }
 
 export function connectionTestFailureText(event: AccountConnectionTestFailureEvent) {
+  // 请求未发出时优先说明代理问题，避免把代理故障误读为上游不可用
+  if (event.source === 'provider' && event.sendState === 'not_sent') {
+    switch (event.proxyHint) {
+      case 'invalid_configuration': return t('accounts.connectionTest.errors.proxyInvalid')
+      case 'unreachable': return t('accounts.connectionTest.errors.proxyUnreachable')
+      case 'tunnel_failed': return t('accounts.connectionTest.errors.proxyTunnelFailed')
+      case 'check_proxy': return t('accounts.connectionTest.errors.checkProxy')
+    }
+    if (event.gatewayErrorCode === 'upstream_unavailable')
+      return t('accounts.connectionTest.errors.notSent')
+  }
   return event.gatewayErrorCode
     ? CONNECTION_TEST_FAILURE_TEXT[event.gatewayErrorCode] || '未分类错误'
     : '测试连接失败'
@@ -96,6 +109,7 @@ function connectionTestFailureDiagnostics(event: AccountConnectionTestFailureEve
   return {
     error: event.error ?? null,
     gatewayErrorCode: event.gatewayErrorCode ?? null,
+    proxyHint: event.proxyHint ?? null,
     sendState: event.sendState ?? null,
     upstreamStatus: event.upstreamStatus ?? null,
     providerErrorCode: event.providerErrorCode ?? null,
@@ -153,7 +167,7 @@ export function useAccountConnectionTest(options: { reload: () => Promise<unknow
     if (connectionTestStatus.value === 'error') {
       return {
         label: '测试失败',
-        description: '请求未完成，请在下方查看失败来源与原始诊断',
+        description: connectionTestLogs.value.at(-1)?.failureMessage ?? '请求未完成，请在下方查看失败来源与原始诊断',
         icon: XCircle,
         badge: 'bg-z-error-container text-z-error-on-container',
         iconClass: 'text-z-error',
@@ -279,8 +293,10 @@ export function useAccountConnectionTest(options: { reload: () => Promise<unknow
     detail?: unknown,
     event?: ConnectionTestTimestamp,
   ) {
-    connectionTestError.value = message
-    setConnectionTestLog(key, `${label}：${message}`, 'danger', detail, event)
+    connectionTestLogs.value.push({
+      ...connectionTestLogItem(key, label, 'danger', detail, event),
+      failureMessage: message,
+    })
     finishConnectionTest('error', event)
   }
 
@@ -356,9 +372,9 @@ export function useAccountConnectionTest(options: { reload: () => Promise<unknow
       )
       if (!modelsRequest.isCurrent(requestId))
         return
-      applyConnectionTestModels(result, refresh)
+      applyConnectionTestModels(result.models, account, refresh)
       if (refresh) {
-        ZNotification.success({ message: `已刷新 ${connectionTestModelOptions.value.length} 个上游模型` })
+        ZNotification.success({ message: `已刷新 ${result.models.length} 个上游模型` })
       }
       else if (!connectionTestSelectedModel.value) {
         connectionTestError.value = '没有可测试模型'
@@ -368,28 +384,25 @@ export function useAccountConnectionTest(options: { reload: () => Promise<unknow
       if (!modelsRequest.isCurrent(requestId))
         return
       connectionTestError.value = errorMessage(error)
-      if (!refresh) {
-        connectionTestModelOptions.value = []
-        connectionTestSelectedModel.value = ''
-      }
+      if (!refresh)
+        applyConnectionTestModels([], account)
     }
     finally {
       modelsRequest.finish(requestId)
     }
   }
 
-  function applyConnectionTestModels(result: AccountModelsResponse, preserveSelection = false) {
+  function applyConnectionTestModels(catalog: AccountModelsResponse['models'], account: Account, preserveSelection = false) {
     const previousSelection = preserveSelection ? connectionTestSelectedModel.value : ''
-    connectionTestModelOptions.value = []
-    for (const model of result.models ?? []) {
-      connectionTestModelOptions.value.push({
-        label: model.label || model.id,
-        value: model.id,
-      })
+    const labels = new Map(catalog.map(model => [model.id, model.label || model.id]))
+    if (account.modelAccess.mode === 'allowlist') {
+      for (const id of account.modelAccess.models) {
+        if (!labels.has(id))
+          labels.set(id, id)
+      }
     }
-    connectionTestSelectedModel.value = connectionTestModelOptions.value.some(
-      model => model.value === previousSelection,
-    )
+    connectionTestModelOptions.value = Array.from(labels, ([value, label]) => ({ value, label }))
+    connectionTestSelectedModel.value = labels.has(previousSelection)
       ? previousSelection
       : connectionTestModelOptions.value[0]?.value || ''
   }

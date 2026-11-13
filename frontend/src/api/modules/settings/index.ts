@@ -30,6 +30,7 @@ export interface SmartSchedulingConfig {
   latencyWeight: number
   resetWeight: number
   queueWeight: number
+  resetWindowWeights: { fiveHour: number, weekly: number, monthly: number }
 }
 
 export interface RuntimeSettings {
@@ -53,7 +54,9 @@ export interface RuntimeSettings {
   openaiSessionAffinityTtlHours: number
   maxWaitingPerKey: number
   maxWaitingPerAccount: number
-  concurrencyWaitTimeoutSeconds: number
+  keyQueueTimeoutSeconds: number
+  accountQueueTimeoutSeconds: number
+  switchAccountOnQueueFailure: boolean
   maxRetryAfterSeconds: number
   responsesMaxDecompressedBodyBytes: number
   rotationStrategy: RotationStrategy
@@ -64,8 +67,9 @@ export interface RuntimeSettings {
   auditRetentionDays: number
   accountErrorProtection: AccountErrorProtection
   accountWarmupEnabled: boolean
-  accountWarmupScheduleTime: string
+  accountWarmupCron: string
   accountWarmupModel: string | null
+  resetCreditOnLowWeeklyQuota: boolean
   resetCreditLeadMinutes: number
   resetCreditMaxWeeklyRemainingPercent: number | null
   updatedAt: string

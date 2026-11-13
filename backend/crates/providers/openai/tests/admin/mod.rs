@@ -169,6 +169,67 @@ async fn custom_identity_preview_and_dashboard_share_the_exact_request_profile()
 }
 
 #[tokio::test]
+async fn installation_seed_is_optional_and_validated_only_for_key_profiles() {
+    let bundle = provider_openai::initialize(
+        valid_config().config,
+        provider_ports(),
+        Arc::new(gateway_core::account::UpstreamInfoReader::default()),
+    )
+    .await
+    .unwrap();
+    let provider = bundle.admin_provider();
+    let id = "3B11BC82-C666-417D-B9FF-2A34FD040385";
+    for (value, valid) in [
+        (json!(id), true),
+        (json!(null), true),
+        (json!(""), true),
+        (json!(id.replace('-', "")), false),
+        (json!("bad"), false),
+        (json!(42), false),
+    ] {
+        let configuration = OpaqueProviderData::new(
+            json!({
+                "mode": "custom", "userAgent": "codex-tui/1.0.0", "installationSeed": value
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let preview = provider.preview_key_client_profile(&configuration, None);
+        assert_eq!(preview.is_ok(), valid);
+        if value == id {
+            assert_eq!(
+                preview.unwrap().expose_to_provider()["configuration"]["installationSeed"],
+                id.to_lowercase()
+            );
+            assert!(provider.preview_client_profile(&configuration).is_err());
+        }
+    }
+    let doc =
+        |value: serde_json::Value| OpaqueProviderData::new(value.as_object().unwrap().clone());
+    let global = doc(json!({"mode": "custom", "userAgent": "codex-tui/2.0.0"}));
+    let key = doc(json!({"inherit":{"installationSeed":id}}));
+    let preview = provider
+        .preview_key_client_profile(&key, Some(&global))
+        .unwrap()
+        .into_inner();
+    assert_eq!(preview["userAgent"], "codex-tui/2.0.0");
+    assert_eq!(
+        preview["configuration"]["installationSeed"],
+        id.to_lowercase()
+    );
+    assert!(provider.preview_client_profile(&key).is_err());
+    assert!(
+        provider
+            .preview_key_client_profile(
+                &doc(json!({"inherit":{"userAgent":"other"}})),
+                Some(&global)
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions_once() {
     let config = valid_config();
     let mut bundle = provider_openai::initialize(
@@ -648,7 +709,7 @@ async fn reset_credit_explicit_http_rejection_should_preserve_the_raw_body() {
 }
 
 #[tokio::test]
-async fn openai_core_provider_projects_codex_request_observation_without_routing_side_effects() {
+async fn openai_core_provider_projects_private_request_observation_without_execution() {
     let config = valid_config();
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -662,14 +723,11 @@ async fn openai_core_provider_projects_codex_request_observation_without_routing
         Map::from_iter([
             ("model".to_owned(), json!("gpt-5.4")),
             ("input".to_owned(), json!("summarize")),
-            ("reasoning".to_owned(), json!({"effort": "high"})),
+            ("session_id".to_owned(), json!("observation-session")),
+            ("previous_response_id".to_owned(), json!("resp_previous")),
         ]),
     )
-    .expect("OpenAI payload")
-    .with_context(Map::from_iter([(
-        "turn_metadata".to_owned(),
-        Value::String(r#"{"request_kind":"compaction","subagent_kind":"review"}"#.to_owned()),
-    )]));
+    .expect("OpenAI payload");
     let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
 
     let client_key_id = ClientApiKeyId::new("key_openai_admin_observation").expect("client key");
@@ -677,11 +735,9 @@ async fn openai_core_provider_projects_codex_request_observation_without_routing
         .core_provider()
         .request_observation(&operation, &client_key_id);
 
-    assert_eq!(observation.request_kind.as_deref(), Some("compaction"));
-    assert_eq!(observation.subagent_kind.as_deref(), Some("review"));
-    // Codex 当前只在特定多代理预设组合下给出 reasoning_preset；普通 high 保持空值
-    assert_eq!(observation.reasoning_preset, None);
-    assert!(observation.compact);
+    assert!(observation.continuation.requested);
+    assert!(observation.continuation.previous_response_id_hash.is_some());
+    assert!(observation.continuation.affinity_hash.is_some());
 }
 
 #[tokio::test]
@@ -770,6 +826,113 @@ async fn openai_admin_provider_persists_the_full_pending_envelope_and_binds_owne
         .expect_err("wrong owner");
     assert_eq!(error.kind(), ProviderAdminErrorKind::NotFound);
     assert_eq!(pending.values.lock().expect("OAuth pending").len(), 1);
+}
+
+#[tokio::test]
+async fn oauth_connection_failures_preserve_safe_diagnostics_and_release_the_claim() {
+    use std::error::Error as _;
+    use tokio::io::AsyncReadExt as _;
+
+    for timed_out in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy_task = if timed_out {
+            Some(tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(request[..count].starts_with(b"CONNECT "));
+                std::future::pending::<()>().await;
+            }))
+        } else {
+            drop(listener);
+            None
+        };
+        let pending = Arc::new(TestOAuthPending::default());
+        let mut config = valid_config();
+        config.config.auth.oauth_token_endpoint =
+            "https://oauth.example.invalid/oauth/token?PRIVATE_URL_MARKER".to_owned();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(Arc::new(MemoryAccountStore::default()), pending.clone()),
+            Arc::new(gateway_core::account::UpstreamInfoReader::default()),
+        )
+        .await
+        .unwrap();
+        let context = MutationContext {
+            actor: MutationActor::System,
+            request_id: "oauth-connection-failure".to_owned(),
+        };
+        let started = bundle
+            .admin_provider()
+            .start_authorization(
+                PendingAuthorizationMutation::new(
+                    ProviderKind::new("openai").unwrap(),
+                    AuthorizationMutationTarget::Create {
+                        name: String::new(),
+                    },
+                    AuthorizationOwnerBinding::from_context(&context),
+                )
+                .with_outbound_proxy(Some(
+                    gateway_core::account::OutboundProxy::parse(&format!(
+                        "http://proxy-user:PRIVATE_PROXY_PASSWORD@{address}"
+                    ))
+                    .unwrap(),
+                )),
+            )
+            .await
+            .unwrap();
+        let state = {
+            let values = pending.values.lock().unwrap();
+            let (_, payload, _, _) = values.values().next().unwrap();
+            payload.expose_to_provider()["state"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let error = bundle
+            .admin_provider()
+            .complete_authorization(CompleteAuthorization {
+                settings: None,
+                context,
+                flow_id: started.flow_id,
+                callback_url: format!(
+                    "http://127.0.0.1:1455/auth/callback?code=PRIVATE_CODE&state={state}"
+                ),
+            })
+            .await
+            .unwrap_err();
+        if let Some(task) = proxy_task {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(error.kind(), ProviderAdminErrorKind::Unavailable);
+        assert_eq!(
+            error.public_message(),
+            Some(if timed_out {
+                "连接 OpenAI 授权服务超时，请检查出站连接"
+            } else {
+                "无法连接 OpenAI 授权服务，请检查出站连接"
+            }),
+        );
+        let mut source = error.source();
+        let transport = loop {
+            let cause = source.expect("transport cause must reach the admin boundary");
+            if let Some(transport) = cause.downcast_ref::<reqwest::Error>() {
+                break transport;
+            }
+            source = cause.source();
+        };
+        assert!(transport.is_connect());
+        assert_eq!(transport.is_timeout(), timed_out);
+        assert!(transport.url().is_none());
+        assert!(!format!("{error:?} {error}").contains("PRIVATE_"));
+        let details =
+            gateway_core::error::ErrorDetails::capture(Some(&error.into()), None, true).unwrap();
+        assert!(!details.as_str().contains("PRIVATE_"));
+        let values = pending.values.lock().unwrap();
+        assert!(values.values().next().unwrap().3.is_none());
+    }
 }
 
 #[tokio::test]
@@ -933,6 +1096,7 @@ async fn openai_admin_batch_quota_isolates_stale_and_invalid_observations() {
             };
             store
                 .compare_and_swap_quota(QuotaObservation {
+                    quota_pause: None,
                     expected_connection: None,
                     account_id: account.id().clone(),
                     expected_revision: account.revision(),
@@ -1044,7 +1208,13 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
     let record = account_record(&account);
     let config = valid_config();
     let catalog_cache = Arc::new(TestCatalogCache::default());
-    catalog_cache.seed("plan:pro", ["gpt-5.4"]);
+    catalog_cache.seed(
+        provider_openai::credential::CodexCatalogScope::for_account(&account)
+            .cache_scope()
+            .unwrap()
+            .as_str(),
+        ["gpt-5.4"],
+    );
     let bundle = provider_openai::initialize(
         config.config.clone(),
         provider_ports_with_catalog(
@@ -1278,6 +1448,7 @@ async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_o
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1394,6 +1565,7 @@ async fn openai_admin_provider_projects_official_codex_quota_and_independent_buc
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1497,6 +1669,7 @@ async fn openai_admin_keeps_confirmed_exhaustion_separate_from_raw_usage_display
     let observed_at = SystemTime::now();
     store
         .compare_and_swap_quota(QuotaObservation {
+            quota_pause: None,
             expected_connection: None,
             plan_type: None,
             account_id: account.id().clone(),
@@ -1609,6 +1782,7 @@ async fn openai_admin_preserves_expired_window_usage_and_exhaustion_attribution(
         };
         store
             .compare_and_swap_quota(QuotaObservation {
+                quota_pause: None,
                 expected_connection: None,
                 plan_type: None,
                 account_id: account.id().clone(),
@@ -2011,6 +2185,9 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_paused: false,
+        quota_limits: Default::default(),
+        auto_use_quota_credits: false,
         outbound_proxy_id: None,
         outbound_proxy_enabled: true,
         notes: None,
@@ -2183,6 +2360,21 @@ impl ProviderCredentialStatePort for TestCredentialState {
 struct TestCooldown;
 
 impl ProviderCooldownPort for TestCooldown {
+    fn read_many<'a>(
+        &'a self,
+        account_ids: &'a [ProviderAccountId],
+    ) -> BoxFuture<'a, Vec<Result<Option<ProviderCooldown>, ProviderStoreError>>> {
+        Box::pin(async move { account_ids.iter().map(|_| Ok(None)).collect() })
+    }
+
+    fn read_scoped_many<'a>(
+        &'a self,
+        account_ids: &'a [ProviderAccountId],
+        _scope: &'a ProviderCooldownScope,
+    ) -> BoxFuture<'a, Vec<Result<Option<ProviderScopedCooldown>, ProviderStoreError>>> {
+        Box::pin(async move { account_ids.iter().map(|_| Ok(None)).collect() })
+    }
+
     fn put_if_later(
         &self,
         _cooldown: ProviderCooldown,
@@ -2863,7 +3055,8 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         .unwrap()
         .unwrap();
     let configuration = configuration.expose_to_provider().expose_to_provider();
-    assert_eq!(configuration.len(), 2);
+    assert_eq!(configuration.len(), 3);
+    assert_eq!(configuration.get("protocol"), Some(&json!("responses")));
     assert_eq!(
         configuration.get("base_url"),
         Some(&json!("https://first.example/v1"))

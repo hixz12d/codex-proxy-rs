@@ -141,8 +141,11 @@ async fn unlisted_models_remain_available_without_catalog_discovery() {
 }
 
 #[tokio::test]
-async fn catalog_membership_and_model_access_precede_weight_affinity_and_fixed_accounts() {
-    use gateway_core::account::{AccountModelAccess, AccountModelAccessMode};
+async fn account_allowlists_override_catalog_omissions_but_weight_affinity_and_pinning_do_not() {
+    use gateway_core::account::{
+        AccountModelAccess,
+        AccountModelAccessMode::{All, Allowlist, Denylist},
+    };
     use provider_openai::credential::ResponsesTransport;
 
     for (primary_api, secondary_api) in [(false, false), (true, true), (true, false), (false, true)]
@@ -163,7 +166,7 @@ async fn catalog_membership_and_model_access_precede_weight_affinity_and_fixed_a
                 "acct_scope_new",
                 secondary_api,
                 &api_secondary,
-                "free",
+                "pro",
                 vec!["gpt-6-luna"],
             ),
         ] {
@@ -219,13 +222,23 @@ async fn catalog_membership_and_model_access_precede_weight_affinity_and_fixed_a
         store.set_scheduling("acct_scope_new", None, AccountWeight::new(100).unwrap());
         let affinity = Arc::new(MemorySessionAffinity::default());
         let leases = Arc::new(TestLeaseCoordinator::default());
-        let provider = provider_with_affinity_and_base_url_and_leases(
+        let (provider, _, _, catalog) = provider_and_quota_with_runtime_ports(
             &store,
             affinity.clone(),
             native.uri(),
             leases.clone(),
+            u32::try_from(DEFAULT_STREAM_MAX_RETRIES).unwrap(),
+            Arc::new(MemoryCooldownPort::new()),
+            crate::support::runtime_policy(),
         );
+        catalog.refresh_catalogs().await.unwrap();
         provider.query_model_capabilities().await.unwrap();
+        // 次账号目录待刷新时，仍须按各自的目录和白名单选号
+        assert!(
+            catalog
+                .observe_response_etag(&store.account("acct_scope_new").unwrap(), "new")
+                .unwrap()
+        );
         for (model, expected) in [
             ("gpt-6-luna", "acct_scope_new"),
             ("gpt-6-astra", "acct_provider_contract"),
@@ -264,52 +277,45 @@ async fn catalog_membership_and_model_access_precede_weight_affinity_and_fixed_a
             }
         }
         assert_eq!(affinity.binding_count(), 1);
-        // 目录资格不能被固定账号、模型允许列表或另一个账号的目录放宽
-        for (model, required, disable_supported) in [
-            ("gpt-6-astra", Some("acct_scope_new"), false),
-            ("custom-unlisted", None, false),
-            ("gpt-6-astra", None, true),
+        let primary = "acct_provider_contract";
+        let secondary = "acct_scope_new";
+        // 目录外许可只属于明确添加该模型的账号，不能借用同池账号的白名单
+        for (model, required, primary_mode, secondary_mode, expected) in [
+            ("gpt-6-astra", Some(secondary), All, All, None),
+            ("custom-unlisted", None, All, All, None),
+            ("gpt-6.1-sol", None, Allowlist, All, Some(primary)),
+            ("gpt-6-astra", None, Denylist, Allowlist, Some(secondary)),
+            (
+                "custom-unlisted",
+                None,
+                Denylist,
+                Allowlist,
+                Some(secondary),
+            ),
+            ("gpt-6-luna", Some(primary), Denylist, Allowlist, None),
         ] {
-            let scope = if disable_supported {
-                Arc::new(FrozenAccountScope::new(
-                    Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([
-                        (
-                            ProviderAccountId::new("acct_provider_contract").unwrap(),
-                            RuntimeAccount::new(
-                                ProviderKind::new("openai").unwrap(),
-                                BTreeSet::new(),
-                            )
-                            .with_model_access(
-                                AccountModelAccess::new(
-                                    AccountModelAccessMode::Denylist,
-                                    vec![model.to_owned()],
-                                )
-                                .unwrap(),
-                            ),
-                        ),
-                        (
-                            ProviderAccountId::new("acct_scope_new").unwrap(),
-                            RuntimeAccount::new(
-                                ProviderKind::new("openai").unwrap(),
-                                BTreeSet::new(),
-                            )
-                            .with_model_access(
-                                AccountModelAccess::new(
-                                    AccountModelAccessMode::Allowlist,
-                                    vec![model.to_owned()],
-                                )
-                                .unwrap(),
-                            ),
-                        ),
-                    ]))),
-                    ClientRoutingScope::all_accounts(),
-                ))
-            } else {
-                contract_account_scope()
-            };
+            let accounts = [(primary, primary_mode), (secondary, secondary_mode)]
+                .into_iter()
+                .map(|(id, mode)| {
+                    let access = if mode == All {
+                        AccountModelAccess::all()
+                    } else {
+                        AccountModelAccess::new(mode, vec![model.to_owned()]).unwrap()
+                    };
+                    (
+                        ProviderAccountId::new(id).unwrap(),
+                        RuntimeAccount::new(ProviderKind::new("openai").unwrap(), BTreeSet::new())
+                            .with_model_access(access),
+                    )
+                })
+                .collect();
+            let scope = Arc::new(FrozenAccountScope::new(
+                Arc::new(RuntimeAccountDirectory::new(accounts)),
+                ClientRoutingScope::all_accounts(),
+            ));
             let attempt = AttemptContext::new(
                 RequestAttemptContext::new(
-                    ModelRequestId::new("req_catalog_rejected").unwrap(),
+                    ModelRequestId::new("req_account_catalog_policy").unwrap(),
                     ClientApiKeyId::new("key_openai_contract").unwrap(),
                 ),
                 NonZeroU32::MIN,
@@ -325,19 +331,26 @@ async fn catalog_membership_and_model_access_precede_weight_affinity_and_fixed_a
                 CancellationToken::new(),
             );
             let acquisitions = leases.requests.lock().unwrap().len();
-            let error = provider
+            let result = provider
                 .clone()
                 .execute(
                     planned_request_for_model("openai", operation(model), model),
                     attempt,
                 )
-                .await
-                .err()
-                .expect("catalog and model access must both permit the account");
-            assert_eq!(error.kind(), ProviderErrorKind::NoEligibleAccount);
-            assert_eq!(leases.requests.lock().unwrap().len(), acquisitions);
+                .await;
+            if let Some(expected) = expected {
+                let mut stream = result.unwrap();
+                assert_eq!(stream.metadata().provider_account_id().as_str(), expected);
+                while let Some(event) = stream.next().await {
+                    event.unwrap();
+                }
+            } else {
+                let error = result.err().expect("account must be excluded");
+                assert_eq!(error.kind(), ProviderErrorKind::NoEligibleAccount);
+                assert_eq!(leases.requests.lock().unwrap().len(), acquisitions);
+            }
         }
-        let sent = native
+        let sent: Vec<_> = native
             .received_requests()
             .await
             .unwrap()
@@ -345,17 +358,25 @@ async fn catalog_membership_and_model_access_precede_weight_affinity_and_fixed_a
             .chain(api_primary.received_requests().await.unwrap())
             .chain(api_secondary.received_requests().await.unwrap())
             .filter(|request| request.method == "POST")
-            .count();
-        assert_eq!(sent, 2);
+            .map(|request| {
+                captured_request_body(&request)["model"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(sent.len(), 5);
+        assert!(sent.iter().any(|model| model == "gpt-6.1-sol"));
+        assert!(sent.iter().any(|model| model == "custom-unlisted"));
     }
 }
 
 #[tokio::test]
-async fn missing_catalog_unknown_plan_and_rotated_api_credentials_preserve_upstream_validation() {
+async fn selection_uses_the_last_catalog_for_the_same_account_identity() {
     use gateway_core::account::{CredentialCasOutcome, CredentialCasUpdate, ProviderAccountUpdate};
     use provider_openai::credential::ResponsesTransport;
 
-    for scenario in ["missing", "unknown_plan", "rotated"] {
+    for scenario in ["missing", "unknown_plan", "rotated", "expired"] {
         let native = MockServer::start().await;
         let api = MockServer::start().await;
         let store = Arc::new(MemoryAccountStore::default());
@@ -385,7 +406,7 @@ async fn missing_catalog_unknown_plan_and_rotated_api_credentials_preserve_upstr
             store
                 .seed_api_key("acct_scope_new", api.uri(), ResponsesTransport::Http)
                 .await;
-            let response = if scenario == "missing" {
+            let response = if matches!(scenario, "missing" | "expired") {
                 ResponseTemplate::new(503)
             } else {
                 ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "gpt-6-luna"}]}))
@@ -407,10 +428,36 @@ async fn missing_catalog_unknown_plan_and_rotated_api_credentials_preserve_upstr
             .respond_with(
                 ResponseTemplate::new(200).set_body_raw(CAPTURE_COMPLETED_SSE, "text/event-stream"),
             )
-            .expect(1)
+            .expect(if scenario == "unknown_plan" { 0 } else { 1 })
             .mount(upstream)
             .await;
-        let provider = provider_with_base_url(&store, native.uri());
+        let (provider, _, _, catalog) = provider_and_quota_with_runtime_ports(
+            &store,
+            Arc::new(MemorySessionAffinity::default()),
+            native.uri(),
+            Arc::new(TestLeaseCoordinator::default()),
+            u32::try_from(DEFAULT_STREAM_MAX_RETRIES).unwrap(),
+            Arc::new(MemoryCooldownPort::new()),
+            crate::support::runtime_policy(),
+        );
+        if scenario == "expired" {
+            use gateway_core::account::AccountCatalogObservation;
+            let a = store.account("acct_scope_new").unwrap();
+            store
+                .save_account_catalog(
+                    &AccountCatalogObservation {
+                        account_id: a.id().clone(),
+                        revision: a.revision(),
+                        plan: a.plan_type().map(str::to_owned),
+                        etag: None,
+                        observed_at: SystemTime::now() - Duration::from_secs(3600),
+                    },
+                    b"\x01{\"data\":[{\"id\":\"gpt-6-luna\"}]}",
+                )
+                .await
+                .unwrap();
+        }
+        catalog.refresh_catalogs().await.unwrap();
         provider.query_model_capabilities().await.unwrap();
         if scenario == "rotated" {
             let account = store.account("acct_scope_new").unwrap();
@@ -435,13 +482,34 @@ async fn missing_catalog_unknown_plan_and_rotated_api_credentials_preserve_upstr
                 CredentialCasOutcome::Updated(_)
             ));
         }
-        let mut stream = provider
-            .execute(
+        let execute = || {
+            provider.clone().execute(
                 planned_request_for_model("openai", operation("gpt-6-astra"), "gpt-6-astra"),
                 context("req_unknown_catalog", CancellationToken::new()),
             )
-            .await
-            .unwrap();
+        };
+        if matches!(scenario, "unknown_plan" | "expired") {
+            assert_eq!(
+                execute().await.err().unwrap().kind(),
+                ProviderErrorKind::NoEligibleAccount,
+                "{scenario}"
+            );
+            if scenario == "unknown_plan" {
+                continue;
+            }
+            // 刷新失败保留排除结果，直到新目录确认该账号已支持模型
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{"id": "gpt-6-astra"}]
+                })))
+                .with_priority(1)
+                .expect(1)
+                .mount(&api)
+                .await;
+            catalog.refresh_catalogs().await.unwrap();
+        }
+        let mut stream = execute().await.unwrap();
         assert_eq!(
             stream.metadata().provider_account_id().as_str(),
             "acct_scope_new",

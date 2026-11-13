@@ -197,6 +197,7 @@ async fn initialize_inner(
         auth,
         accounts: accounts.clone(),
         account_groups: Arc::new(DefaultAccountGroupService::new(
+            upstream_info.clone(),
             store.account_groups(),
             store.account_runtime(),
             snapshot.clone(),
@@ -261,6 +262,14 @@ pub fn initialize_plugin_accounts(
         snapshot,
         upstream_info,
     ))
+}
+
+/// 为 Runtime 创建代理目录与当前出口解析的窄端口
+#[must_use]
+pub fn initialize_plugin_proxies(
+    store: Arc<dyn ports::proxy::ProxyStore>,
+) -> Arc<dyn ports::proxy::PluginProxyAccess> {
+    Arc::new(use_case::proxies::DefaultPluginProxyAccess { store })
 }
 
 /// 为 Runtime 创建非秘密 Client Key 目录与预算重置的窄端口

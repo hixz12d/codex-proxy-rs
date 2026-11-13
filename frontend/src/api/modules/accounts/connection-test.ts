@@ -38,6 +38,7 @@ export type AccountConnectionTestEvent = AccountConnectionTestEventMeta & (
     type: 'error'
     source?: AccountConnectionTestFailureSource
     gatewayErrorCode?: string
+    proxyHint?: string | null
     sendState?: AccountConnectionTestSendState | null
     error?: string
     providerErrorCode?: string | null

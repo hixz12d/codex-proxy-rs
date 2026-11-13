@@ -71,6 +71,7 @@ impl CallbackHandler for PluginCallbacks {
         let log = self.log.clone();
         let private_state = self.private_state.clone();
         let accounts = self.accounts.clone();
+        let proxies = self.proxies.clone();
         let resources = self.resources.clone();
         let data = self.data.clone();
         let keys = self.keys.clone();
@@ -79,6 +80,7 @@ impl CallbackHandler for PluginCallbacks {
         let request_limits = self.request_limits.clone();
         let affinity = self.affinity.clone();
         let services = self.services.clone();
+        let usage = self.usage.clone();
         let service_actor = self.service_actor.clone();
         Box::pin(async move {
             let call = call.ok_or_else(denied)?;
@@ -150,6 +152,15 @@ impl CallbackHandler for PluginCallbacks {
                     .call(&context, &call, service_actor, params, &payload)
                     .await;
             }
+            if matches!(
+                method.as_str(),
+                gateway_plugin_sdk::call::services::usage::RECORDS_SCAN
+                    | gateway_plugin_sdk::call::services::usage::STATISTICS_QUERY
+                    | gateway_plugin_sdk::call::services::usage::READ_NEXT
+                    | gateway_plugin_sdk::call::services::usage::READ_CLOSE
+            ) {
+                return usage.call(&call, &method, params, &payload).await;
+            }
             if is_private_state {
                 return private_state.call(&method, params, &payload).await;
             }
@@ -167,6 +178,8 @@ impl CallbackHandler for PluginCallbacks {
                     | gateway_plugin_sdk::call::key_budgets::RESET
                     | gateway_plugin_sdk::call::key_budgets::GET
                     | gateway_plugin_sdk::call::key_budgets::UPDATE_LIMITS
+                    | gateway_plugin_sdk::call::key_budgets::GET_WINDOW
+                    | gateway_plugin_sdk::call::key_budgets::SET_WINDOW
             ) {
                 return keys.call(&context, &method, params, &payload).await;
             }
@@ -223,6 +236,12 @@ impl CallbackHandler for PluginCallbacks {
                 maximum_payload,
                 request_limits: &request_limits,
             };
+            if method == host::PROXIES_LIST {
+                return proxies.list(params, &payload).await;
+            }
+            if method == host::PROXY_HTTP {
+                return http.proxy(&proxies, params, payload).await;
+            }
             if method == host::ACCOUNT_HTTP {
                 return http.account(&accounts, params, payload).await;
             }

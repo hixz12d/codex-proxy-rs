@@ -1,5 +1,7 @@
 //! 账号管理路由与 HTTP handler 编排
 
+use gateway_core::engine::probe::AccountProbeTarget;
+
 use crate::auth::SessionState;
 
 use super::*;
@@ -626,7 +628,11 @@ where
     let stream = state
         .admin_services()
         .accounts()
-        .test_connection(account_id, upstream_model, Default::default())
+        .test_connection(
+            AccountProbeTarget::ConnectionTest(account_id),
+            upstream_model,
+            Default::default(),
+        )
         .await
         .map_err(map_service_error)?
         .map(move |event| {
@@ -701,7 +707,11 @@ where
         match state
             .admin_services()
             .accounts()
-            .test_connection(account_id, upstream_model, options)
+            .test_connection(
+                AccountProbeTarget::ConnectionTest(account_id),
+                upstream_model,
+                options,
+            )
             .await
         {
             Ok(events) => events

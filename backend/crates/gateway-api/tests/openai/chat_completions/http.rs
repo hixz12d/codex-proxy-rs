@@ -1,12 +1,8 @@
 //! Chat HTTP 夹具和共享执行、鉴权、插件及终结边界
 
 use std::{
-    collections::VecDeque,
     io::Write as _,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 
@@ -19,11 +15,10 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use gateway_core::{
     engine::{
-        CommitRequirement, CoordinatedEvent, EngineError, ModelRequestId,
+        ModelRequestId,
         execution::{
-            AuthenticatedClient, ClientAuthenticationError, ExecutionService, ExecutionSession,
-            PreparedRootExecution, ResponseCommit, StartExecution, StartProviderExecution,
-            StartedExecution,
+            AuthenticatedClient, ClientAuthenticationError, ExecutionService,
+            PreparedRootExecution, StartExecution, StartProviderExecution, StartedExecution,
         },
         middleware::{
             FrozenMiddlewarePlan, MiddlewareContext, MiddlewareError, MiddlewareNext,
@@ -31,7 +26,7 @@ use gateway_core::{
         },
     },
     error::GatewayError,
-    event::{ProviderEvent, ProviderResponseHeader},
+    event::ProviderResponseHeader,
     operation::Operation,
     routing::{
         PublicModelId,
@@ -50,136 +45,7 @@ use crate::openai::{
 pub(super) const PATH: &str = "/v1/chat/completions";
 const KEY: &str = "sk_chat_fixture";
 
-#[derive(Default)]
-pub(super) struct Trace {
-    pub commits: AtomicUsize,
-    pub discarded: AtomicUsize,
-    pub cancelled: AtomicBool,
-    pub finalized: AtomicBool,
-    pub detached: AtomicUsize,
-    response_commit: ResponseCommit,
-}
-
-#[derive(Default)]
-pub(super) enum Finish {
-    #[default]
-    Success,
-    Error,
-    Pending,
-}
-
-pub(super) struct Session {
-    events: VecDeque<Vec<ProviderEvent>>,
-    pub trace: Arc<Trace>,
-    pub finish: Finish,
-    pub delay: Option<Duration>,
-    pub fail_commit: bool,
-    pub response_headers: Vec<ProviderResponseHeader>,
-    committed: bool,
-    buffered: bool,
-}
-
-impl Session {
-    pub fn new(events: Vec<ProviderEvent>) -> Self {
-        Self {
-            events: events.into_iter().map(|event| vec![event]).collect(),
-            trace: Arc::default(),
-            finish: Finish::Success,
-            delay: None,
-            fail_commit: false,
-            response_headers: Vec::new(),
-            committed: false,
-            buffered: false,
-        }
-    }
-
-    pub fn with_batch(mut self, events: Vec<ProviderEvent>) -> Self {
-        self.events.push_back(events);
-        self
-    }
-}
-
-impl ExecutionSession for Session {
-    fn response_commit(&self) -> ResponseCommit {
-        self.trace.response_commit.clone()
-    }
-
-    fn next_event(&mut self) -> BoxFuture<'_, Result<Option<CoordinatedEvent>, EngineError>> {
-        Box::pin(async move {
-            if let Some(delay) = self.delay.take() {
-                tokio::time::sleep(delay).await;
-            }
-            if let Some(event) = self.events.pop_front() {
-                let requirement = if self.committed {
-                    CommitRequirement::AlreadyCommitted
-                } else {
-                    CommitRequirement::CommitBeforeDelivery
-                };
-                return CoordinatedEvent::try_batch(event, requirement).map(Some);
-            }
-            match self.finish {
-                Finish::Success => {
-                    self.trace.finalized.store(true, Ordering::SeqCst);
-                    Ok(None)
-                }
-                Finish::Error => {
-                    self.trace.finalized.store(true, Ordering::SeqCst);
-                    Err(EngineError::ProviderMetadataMismatch)
-                }
-                Finish::Pending => futures::future::pending().await,
-            }
-        })
-    }
-
-    fn collect_uncommitted(&mut self) -> BoxFuture<'_, Result<Vec<ProviderEvent>, EngineError>> {
-        self.buffered = true;
-        Box::pin(async move { Ok(self.events.drain(..).flatten().collect()) })
-    }
-
-    fn response_headers(&self) -> &[ProviderResponseHeader] {
-        &self.response_headers
-    }
-
-    fn discard_pending_delivery(&mut self) -> Result<(), EngineError> {
-        self.trace.discarded.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn commit_downstream(&mut self, status: Option<u16>) -> BoxFuture<'_, Result<(), EngineError>> {
-        Box::pin(async move {
-            self.trace.commits.fetch_add(1, Ordering::SeqCst);
-            if self.fail_commit {
-                return Err(EngineError::ProviderMetadataMismatch);
-            }
-            self.trace.response_commit.record(status);
-            self.committed = true;
-            if self.buffered {
-                self.trace.finalized.store(true, Ordering::SeqCst);
-            }
-            Ok(())
-        })
-    }
-
-    fn record_client_status(&mut self, status: u16) -> BoxFuture<'_, Result<(), EngineError>> {
-        Box::pin(async move {
-            self.trace.response_commit.record(Some(status));
-            Ok(())
-        })
-    }
-
-    fn is_finalized(&self) -> bool {
-        self.trace.finalized.load(Ordering::SeqCst)
-    }
-    fn cancel(&self) {
-        self.trace.cancelled.store(true, Ordering::SeqCst);
-    }
-    fn detach_finalize(self: Box<Self>) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            self.trace.detached.fetch_add(1, Ordering::SeqCst);
-            self.trace.finalized.store(true, Ordering::SeqCst);
-        })
-    }
-}
+use crate::support::generation::{Finish, Session};
 
 #[derive(Clone, Debug)]
 pub(super) struct Captured {
@@ -255,7 +121,7 @@ impl ExecutionService for Execution {
 pub(super) struct Fixture {
     pub router: axum::Router,
     pub execution: Arc<Execution>,
-    pub trace: Arc<Trace>,
+    pub trace: Arc<crate::support::generation::Trace>,
 }
 
 impl Fixture {
@@ -621,4 +487,52 @@ async fn error_after_admission_keepalive_uses_chat_error_encoding() {
     assert!(!body.contains("response.failed"));
     assert_eq!(fixture.trace.commits.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.trace.response_commit.status_code(), Some(200));
+}
+
+#[tokio::test]
+async fn early_middleware_failure_is_recorded_at_ingress_without_a_reserved_model_id() {
+    let middleware = Arc::new(
+        RequestMiddleware {
+            expected_operation: Some(gateway_core::operation::OperationKind::Generate),
+            ..Default::default()
+        }
+        .with_json_short_circuit(Bytes::from_static(b"{}")),
+    );
+    let mut execution = Execution::new(Session::new(vec![completed(json!([message("OK")]))]));
+    execution.middleware = Some(middleware.frozen());
+    let execution = Arc::new(execution);
+    let diagnostics = Arc::new(crate::support::RecordingDiagnostics::default());
+    let admin = crate::admin::AdminTestFixture::new().await;
+    let router = gateway_api::initialize(
+        uuid::Uuid::nil(),
+        gateway_api::ApiConfig {
+            asset_directory: env!("CARGO_MANIFEST_DIR").into(),
+            cors_allowed_origins: Vec::new(),
+            request_timeout_seconds: None,
+            request_id_header: "x-correlation-id".into(),
+        },
+        execution.clone(),
+        admin.services,
+        Vec::new(),
+        Arc::new(crate::openai::EmptyWorkerHealth),
+        Arc::new(crate::openai::TestLifecycle::default()),
+        diagnostics.clone(),
+    )
+    .unwrap()
+    .router();
+    let mut request = request(chat_request(false));
+    request
+        .headers_mut()
+        .insert("x-correlation-id", "ingress-short-circuit".parse().unwrap());
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(!response.headers().contains_key("x-gateway-request-id"));
+    assert!(execution.captured.lock().unwrap().is_none());
+    let failures = diagnostics.0.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].operation, "http_ingress");
+    assert_eq!(
+        failures[0].correlation_id.as_deref(),
+        Some("ingress-short-circuit")
+    );
 }

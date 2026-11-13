@@ -6,6 +6,11 @@
       "globalConfiguration": "Global configuration",
       "customConfiguration": "Custom configuration",
       "enterIntegerFromTo": "Enter an integer from 1 to {version}",
+      "installationSeed": "Installation seed",
+      "generateInstallationSeed": "Generate installation seed",
+      "installationSeedHelp": "Derives a stable installation identity for each key and upstream account without sending the seed upstream, changing the seed changes the identity",
+      "installationSeedPlaceholder": "Leave blank to use the upstream account’s installation ID",
+      "invalidInstallationSeed": "Enter a hyphenated UUID",
       "clientDefault": "Client default",
       "useCustomUserAgent": "Use a custom user agent",
       "cliEntry": "CLI entry",
@@ -77,7 +82,7 @@
       "fillInUnitPrice": "Fill in the unit price",
       "pricingInstructions": "Pricing instructions",
       "modelIdUsesNameActuallySentTo": "Model ID uses the name actually sent to upstream, not the client alias",
-      "customTierHelp": "Enter all four unit prices, up to 1,000,000 each; use 0 for free pricing and multipliers from 0 to 100, with up to four decimal places",
+      "customTierHelp": "Enter all four unit prices from 0 (free) to 1,000,000 and a multiplier from 0 to 100, with up to four decimal places",
       "estimateHelp": "Affects local estimates and spending limits, not actual subscription charges, applies to new requests after saving and leaves past costs unchanged",
       "unitPrice": "{label} unit price",
       "source": "Source",
@@ -124,7 +129,7 @@
       "unitHelp": "Prices in USD per million tokens, view pricing details",
       "unitPriceUnitUsdMTokens": "Unit prices in USD per million tokens",
       "priorityHelp": "Custom prices override source prices, then built-in prices, affecting local estimates and spending limits only",
-      "tableHelp": "Effective standard-tier prices; image models show image token prices and struck-through values show source prices; edit a model to view other tiers",
+      "tableHelp": "The table shows effective standard-tier prices (image token prices for image models), with source prices struck through and other tiers available in the editor",
       "deleteModelPriceList": "Delete model price list",
       "deleteDescription": "Delete source and custom prices for this model, leaving past costs unchanged",
       "standard": "Standard",
@@ -145,6 +150,14 @@
       "unitLabel": "USD / 1M tokens"
     },
     "scheduling": {
+      "runtimeGroup": "Runtime signals",
+      "quotaGroup": "Quota",
+      "queueGroup": "Queue",
+      "windowMode": "Reset window weights",
+      "windowHelp": "Higher weights give a window more influence on the reset score. Set a weight to 0 to ignore that window.",
+      "fiveHour": "5 hours",
+      "weekly": "Weekly",
+      "monthly": "Monthly",
       "roundRobin": "Round robin",
       "autoReviewSlotsHelp": "Applies to Codex accounts only: with a regular concurrency limit of 10 and 3 auto review slots, up to 10 regular requests and 3 auto review requests can run independently",
       "autoReviewQueueHelp": "With dedicated slots, auto review uses a separate queue that may exceed account queue capacity, while total queue capacity, queue timeout, and API key limits still apply",
@@ -175,7 +188,7 @@
         "preferred": "Preferred",
         "strict": "Strict",
         "relaxedHelp": "Relaxed: use the scheduling policy without preferring the session's primary account",
-        "preferredHelp": "Preferred: reuse the primary account, route elsewhere temporarily if busy or unavailable, and keep the session binding",
+        "preferredHelp": "Preferred: reuse the primary account, spill over during brief congestion, and migrate the session binding if disabled or persistently unavailable",
         "strictHelp": "Strict: use one account per session, child threads wait and follow the parent thread's account switches"
       },
       "title": "Session affinity",
@@ -193,15 +206,15 @@
     "warmup": {
       "title": "Account warmup",
       "description": "Try to start quota windows for idle Codex OAuth accounts",
-      "enableDailyWarmup": "Enable daily warmup",
-      "executionTime": "Execution time",
-      "timesPlaceholder": "HH:MM, separate times with commas",
-      "scheduleLabel": "Daily warmup times",
+      "enableWarmup": "Enable warmup",
+      "cronExpression": "Cron expression",
+      "cronHelp": "Press Enter after each tag",
       "modelLabel": "Warmup model",
       "modelHelp": "Required when enabled, use an available model",
       "modelPlaceholder": "Enter model name",
       "helpTitle": "About account warmup",
-      "help": "Send one request to each idle Codex OAuth account at the scheduled times, starting a quota window is not guaranteed"
+      "help": "Sends a lightweight request to available Codex OAuth accounts, skipping exhausted quotas and confirmed active windows, accounts at 0% may be warmed up, activation is not guaranteed",
+      "scheduleHelp": "Runs in the deployment time zone, once per matching minute"
     },
     "adminApiKey": {
       "adminApiKey": "Admin API key",
@@ -240,6 +253,10 @@
       "enterNewPasswordAgain": "Enter new password again",
       "saveAndLogInAgain": "Save and log in again"
     },
+    "units": {
+      "seconds": "seconds",
+      "inSeconds": "{label} (seconds)"
+    },
     "concurrency": {
       "title": "Concurrency and retries",
       "accountLimit": {
@@ -250,20 +267,29 @@
       "keyQueueHelp": "Per API key, 0 disables queuing",
       "accountQueueCapacity": "Account queue capacity",
       "accountQueueHelp": "Per account, 0 disables queuing",
-      "queueTimeoutLabel": "Queue timeout (s)",
-      "queueTimeoutHelp": "Shared by both queues, 1–120 seconds",
+      "keyTimeout": "API key queue timeout",
+      "keyTimeoutHelp": "Maximum wait for a key slot before returning an error",
+      "accountTimeout": "Account queue timeout",
+      "accountTimeoutHelp": "Starts on first account queue entry and continues across retries",
+      "queueFailure": "When the account queue is full or times out",
+      "queueFailureHelp": "Try another account with capacity or return the queue error if switching is unavailable",
+      "queueFailureHelpTitle": "Account switching rules",
+      "queueFailureAttempt": "Try switching once without queuing again",
+      "queueFailureRestrictions": "Requests pinned to an account, native continuations and requests bound to a parent session cannot switch on their own",
+      "returnError": "Return error",
+      "trySwitch": "Try another account",
       "autoReview": {
         "label": "Reserved auto review slots",
         "description": "Extra slots per Codex account, 0 shares regular concurrency",
         "helpTitle": "About auto review concurrency"
       },
-      "queueTimeoutHelpTitle": "About queue timeout",
-      "queueTimeoutDetails": "The API key and account queues share this timeout, measured from the first queue entry",
       "retryAfter": {
-        "label": "Upstream retry wait limit (s)",
+        "label": "Upstream retry wait limit",
         "help": "Try another account above the limit",
         "helpTitle": "About upstream retry waits",
-        "details": "Defaults to 240 seconds. Limits each Retry-After wait, not the total request duration. Above the limit, try another account; return the error if none is available. Set to 0 to reject positive waits. Account rotation still follows the rotation limit and request replay conditions."
+        "waitLimit": "The default 240-second limit applies to each Retry-After wait rather than the total request time",
+        "zeroLimit": "Set to 0 to treat any positive wait as over the limit",
+        "switchConditions": "Above the limit, only retryable requests with account switches remaining can switch accounts, and an error is returned if none is available"
       }
     },
     "modelMapping": "Model mapping",
@@ -293,7 +319,11 @@
     "quotaReset": {
       "title": "Quota reset credits",
       "enableHelp": "Enable automatic use in the account's Quota reset panel",
-      "description": "Global settings for accounts with automatic use enabled",
+      "description": "How long before expiry to use a reset credit",
+      "timing": "When to use a credit",
+      "expiryMode": "Before expiry",
+      "weeklyMode": "By weekly quota",
+      "earlyThresholdHelp": "Use at or below this percentage, leave blank or enter 0 to wait until exhausted",
       "thresholdHelp": "Skip automatic use when the remaining quota exceeds this threshold, leave blank for no limit",
       "weeklyQuotaLimit": "Reset credit remaining weekly quota threshold"
     },
@@ -328,7 +358,7 @@
     },
     "tokenRefresh": {
       "title": "Credential refresh",
-      "leadTimeLabel": "Refresh lead time (s)",
+      "leadTimeLabel": "Refresh lead time",
       "leadTimeHelp": "Refresh access tokens before they expire",
       "concurrencyLabel": "Refresh concurrency limit",
       "concurrencyHelp": "Concurrent refresh limit, lower to reduce rate limiting"
@@ -599,7 +629,8 @@
       "invalidRetention": "History retention must be an integer from 1 to 31 days",
       "invalidQueueSettings": "Queue capacity must be an integer from 0 to 1,000 and timeout from 1 to 120 seconds",
       "invalidProbeModel": "The probe model must be at most 128 characters without control characters",
-      "invalidWarmupTimes": "Use HH:MM for warmup times, for example 08:00 or 08:00,13:00",
+      "invalidWarmupCron": "Enter a valid Cron expression",
+      "warmupCronTooLong": "Keep all rules within 255 bytes",
       "warmupModelRequired": "Select a model to enable warmup",
       "invalidWarmupModel": "Warmup model name must not exceed 128 characters",
       "settingsSaved": "Settings saved",
@@ -614,7 +645,7 @@
         "access": "Security",
         "backups": "Backups"
       },
-      "description": "Manage scheduling, upstreams, pricing, security, history retention, and backups",
+      "description": "Manage scheduling, upstreams, pricing, security, retention and backups",
       "sectionsLabel": "Settings sections",
       "undoAllBasicSettingsChanges": "Undo all basic settings changes",
       "unsavedChanges": {
@@ -636,7 +667,6 @@
       "countValidity": "Count validity",
       "windowHelp": "Each matching failure renews the count, a successful call clears it",
       "countValiditySeconds": "Count validity in seconds",
-      "seconds": "seconds",
       "cooldownTime": "Cooldown duration",
       "cooldownHelp": "A failed probe starts another cooldown",
       "cooldownTimeInSeconds": "Cooldown duration in seconds",

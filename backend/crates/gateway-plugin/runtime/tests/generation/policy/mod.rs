@@ -608,6 +608,7 @@ async fn model_router_can_delegate_after_a_managed_http_side_effect() {
 
 fn candidate(id: &str, weight: u16) -> AccountCandidate {
     AccountCandidate {
+        inherited_concurrency: None,
         account: ProviderAccount::new(
             ProviderAccountId::new(id).unwrap(),
             ProviderKind::new("example").unwrap(),
@@ -629,6 +630,7 @@ fn candidate(id: &str, weight: u16) -> AccountCandidate {
             in_flight: 0,
             last_started_at: None,
             quota_reset_at: None,
+            quota_reset_windows: None,
             quota_remaining_rank: None,
             cooldown: None,
             failure_rate_basis_points: None,

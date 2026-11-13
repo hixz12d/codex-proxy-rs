@@ -69,6 +69,10 @@ async fn fixture(sharing: ClientPeerSharing, plaintext: &str) -> (AdminTestFixtu
         .await
         .unwrap()
         .record;
+    key.limits = RateLimits {
+        max_concurrency: 5,
+        requests_per_minute: 60,
+    };
     key.peer_sharing = sharing;
     key.groups = vec![group.clone()];
     key.name = "private-key-sentinel".into();
@@ -77,6 +81,7 @@ async fn fixture(sharing: ClientPeerSharing, plaintext: &str) -> (AdminTestFixtu
     *fixture.client_key.lock().unwrap() = Some(key);
     let provider = ProviderKind::new("openai").unwrap();
     let facts = AccountStatusFacts {
+        quota_paused: false,
         enabled: true,
         credential_state: CredentialState::Ready,
         access_token_expires_at: None,
@@ -93,6 +98,9 @@ async fn fixture(sharing: ClientPeerSharing, plaintext: &str) -> (AdminTestFixtu
         },
         projection: resolve_account_status(&facts, now.into()),
         account: AccountRecord {
+            quota_paused: false,
+            quota_limits: Default::default(),
+            auto_use_quota_credits: false,
             id: "acct_private_sentinel".into(),
             provider_kind: provider,
             groups: vec![group.clone()],
@@ -124,6 +132,7 @@ async fn fixture(sharing: ClientPeerSharing, plaintext: &str) -> (AdminTestFixtu
         },
     });
     *fixture.provider_quota.lock().unwrap() = Some(ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         plan_type: Some("pro".into()),
         observed_at: Some(now),
@@ -243,7 +252,11 @@ async fn exports_scoped_observations_even_when_the_key_budget_is_exhausted_witho
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
     assert_eq!(body["object"], "cpr.peer");
-    assert_eq!(body["schema_version"], 2);
+    assert_eq!(body["schema_version"], 3);
+    assert_eq!(
+        body["key_limits"],
+        json!({"max_concurrency":5,"requests_per_minute":60})
+    );
     assert_eq!(body["usage"]["data"]["windows"][0]["remaining"], "0");
     assert_eq!(body["usage"]["data"]["allowed"], false);
     assert_eq!(body["usage"]["data"]["windows"][0]["limit_reached"], true);
@@ -259,6 +272,32 @@ async fn exports_scoped_observations_even_when_the_key_budget_is_exhausted_witho
     assert!(!body.to_string().contains(RAW_KEY));
     assert_eq!(*fixture.client_key.lock().unwrap(), before);
     assert!(fixture.observations.lock().unwrap().summaries.is_empty());
+}
+
+#[tokio::test]
+async fn peer_budget_reports_window_availability_and_actual_duration_without_an_amount_limit() {
+    let (fixture, app) = fixture(sharing(), RAW_KEY).await;
+    let now = Utc::now();
+    for (offset, explicit, allowed) in [(-3, true, false), (1, false, false), (-1, true, true)] {
+        let start = now + TimeDelta::hours(offset);
+        {
+            let mut key = fixture.client_key.lock().unwrap();
+            let budget = &mut key.as_mut().unwrap().budget;
+            budget.limits = Default::default();
+            budget.weekly_window = Some(gateway_core::engine::budget::ClientBudgetWindow {
+                start: start.into(),
+                end: (start + TimeDelta::hours(2)).into(),
+                explicit,
+            });
+        }
+        let response = query(&app, PATH, Some(RAW_KEY)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["usage"]["data"]["allowed"], allowed);
+        let weekly = &body["usage"]["data"]["windows"][1];
+        assert_eq!(weekly["limit_reached"], false);
+        assert_eq!(weekly["window_seconds"], 7200);
+    }
 }
 
 #[tokio::test]
@@ -358,7 +397,10 @@ async fn plan_only_summary_limits_exported_data_and_preserves_unknown_on_quota_r
         body["pool"]["plans"],
         json!([{ "name": "Free", "count": 1 }])
     );
-    assert_eq!(body["capabilities"], json!(["key_usage", "pool_summary"]));
+    assert_eq!(
+        body["capabilities"],
+        json!(["key_usage", "key_limits", "pool_summary"])
+    );
     assert!(body.get("quota").is_none());
 
     *fixture.provider_quota.lock().unwrap() = None;

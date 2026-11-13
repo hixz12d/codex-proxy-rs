@@ -3,12 +3,13 @@
 //! Provider raw quota JSON 的唯一解析者：产出 [`CodexAccountQuotaSnapshot`]
 //! 供服务编排层消费；`limit_reached` 是快照级事实，不能只从子窗口反推
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use gateway_core::account::{
-    AccountQuotaSignals, CredentialRevision, ProviderAccountId, QuotaEvidence, QuotaObservation,
-    QuotaState,
+    AccountQuotaResetWindow, AccountQuotaSignals, CredentialRevision, ProviderAccountId,
+    QuotaEvidence, QuotaObservation, QuotaResetPeriod, QuotaState,
 };
 use gateway_protocol::openai::events::{CreditsSnapshot, parse_credits_from_object};
 use serde_json::{Map, Value};
@@ -120,10 +121,65 @@ pub struct CodexAccountQuotaSnapshot {
     fact: CodexQuotaFact,
     quota: QuotaState,
     windows: Vec<CodexQuotaWindow>,
+    unconfirmed_limits: BTreeMap<String, f64>,
     pub(super) recovery: Option<QuotaRecovery>,
 }
 
 impl CodexAccountQuotaSnapshot {
+    pub(super) fn pause_decision(
+        &self,
+        limits: &gateway_core::account::AccountQuotaLimits,
+        merge_base: Option<super::QuotaMergeBase>,
+    ) -> gateway_core::account::QuotaPauseDecision {
+        gateway_core::account::QuotaPauseDecision {
+            merge_base,
+            limits: limits.clone(),
+            paused: self
+                .limit_usage()
+                .any(|(key, used)| limits.reached(key, Some(used))),
+        }
+    }
+
+    pub(crate) fn limit_usage(&self) -> impl Iterator<Item = (&str, f64)> {
+        self.windows
+            .iter()
+            .filter(|w| w.is_account_wide())
+            .filter_map(|w| Some((w.key(), w.used_percent()?)))
+            .chain(
+                self.unconfirmed_limits
+                    .iter()
+                    .map(|(key, &used)| (key.as_str(), used)),
+            )
+    }
+
+    /// 迟到的在途响应或不完整的刷新不能清除已确认的上限，只有对应窗口的新比例才能覆盖它
+    pub(super) fn retain_limit_evidence(
+        &mut self,
+        limits: &gateway_core::account::AccountQuotaLimits,
+        previous: Option<&Self>,
+        document: &mut Map<String, Value>,
+    ) {
+        self.unconfirmed_limits = previous
+            .into_iter()
+            .flat_map(Self::limit_usage)
+            .filter(|(key, used)| {
+                limits.reached(key, Some(*used))
+                    && !self.windows.iter().any(|w| {
+                        w.is_account_wide() && w.key() == *key && w.used_percent().is_some()
+                    })
+            })
+            .map(|(key, used)| (key.to_owned(), used))
+            .collect();
+        if self.unconfirmed_limits.is_empty() {
+            document.remove(super::LIMIT_EVIDENCE_FIELD);
+        } else {
+            document.insert(
+                super::LIMIT_EVIDENCE_FIELD.into(),
+                serde_json::json!(self.unconfirmed_limits),
+            );
+        }
+    }
+
     #[must_use]
     pub const fn account_id(&self) -> &ProviderAccountId {
         &self.account_id
@@ -149,6 +205,18 @@ impl CodexAccountQuotaSnapshot {
     #[must_use]
     pub fn credits(&self) -> Option<&CreditsSnapshot> {
         self.credits.as_ref()
+    }
+
+    pub(super) fn access_with_credits(
+        &self,
+        subscription: QuotaState,
+        enabled: bool,
+    ) -> QuotaState {
+        if enabled && subscription.is_exhausted() && self.credits_usable {
+            QuotaState::credits_only(self.observed_at, subscription.reset_at())
+        } else {
+            subscription
+        }
     }
 
     pub(super) const fn credits_usable(&self) -> bool {
@@ -303,6 +371,7 @@ pub(crate) fn quota_scheduling_signals(
     let now = SystemTime::now();
     let mut remaining_rank: Option<u64> = None;
     let mut reset_at: Option<SystemTime> = None;
+    let mut reset_windows = Vec::new();
     for window in &snapshot.windows {
         if quota_window_ttl(window, snapshot.observed_at(), now).is_none() {
             continue;
@@ -317,10 +386,22 @@ pub(crate) fn quota_scheduling_signals(
         }
         if let Some(reset) = window_reset_at.filter(|reset| *reset > now) {
             reset_at = Some(reset_at.map_or(reset, |current| current.min(reset)));
+            if window.is_account_wide() {
+                let period = match window.kind() {
+                    CodexQuotaWindowKind::ShortTerm => QuotaResetPeriod::FiveHour,
+                    CodexQuotaWindowKind::Weekly => QuotaResetPeriod::Weekly,
+                    CodexQuotaWindowKind::Monthly => QuotaResetPeriod::Monthly,
+                    CodexQuotaWindowKind::Other => continue,
+                };
+                reset_windows.push(AccountQuotaResetWindow {
+                    period,
+                    reset_at: reset,
+                });
+            }
         }
     }
     if remaining_rank.is_some() || reset_at.is_some() {
-        Some(AccountQuotaSignals::new(reset_at, remaining_rank))
+        Some(AccountQuotaSignals::new(reset_at, remaining_rank).with_reset_windows(reset_windows))
     } else {
         None
     }
@@ -351,11 +432,6 @@ pub(crate) fn parse_account_quota_snapshot(
     });
     let quota = authoritative_quota_state(&object, &windows, observed_at)?;
     let credits_usable = has_usable_credits(&object);
-    let quota = if credits_usable {
-        QuotaState::allowed(observed_at)
-    } else {
-        quota
-    };
     let recovery = object
         .get(RECOVERY_FIELD)
         .map(|value| serde_json::from_value(value.clone()))
@@ -374,6 +450,12 @@ pub(crate) fn parse_account_quota_snapshot(
         fact,
         quota,
         windows,
+        unconfirmed_limits: object
+            .get(super::LIMIT_EVIDENCE_FIELD)
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|_| CodexCredentialQuotaError::InvalidCredentialData)?
+            .unwrap_or_default(),
         recovery,
     })
 }
@@ -400,10 +482,13 @@ fn has_usable_credits(usage: &Map<String, Value>) -> bool {
         == Some(true);
     let other_limit_reached = usage
         .get("rate_limit_reached_type")
-        .and_then(|reason| reason.get("type"))
-        .and_then(Value::as_str)
+        .and_then(|reason| reason.as_str().or_else(|| reason.get("type")?.as_str()))
         .is_some_and(|reason| reason != "rate_limit_reached");
-    available && !spend_reached && !other_limit_reached
+    let overage_reached = credits
+        .get("overage_limit_reached")
+        .and_then(Value::as_bool)
+        == Some(true);
+    available && !spend_reached && !other_limit_reached && !overage_reached
 }
 
 /// 只有默认 `codex` 桶能提供账号级套餐访问结论，具名桶只保留展示事实
@@ -427,9 +512,14 @@ fn authoritative_quota_state(
         .ok_or(CodexCredentialQuotaError::InvalidCredentialData)?;
     let allowed = optional_bool(rate_limit, "allowed")?;
     let top_level_reached = optional_bool(rate_limit, "limit_reached")?.unwrap_or(false);
-    let window_reached = windows
-        .iter()
-        .any(|w| w.is_account_wide() && w.limit_reached);
+    let window_reached = windows.iter().any(|window| {
+        window.is_account_wide()
+            && (window.limit_reached
+                || (window.limit_reached()
+                    && window
+                        .reset_at()
+                        .is_none_or(|reset| SystemTime::from(reset) > observed_at)))
+    });
     let reset_at = windows
         .iter()
         .filter(|w| w.is_account_wide() && w.limit_reached())
@@ -444,16 +534,6 @@ fn authoritative_quota_state(
         })
         .map(SystemTime::from);
 
-    if allowed == Some(true) {
-        if top_level_reached || window_reached {
-            tracing::warn!(
-                top_level_reached,
-                window_reached,
-                "OpenAI quota returned contradictory access facts; explicit allowed=true wins"
-            );
-        }
-        return Ok(QuotaState::allowed(observed_at));
-    }
     if allowed == Some(false) {
         return Ok(QuotaState::exhausted(
             QuotaEvidence::ProviderDenied,
@@ -467,6 +547,9 @@ fn authoritative_quota_state(
             observed_at,
             reset_at,
         ));
+    }
+    if allowed == Some(true) {
+        return Ok(QuotaState::allowed(observed_at));
     }
     Ok(QuotaState::observed_unknown(observed_at))
 }
@@ -566,9 +649,7 @@ fn parse_rate_limit_windows(
             .transpose()?;
         let limit_reached = optional_bool(window, "limit_reached")?.unwrap_or(false);
         let kind = quota_window_kind(window_seconds);
-        // primary/secondary 是协议槽位，不代表固定周期
-        // 窗口身份使用上游
-        // limit_id 和实际时长，5h/周/月分类只参与展示
+        // 槽位不代表周期，窗口键保留上游额度桶和实际时长；周期分类供展示及智能调度使用
         let key = match window_seconds {
             Some(seconds) => format!("{source}:{seconds}s"),
             None => format!("{source}:{name}"),

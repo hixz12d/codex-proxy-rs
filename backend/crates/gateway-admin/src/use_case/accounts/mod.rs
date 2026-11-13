@@ -12,7 +12,7 @@ use chrono::{Duration, Utc};
 use futures::StreamExt as _;
 use gateway_core::{
     account::ProviderAccountId,
-    engine::probe::{AccountProbe, AccountProbeRequest},
+    engine::probe::{AccountProbe, AccountProbeRequest, AccountProbeTarget},
     routing::{ProviderKind, UpstreamModelId},
     runtime::SnapshotControl,
 };
@@ -179,7 +179,7 @@ pub trait AccountsService: Send + Sync {
 
     async fn test_connection(
         &self,
-        account_id: ProviderAccountId,
+        target: AccountProbeTarget,
         upstream_model: UpstreamModelId,
         options: AccountConnectionTestOptions,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
@@ -506,7 +506,11 @@ impl DefaultAccountsService {
             });
         Ok(AccountDirectoryItem {
             protection_rules: stored.protection_rules,
-            capacity: stored.capacity,
+            capacity: super::peer_link::upstream::account_capacity(
+                &stored.account,
+                stored.capacity,
+                &quota,
+            ),
             capabilities: provider
                 .account_capabilities(account_id, &stored.account.authentication_kind),
             plan_type_display: self.providers.resolve_account_plan(
@@ -620,7 +624,11 @@ impl AccountsService for DefaultAccountsService {
                         used_slots: in_flight
                             .as_ref()
                             .map(|counts| counts.get(&item.account.id).copied().unwrap_or(0)),
-                        ..item.capacity
+                        ..super::peer_link::upstream::account_capacity(
+                            &item.account,
+                            item.capacity,
+                            &quota,
+                        )
                     },
                     capabilities,
                     plan_type_display: providers.resolve_account_plan(
@@ -753,6 +761,8 @@ impl AccountsService for DefaultAccountsService {
             self.accounts
                 .batch_update_accounts(
                     BatchUpdateAccounts {
+                        quota_limits: None,
+                        auto_use_quota_credits: None,
                         account_ids: vec![account_id.to_string()],
                         enabled: Some(true),
                         concurrency_limit: None,
@@ -761,6 +771,7 @@ impl AccountsService for DefaultAccountsService {
                         group_ids: None,
                         outbound_proxy: None,
                     },
+                    Default::default(),
                     context,
                 )
                 .await
@@ -831,23 +842,80 @@ impl AccountsService for DefaultAccountsService {
             (
                 std::sync::Arc<dyn crate::ports::provider::ProviderAdmin>,
                 Vec<ProviderAccountId>,
+                Vec<ProviderAccountId>,
             ),
         >::new();
+        let mut pauses = BTreeMap::new();
         for account_id in &account_ids {
-            let (item, provider) = self.provider_for_account(account_id).await?;
-            providers
+            let (mut item, provider) = self.provider_for_account(account_id).await?;
+            if let Some(limits) = &command.quota_limits {
+                if !provider
+                    .account_capabilities(account_id, &item.account.authentication_kind)
+                    .quota_limits_supported
+                {
+                    return Err(AdminError::invalid("该账号不支持通用额度窗口上限"));
+                }
+                let new_keys = limits
+                    .keys()
+                    .filter(|key| !item.account.quota_limits.contains(key))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if !limits.is_empty() {
+                    item.account.quota_limits = limits.clone();
+                    let quota = provider
+                        .read_quotas(&[ProviderQuotaReadRequest {
+                            account: &item.account,
+                            rolling_usage: None,
+                        }])
+                        .await
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| AdminError::invalid("缺少账号额度观测结果"))?
+                        .map_err(|error| map_provider_error(error, "provider quota"))?;
+                    if new_keys.iter().any(|key| {
+                        !quota.windows.iter().any(|window| {
+                            window.key == *key
+                                && window.local_usage_attribution
+                                    == QuotaLocalUsageAttribution::AccountWide
+                        })
+                    }) {
+                        return Err(AdminError::invalid("只能设置已观测的通用额度窗口"));
+                    }
+                    pauses.insert(
+                        item.account.id.clone(),
+                        crate::model::accounts::PreparedQuotaPause {
+                            revision: item.account.credential_revision,
+                            observed_at: quota.observed_at,
+                            paused: !quota.paused_windows.is_empty(),
+                        },
+                    );
+                }
+            }
+            if command.auto_use_quota_credits.is_some()
+                && !provider
+                    .account_capabilities(account_id, &item.account.authentication_kind)
+                    .quota_credits
+            {
+                return Err(AdminError::invalid("该账号不支持使用额度点数"));
+            }
+            let (_, selected, exhausted) = providers
                 .entry(item.account.provider_kind)
-                .or_insert_with(|| (provider, Vec::new()))
-                .1
-                .push(account_id.clone());
+                .or_insert_with(|| (provider, Vec::new(), Vec::new()));
+            selected.push(account_id.clone());
+            if command.auto_use_quota_credits == Some(true)
+                && !item.account.auto_use_quota_credits
+                && item.account.quota.is_exhausted()
+            {
+                exhausted.push(account_id.clone());
+            }
         }
         let enabled = command.enabled;
         let result = self
             .accounts
-            .batch_update_accounts(command, context)
+            .batch_update_accounts(command, pauses, context)
             .await
             .map_err(|error| map_store_error(error, "provider accounts"))?;
-        for (provider, provider_ids) in providers.values() {
+        for (provider, provider_ids, _) in providers.values() {
             if enabled == Some(false) {
                 for account_id in provider_ids {
                     super::notify_account_unavailable(
@@ -866,6 +934,18 @@ impl AccountsService for DefaultAccountsService {
             .await;
         }
         publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
+        for (provider, _, exhausted) in providers.into_values() {
+            if exhausted.is_empty() {
+                continue;
+            }
+            super::credential_mutation::observe_account_quotas(
+                self.upstream_info.as_ref(),
+                &provider,
+                &self.accounts,
+                &exhausted,
+                context.request_id.as_str(),
+            );
+        }
         Ok(result)
     }
 
@@ -1125,7 +1205,7 @@ impl AccountsService for DefaultAccountsService {
 
     async fn test_connection(
         &self,
-        account_id: ProviderAccountId,
+        target: AccountProbeTarget,
         upstream_model: UpstreamModelId,
         options: AccountConnectionTestOptions,
     ) -> Result<AccountConnectionTestEventStream, AdminError> {
@@ -1133,7 +1213,7 @@ impl AccountsService for DefaultAccountsService {
         options
             .validate()
             .map_err(|field| AdminError::invalid(format!("{field} 字段不合法")))?;
-        let (stored, provider) = self.provider_for_account(&account_id).await?;
+        let (stored, provider) = self.provider_for_account(target.account_id()).await?;
         let account = stored.account;
         let model = upstream_model.as_str().to_owned();
         let input_text = options
@@ -1161,7 +1241,7 @@ impl AccountsService for DefaultAccountsService {
             let result = probe
                 .probe(
                     AccountProbeRequest {
-                        account_id,
+                        target,
                         provider_kind: account.provider_kind,
                         upstream_model,
                         operation,
@@ -1192,6 +1272,7 @@ impl AccountsService for DefaultAccountsService {
                     vec![AccountConnectionTestEvent::Failed {
                         source: error.source(),
                         gateway_error_code: error.kind(),
+                        proxy_hint: error.proxy_hint(),
                         send_state: error.send_state(),
                         message,
                         provider_error_code: error.client_error_code().map(ToOwned::to_owned),

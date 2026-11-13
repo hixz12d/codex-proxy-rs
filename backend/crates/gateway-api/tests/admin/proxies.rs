@@ -11,11 +11,11 @@ use chrono::Utc;
 use gateway_admin::{
     model::{MutationContext, Revision, proxies::*},
     ports::{
-        proxy::{ProxyProbe, ProxyStore},
+        proxy::{ProbeRoute, ProxyProbe, ProxyStore},
         store::{AdminStoreError, AdminStoreErrorKind, AdminStoreResult},
     },
 };
-use gateway_core::account::{OutboundProxy, ProviderAccountId};
+use gateway_core::account::ProviderAccountId;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
@@ -348,15 +348,18 @@ pub(super) struct SuccessfulProbe;
 
 #[async_trait]
 impl ProxyProbe for SuccessfulProbe {
-    async fn test(&self, proxy: Option<&OutboundProxy>, detect_location: bool) -> ProxyTestResult {
-        if let Some(proxy) = proxy {
+    async fn test(&self, proxy: ProbeRoute<'_>, detect_location: bool) -> ProxyTestResult {
+        if let ProbeRoute::Proxy(proxy) = proxy {
             assert_eq!(
                 proxy.expose_url(),
                 "http://test-user:private-password@proxy.example:8080/"
             );
-        } else {
-            assert!(detect_location);
         }
+        let exit_ip = match proxy {
+            ProbeRoute::Proxy(_) => "203.0.113.2",
+            ProbeRoute::Direct => "203.0.113.3",
+            ProbeRoute::Deployment => "203.0.113.4",
+        };
         ProxyTestResult {
             location: if detect_location {
                 ProxyLocationDetection::Detected { location: serde_json::from_value(json!({"country":"JP","region":"Tokyo","city":"Tokyo","timezone":"Asia/Tokyo"})).unwrap() }
@@ -365,8 +368,8 @@ impl ProxyProbe for SuccessfulProbe {
             },
             success: true,
             latency_ms: 15,
-            exit_ip: Some("203.0.113.2".parse().unwrap()),
-            exit_ipv4: Some("203.0.113.2".parse().unwrap()),
+            exit_ip: Some(exit_ip.parse().unwrap()),
+            exit_ipv4: Some(exit_ip.parse().unwrap()),
             exit_ipv6: None,
             message: "Connected".to_owned(),
         }
@@ -567,11 +570,63 @@ async fn proxy_probe_checks_unsaved_address_without_creating_or_changing_records
 }
 
 #[tokio::test]
-async fn proxy_probe_rejects_empty_or_invalid_addresses() {
+async fn proxy_probe_checks_direct_egress_without_changing_saved_proxies() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let (_, created) = request(
+        &fixture,
+        "/api/admin/proxies/create",
+        Some(json!([{"name": "Saved", "proxyUrl": "http://saved.example:8080"}])),
+        true,
+    )
+    .await;
+    for detect_location in [false, true] {
+        let (status, probed) = request(
+            &fixture,
+            "/api/admin/proxies/probe",
+            Some(json!({"proxyUrl": "", "detectLocation": detect_location})),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(probed["data"]["success"], true);
+        assert_eq!(probed["data"]["exitIpv4"], "203.0.113.3");
+        assert_eq!(
+            probed["data"]["location"]["status"],
+            if detect_location {
+                "detected"
+            } else {
+                "notRequested"
+            }
+        );
+    }
+    let (status, deployed) = request(
+        &fixture,
+        "/api/admin/proxies/probe",
+        Some(json!({"proxyUrl": "", "useDeploymentProxy": true})),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deployed["data"]["exitIpv4"], "203.0.113.4");
+    let (_, listed) = request(&fixture, "/api/admin/proxies", None, true).await;
+    assert_eq!(listed["data"]["page"]["total"], 1);
+    assert_eq!(
+        listed["data"]["items"][0],
+        created["data"][0]["data"]["record"]
+    );
+}
+
+#[tokio::test]
+async fn proxy_probe_rejects_missing_or_invalid_addresses() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     for (body, expected) in [
-        (json!({"proxyUrl": ""}), StatusCode::BAD_REQUEST),
+        (
+            json!({"proxyUrl": "http://proxy.example:8080", "useDeploymentProxy": true}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (json!({"proxyUrl": " "}), StatusCode::UNPROCESSABLE_ENTITY),
         (json!({"proxyUrl": null}), StatusCode::UNPROCESSABLE_ENTITY),
         (json!({}), StatusCode::UNPROCESSABLE_ENTITY),
         (

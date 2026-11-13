@@ -125,6 +125,21 @@ pub(crate) fn push_usage_filter(
 
 pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
     "select mr.id, mr.outcome, mr.provider_error_code as error_code, mr.error_message, mr.client_status_code, mr.client_api_key_name_snapshot as client_api_key_name, mr.endpoint, mr.client_transport, mr.requested_model_id,
+            mr.error_kind, mr.upstream_status_code,
+            exists (
+              select 1 from (values
+                (saved_error.body -> 'code'),
+                (saved_error.body -> 'type'),
+                (saved_error.body -> 'message')
+              ) as field(value)
+              where jsonb_typeof(field.value) = 'string' and field.value <> '\"\"'::jsonb
+            ) as has_upstream_error,
+            case when saved_upstream.body ->> 'type' = 'websocket.close'
+              and jsonb_typeof(saved_upstream.body -> 'code') = 'number'
+              then saved_upstream.body ->> 'code'
+            end as websocket_close_code,
+            mr.continuation_unavailable_reason, mr.upstream_connection_exit_reason,
+            (mr.recovery_request_id is not null and mr.recovered_at is not null) as recovered,
             mr.provider_kind, mr.provider_account_ref,
             mr.provider_account_name_snapshot as provider_account_name,
             mr.provider_account_email_snapshot as provider_account_email,
@@ -144,7 +159,18 @@ pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
             host(mr.client_ip) as client_ip, mr.user_agent,
             mr.reasoning_effort, mr.reasoning_preset, mr.subagent_kind, mr.compact,
             mr.started_at
-     from model_request_observations mr";
+     from model_request_observations mr
+     cross join lateral (
+       select case when pg_input_is_valid(mr.error_details, 'jsonb') then
+         case when jsonb_typeof(mr.error_details::jsonb -> 'upstream') = 'string'
+           and pg_input_is_valid(mr.error_details::jsonb ->> 'upstream', 'jsonb')
+           then (mr.error_details::jsonb ->> 'upstream')::jsonb
+         end
+       end as body
+     ) saved_upstream
+     cross join lateral (
+       select coalesce(saved_upstream.body -> 'error', saved_upstream.body #> '{response,error}') as body
+     ) saved_error";
 
 pub(crate) const USAGE_RECORD_DETAIL_SELECT: &str =
     "select mr.id, mr.client_api_key_ref, mr.config_revision,
@@ -162,6 +188,8 @@ pub(crate) const USAGE_RECORD_DETAIL_SELECT: &str =
             mr.outcome, mr.client_status_code, mr.upstream_status_code,
             mr.client_response_id, mr.upstream_request_id, mr.upstream_response_id,
             mr.error_kind, mr.provider_error_code, mr.error_message, mr.retry_after_ms,
+            mr.error_details, mr.continuation_unavailable_reason, mr.upstream_connection_exit_reason,
+            (mr.recovery_request_id is not null and mr.recovered_at is not null) as recovered,
             mr.input_tokens, mr.output_tokens, mr.cached_input_tokens, mr.cache_write_input_tokens,
             mr.reasoning_output_tokens, mr.image_input_tokens, mr.image_output_tokens,
             mr.total_tokens, mr.billing_snapshot_json, mr.cost_source, mr.cost_amount::text,
@@ -623,7 +651,7 @@ pub(crate) fn intermediate_attempt_from_row(
         upstream_transport: None,
         upstream_send_state: None,
         outcome: admin_observability::RequestOutcome::Failed,
-        downstream_committed: false,
+        downstream_committed: None,
         status_code: optional_status(row, "status_code")?,
         provider_error_code: get(row, "provider_error_code")?,
         failure_kind: get(row, "failure_kind")?,
@@ -660,7 +688,7 @@ pub(crate) fn final_attempt_from_request(request: &UsageRecord) -> UsageAttemptO
         upstream_transport: request.upstream_transport.clone(),
         upstream_send_state: Some(request.upstream_send_state.clone()),
         outcome: request.outcome.clone(),
-        downstream_committed: request.downstream_committed_at.is_some(),
+        downstream_committed: Some(request.downstream_committed_at.is_some()),
         status_code: request.upstream_status_code.or(request.client_status_code),
         provider_error_code: request.provider_error_code.clone(),
         failure_kind: request.error_kind.clone(),

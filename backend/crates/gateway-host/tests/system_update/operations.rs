@@ -260,7 +260,7 @@ async fn assert_system_operations_rejected(service: &ProcessSystemOperations, re
 }
 
 #[tokio::test]
-async fn restart_should_spawn_replacement_before_shutdown_outside_docker() {
+async fn restart_should_wait_for_service_release_before_starting_replacement() {
     let fixture = Fixture::new();
     let replacement_marker = fixture.root.path().join("replacement-ran");
     fs::copy(
@@ -285,20 +285,17 @@ async fn restart_should_spawn_replacement_before_shutdown_outside_docker() {
     tokio::time::timeout(Duration::from_secs(2), shutdown.cancelled())
         .await
         .expect("shutdown requested after spawn");
-    #[cfg(windows)]
-    {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !fixture.root.path().join("replacement-waiting").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("replacement waiting for old service");
-        assert!(
-            !replacement_marker.exists(),
-            "new service must wait for resource release"
-        );
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fixture.root.path().join("replacement-waiting").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replacement waiting for old service");
+    assert!(
+        !replacement_marker.exists(),
+        "new service must wait for resource release"
+    );
     drop(service);
     tokio::time::timeout(Duration::from_secs(2), async {
         while !replacement_marker.is_file() {
@@ -326,7 +323,6 @@ async fn restart_should_use_startup_path_after_running_executable_is_renamed() {
                 "system_update::operations::restart_should_use_startup_path_after_running_executable_is_renamed",
             ])
             .env(CHILD_ENV, "1")
-            .env("CPR_RESTART_DELAY_MS", "1200")
             .output()
             .expect("isolated restart test");
         assert!(
@@ -359,13 +355,16 @@ async fn restart_should_use_startup_path_after_running_executable_is_renamed() {
 
     let backup = fixture.backup();
     fs::rename(fixture.executable(), &backup).expect("back up running executable");
-    fixture.write_executable("#!/bin/sh\nprintf new > \"${0%/*}/replacement-version\"\n");
+    fixture.write_executable(
+        "#!/bin/sh\ncat >/dev/null\nprintf new > \"${0%/*}/replacement-version\"\n",
+    );
     assert_eq!(std::env::current_exe().expect("renamed executable"), backup);
 
     service
         .restart(Arc::new(AllowingUpdatePreflight))
         .await
         .expect("restart accepted");
+    drop(service);
     let marker = fixture.root.path().join("replacement-version");
     tokio::time::timeout(Duration::from_secs(5), async {
         while !marker.is_file() {
@@ -438,6 +437,13 @@ async fn restart_should_conflict_while_another_system_operation_is_running() {
 async fn rollback_should_restore_binary_web_and_version_state() {
     let server = MockServer::start().await;
     let fixture = Fixture::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(fixture.official(), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(fixture.web(), fs::Permissions::from_mode(0o751)).unwrap();
+    }
     fixture
         .mount_release(
             &server,
@@ -471,11 +477,42 @@ async fn rollback_should_restore_binary_web_and_version_state() {
                 & 0o777,
             0o555
         );
+        assert_eq!(
+            fs::metadata(fixture.official().with_file_name("official.backup"))
+                .expect("official backup directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        for name in ["plugin-release-manifest.json", "new-plugin.tar.gz"] {
+            assert_eq!(
+                fs::metadata(fixture.official().join(name))
+                    .expect("official plugin file")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444,
+                "{name}"
+            );
+        }
     }
     service
         .rollback(Arc::new(AllowingUpdatePreflight))
         .await
         .expect("rollback");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (path, mode) in [(fixture.official(), 0o555), (fixture.web(), 0o751)] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
 
     assert_eq!(
         fs::read(fixture.executable()).expect("binary"),
@@ -588,6 +625,8 @@ async fn rollback_should_restore_current_release_when_plugin_revision_changes_du
         .expect_err("revision changed after rollback swap");
 
     assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
+    #[cfg(unix)]
+    assert_official_directory_readonly(&fixture);
     assert_eq!(
         fs::read(fixture.executable()).expect("binary"),
         b"new-binary"
@@ -651,6 +690,8 @@ async fn cancelled_rollback_should_restore_current_release_after_the_swap() {
             .expect_err("rollback task cancelled")
             .is_cancelled()
     );
+    #[cfg(unix)]
+    assert_official_directory_readonly(&fixture);
 
     assert_eq!(
         fs::read(fixture.executable()).expect("binary"),
@@ -783,7 +824,7 @@ async fn prerelease_updates_should_install_later_stages_and_stable_release() {
         let service = ProcessSystemOperations::new(CancellationToken::new(), config);
         assert!(
             service
-                .update_detail(true, None)
+                .update_detail(SystemUpdateCheck::Refresh, None)
                 .await
                 .expect("detail")
                 .has_update
@@ -1121,10 +1162,94 @@ async fn update_should_replace_web_assets_across_filesystems() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn update_should_preserve_readonly_staged_directory_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct ReadonlyStagingPreflight(PathBuf);
+
+    #[async_trait::async_trait]
+    impl SystemUpdatePreflight for ReadonlyStagingPreflight {
+        async fn validate(
+            &self,
+            candidate: SystemUpdateCandidate,
+        ) -> Result<Revision, SystemOperationError> {
+            let staging = fs::read_dir(&self.0)
+                .unwrap()
+                .next()
+                .expect("staging directory")
+                .unwrap()
+                .path();
+            let nested = staging.join("web-dist/assets");
+            fs::create_dir(&nested).unwrap();
+            fs::write(nested.join("asset.js"), "asset").unwrap();
+            for (path, mode) in [
+                (nested.join("asset.js"), 0o444),
+                (nested, 0o550),
+                (staging.join("web-dist"), 0o555),
+                (staging.join("official-plugins"), 0o555),
+            ] {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            AllowingUpdatePreflight.validate(candidate).await
+        }
+
+        async fn confirm_revision(&self, _: Revision) -> Result<(), SystemOperationError> {
+            Ok(())
+        }
+    }
+
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    fixture
+        .mount_release(
+            &server,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Valid,
+        )
+        .await;
+    let config = fixture.config(&format!("{}/repos", server.uri()));
+    let preflight = Arc::new(ReadonlyStagingPreflight(config.update_temp_dir.clone()));
+    let service = ProcessSystemOperations::new(CancellationToken::new(), config);
+    service
+        .perform_update(Some(TARGET_VERSION.to_owned()), None, preflight)
+        .await
+        .expect("update accepted");
+    let status = wait_for_update(&service).await;
+    assert_eq!(
+        status.operation.status,
+        SystemOperationStatus::Succeeded,
+        "{status:?}"
+    );
+    assert_eq!(
+        fs::read(fixture.web().join("assets/asset.js")).unwrap(),
+        b"asset"
+    );
+    for (path, mode) in [
+        (fixture.official(), 0o555),
+        (fixture.web(), 0o555),
+        (fixture.web().join("assets"), 0o550),
+        (fixture.web().join("assets/asset.js"), 0o444),
+    ] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+    }
+}
+
 #[tokio::test]
 async fn update_should_restore_web_assets_when_binary_backup_fails() {
     let server = MockServer::start().await;
     let fixture = Fixture::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(fixture.official(), fs::Permissions::from_mode(0o555)).unwrap();
+    }
     fixture
         .mount_release(
             &server,
@@ -1152,6 +1277,22 @@ async fn update_should_restore_web_assets_when_binary_backup_fails() {
     );
     assert!(fixture.official().join("old-plugin.tar.gz").is_file());
     assert!(!fixture.official().join("new-plugin.tar.gz").exists());
+    #[cfg(unix)]
+    assert_official_directory_readonly(&fixture);
+}
+
+#[cfg(unix)]
+fn assert_official_directory_readonly(fixture: &Fixture) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    assert_eq!(
+        fs::metadata(fixture.official())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o555
+    );
 }
 
 #[tokio::test]

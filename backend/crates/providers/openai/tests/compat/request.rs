@@ -125,7 +125,6 @@ fn encoder_should_default_missing_store_without_changing_unknown_or_nested_field
         "input": [{"role": "user", "content": [{
             "type": "input_text", "text": "temperature and max_output_tokens are tool parameter names"
         }]}],
-        "max_tokens": 256,
         "future_options": {"temperature": 0.7},
         "client_metadata": {"prompt_cache_retention": "business-value", "store": true},
         "tools": [{

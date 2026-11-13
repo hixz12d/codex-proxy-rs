@@ -48,6 +48,7 @@ use gateway_core::provider_ports::{
     ProviderStoreErrorKind,
 };
 use gateway_core::routing::{ProviderKind, UpstreamModelId};
+use gateway_protocol::openai::OPENAI_PROTOCOL;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
@@ -205,6 +206,8 @@ impl ProviderAdmin for OpenAiAdminProvider {
     ) -> gateway_admin::model::accounts::ProviderAccountCapabilities {
         let oauth = authentication_kind == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH;
         gateway_admin::model::accounts::ProviderAccountCapabilities {
+            quota_limits_supported: oauth,
+            quota_credits: oauth,
             quota: oauth,
             quota_refresh: oauth,
             profile: oauth,
@@ -231,8 +234,29 @@ impl ProviderAdmin for OpenAiAdminProvider {
         &self,
         configuration: &gateway_core::account::OpaqueProviderData,
     ) -> Result<gateway_core::account::OpaqueProviderData, ProviderAdminError> {
+        if configuration
+            .expose_to_provider()
+            .contains_key("installationSeed")
+            || gateway_core::settings::request_profiles::inherited_fields(configuration).is_some()
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("安装身份种子只能在 API 密钥中设置"));
+        }
         self.profile
             .preview_selection(configuration)
+            .map_err(map_client_profile_error)
+    }
+
+    fn preview_key_client_profile(
+        &self,
+        key: &gateway_core::account::OpaqueProviderData,
+        global: Option<&gateway_core::account::OpaqueProviderData>,
+    ) -> Result<gateway_core::account::OpaqueProviderData, ProviderAdminError> {
+        crate::transport::profile::identity::inherited_identity_fields(key)
+            .map_err(map_client_profile_error)?;
+        let profile = gateway_core::settings::request_profiles::resolve_key_profile(key, global);
+        self.profile
+            .preview_selection(&profile)
             .map_err(map_client_profile_error)
     }
 
@@ -274,7 +298,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return;
         }
         self.quota.invalidate_scheduling(account_ids);
-        if let Err(error) = self.catalog.invalidate() {
+        if let Err(error) = self.catalog.invalidate_accounts(account_ids).await {
             tracing::warn!(
                 account_count = account_ids.len(),
                 error = %error,
@@ -640,7 +664,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
         let access_token_expires_at =
             parse_access_token_expiration(secret.access_token.expose_secret());
         let prepared = CodexCredentialAdmin
-            .prepare_refreshed_oauth_rotation(current, secret, access_token_expires_at, None)
+            .prepare_oauth_rotation(current, secret, None, access_token_expires_at, None)
             .map_err(map_credential_admin_error)?;
         prepared_rotation(prepared, command.account.provider_kind)
     }
@@ -717,7 +741,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
             if refresh {
                 return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
             }
-            return Ok(project_quota(None, false));
+            return Ok(empty_quota());
         }
         let snapshot = if refresh {
             let snapshot = Some(
@@ -734,7 +758,11 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 .await
                 .map_err(map_quota_error)?
         };
-        Ok(project_quota(snapshot, account.quota().is_exhausted()))
+        Ok(project_quota(
+            snapshot,
+            account.quota().is_exhausted(),
+            account.quota_limits(),
+        ))
     }
 
     async fn read_quotas(
@@ -1131,6 +1159,7 @@ fn account_from_record(account: &AccountRecord) -> Result<ProviderAccount, Provi
         revision,
         account.access_token_expires_at.map(SystemTime::from),
     )
+    .with_auto_use_quota_credits(account.auto_use_quota_credits)
     .with_outbound_proxy(account.outbound_proxy.clone())
     .with_notes(account.notes.clone())
     .with_profile(
@@ -1201,6 +1230,7 @@ fn account_matches_record(account: &ProviderAccount, record: &AccountRecord) -> 
 
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
+        paused_windows: Vec::new(),
         upstream: None,
         credits: None,
         plan_type: None,
@@ -1215,15 +1245,19 @@ fn empty_quota() -> ProviderQuota {
 fn project_quota(
     snapshot: Option<CodexAccountQuotaSnapshot>,
     limit_reached: bool,
+    limits: &gateway_core::account::AccountQuotaLimits,
 ) -> ProviderQuota {
     let mut quota = snapshot
-        .map(project_quota_snapshot)
+        .map(|s| project_quota_snapshot(s, limits))
         .unwrap_or_else(empty_quota);
     quota.limit_reached = limit_reached;
     quota
 }
 
-fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota {
+fn project_quota_snapshot(
+    snapshot: CodexAccountQuotaSnapshot,
+    limits: &gateway_core::account::AccountQuotaLimits,
+) -> ProviderQuota {
     let mut provider_data = Map::new();
     provider_data.insert(
         "remaining_percent".to_owned(),
@@ -1265,6 +1299,11 @@ fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota 
     // 在窗口全部过期后继续维持限流
     let limit_reached = quota_windows_limit_reached(&windows);
     ProviderQuota {
+        paused_windows: snapshot
+            .limit_usage()
+            .filter(|(key, used)| limits.reached(key, Some(*used)))
+            .map(|(key, _)| key.to_owned())
+            .collect(),
         upstream: None,
         plan_type: snapshot.plan_type().map(str::to_owned),
         observed_at: Some(DateTime::<Utc>::from(snapshot.observed_at())),
@@ -1699,7 +1738,7 @@ fn build_connection_test_operation(
             serde_json::json!({ "effort": effort }),
         );
     }
-    let payload = ProtocolPayload::json_object("openai", body)
+    let payload = ProtocolPayload::json_object(OPENAI_PROTOCOL, body)
         .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
     Ok(Operation::Generate(GenerateRequest::from_protocol_payload(
         payload,
@@ -1855,12 +1894,15 @@ fn log_import_failure(stage: &'static str, error: &'static str) {
 }
 
 fn map_oauth_error(error: CodexOAuthAdminError) -> ProviderAdminError {
+    use crate::credential::token_client::AuthorizationCodeExchangeError as Exchange;
     use CodexOAuthAdminError as Error;
     use ProviderAdminErrorKind as Kind;
-    let (kind, message) = match error {
+    let (kind, message) = match &error {
         Error::InvalidInput => (Kind::Invalid, "OpenAI 授权参数不合法，请重新发起授权"),
         Error::CallbackRejected => (Kind::Invalid, "OpenAI 授权回调校验失败，请重新发起授权"),
-        Error::TokenRejected => (Kind::Invalid, "OpenAI 拒绝了授权码，请重新发起授权"),
+        Error::TokenRejected | Error::Exchange(Exchange::Rejected) => {
+            (Kind::Invalid, "OpenAI 拒绝了授权码，请重新发起授权")
+        }
         Error::Credential => (Kind::Invalid, "OpenAI 授权返回的凭据不完整或无效"),
         Error::NotFound | Error::FlowExpired => (
             Kind::NotFound,
@@ -1870,29 +1912,51 @@ fn map_oauth_error(error: CodexOAuthAdminError) -> ProviderAdminError {
             Kind::Conflict,
             "OpenAI 授权流程正在处理或已被更新，请先检查授权状态",
         ),
-        Error::Ambiguous => (
+        Error::Exchange(Exchange::Ambiguous { .. }) => (
             Kind::Ambiguous,
             "OpenAI 授权结果未知，请先核对账号状态，不要立即重复提交",
         ),
-        Error::UpstreamUnavailable => (
+        Error::Exchange(Exchange::Connection {
+            timed_out: true, ..
+        }) => (
+            Kind::Unavailable,
+            "连接 OpenAI 授权服务超时，请检查出站连接",
+        ),
+        Error::Exchange(Exchange::Connection {
+            timed_out: false, ..
+        }) => (
+            Kind::Unavailable,
+            "无法连接 OpenAI 授权服务，请检查出站连接",
+        ),
+        Error::Exchange(Exchange::Unavailable) => (
             Kind::Unavailable,
             "OpenAI 授权服务暂不可用，请检查出站连接后重试",
         ),
         Error::StorageUnavailable => (Kind::Unavailable, "OpenAI 授权状态存储暂不可用，请稍后重试"),
     };
-    provider_admin_error(kind).with_public_message(message)
+    provider_admin_error(kind)
+        .with_public_message(message)
+        .with_source(error)
 }
 
 const fn oauth_error_code(error: &CodexOAuthAdminError) -> &'static str {
+    use crate::credential::token_client::AuthorizationCodeExchangeError as Exchange;
     match error {
         CodexOAuthAdminError::InvalidInput => "invalid_input",
         CodexOAuthAdminError::NotFound => "not_found",
         CodexOAuthAdminError::Conflict => "conflict",
         CodexOAuthAdminError::FlowExpired => "flow_expired",
         CodexOAuthAdminError::CallbackRejected => "callback_rejected",
-        CodexOAuthAdminError::TokenRejected => "token_rejected",
-        CodexOAuthAdminError::UpstreamUnavailable => "upstream_unavailable",
-        CodexOAuthAdminError::Ambiguous => "ambiguous",
+        CodexOAuthAdminError::TokenRejected
+        | CodexOAuthAdminError::Exchange(Exchange::Rejected) => "token_rejected",
+        CodexOAuthAdminError::Exchange(Exchange::Unavailable) => "upstream_unavailable",
+        CodexOAuthAdminError::Exchange(Exchange::Connection {
+            timed_out: true, ..
+        }) => "connect_timeout",
+        CodexOAuthAdminError::Exchange(Exchange::Connection {
+            timed_out: false, ..
+        }) => "connect_failed",
+        CodexOAuthAdminError::Exchange(Exchange::Ambiguous { .. }) => "ambiguous",
         CodexOAuthAdminError::StorageUnavailable => "storage_unavailable",
         CodexOAuthAdminError::Credential => "credential",
     }
@@ -2086,6 +2150,7 @@ fn map_client_profile_error(
     use crate::transport::profile::selection::ClientProfileError;
     let message = match error {
         ClientProfileError::Invalid => "客户端身份字段或版本组合不合法",
+        ClientProfileError::InvalidInstallationSeed => "安装身份种子必须是带连字符的 UUID",
         ClientProfileError::InvalidUserAgent => {
             "User-Agent 必须是 1 至 4096 字节的单行 ASCII 文本，且首尾不能含空白"
         }

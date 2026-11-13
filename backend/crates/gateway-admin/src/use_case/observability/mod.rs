@@ -19,8 +19,8 @@ use crate::{
             DashboardPeriodMetrics, DashboardQuery, DashboardResult, DecimalAmount,
             DiagnosticDimension, DiagnosticsItem, DiagnosticsResult, Granularity, HealthStatus,
             HealthTimeline, HealthTimelinePoint, OpsErrorPage, OpsErrorQuery, ProviderBillingInput,
-            RequestMetricPoint, RequestMetrics, TimeRange, Trend, TrendKind, TrendPoint,
-            TrendSummary, UsageBilling, UsageBillingProjection, UsageCacheEfficiency,
+            RequestHealth, RequestMetricPoint, RequestMetrics, TimeRange, Trend, TrendKind,
+            TrendPoint, TrendSummary, UsageBilling, UsageBillingProjection, UsageCacheEfficiency,
             UsageCalculatedBillingFact, UsageConcurrencyPoint, UsageCostComparison,
             UsageCostSummary, UsageDetail, UsageFilter, UsageInsight, UsageInsightData,
             UsageInsightMetric, UsageInsights, UsageInsightsCost, UsageInsightsCostPoint,
@@ -43,6 +43,7 @@ const HEALTH_TIMELINE_SLOT_MINUTES: i64 = 15;
 const HEALTH_TIMELINE_MIN_SAMPLE_SIZE: u64 = 10;
 const HEALTH_TIMELINE_UNAVAILABLE_FAILURE_THRESHOLD: u64 = 3;
 const HEALTH_TIMELINE_STABLE_RELIABILITY: f64 = 95.0;
+mod errors;
 mod export;
 mod store_cache;
 pub(crate) use store_cache::CachedObservabilityStore;
@@ -133,7 +134,7 @@ impl DefaultObservabilityService {
             self.settings.load_runtime_settings(),
         )
         .map_err(|error| map_store_error(error, "dashboard"))?;
-        let runtime_slots = observation.runtime_slots;
+        let runtime_slots = observation.runtime_slots.as_ref();
         self.enrich_list_records(&mut observation.recent_requests)
             .await;
         self.enrich_dashboard_quotas(&mut observation.account_usage)
@@ -180,11 +181,19 @@ impl DefaultObservabilityService {
             .providers
             .dashboard_wire_profiles(&settings.request_profiles);
         let max_concurrent_per_account = u64::from(settings.values.max_concurrent_per_account);
-        let (inherited_accounts, overridden_slots) = runtime_slots
-            .as_ref()
+        let (mut inherited_accounts, mut overridden_slots) = runtime_slots
             .map_or((observation.provider_accounts.normal, 0), |slots| {
                 (slots.inherited_accounts, slots.overridden_slots)
             });
+        if let (Some(peer), Some(slots)) = (&self.upstream_info, runtime_slots) {
+            let now = std::time::SystemTime::now();
+            for version in &slots.inherited_versions {
+                if let Some(limit) = peer.observed_concurrency_limit(version, now) {
+                    inherited_accounts -= 1;
+                    overridden_slots = overridden_slots.saturating_add(u64::from(limit.get()));
+                }
+            }
+        }
         let total_slots = (max_concurrent_per_account > 0 || inherited_accounts == 0).then(|| {
             inherited_accounts
                 .saturating_mul(max_concurrent_per_account)
@@ -348,9 +357,16 @@ impl ObservabilityService for DefaultObservabilityService {
             .items
             .into_iter()
             .map(|item| {
-                let error_rate = rate_or_zero(item.failure_count, item.request_count);
-                let non_completion_rate =
-                    rate_or_zero(item.non_completion_count, item.request_count);
+                let health = RequestHealth::from_counts(
+                    item.success_count,
+                    item.failure_count,
+                    item.cancelled_count,
+                    item.incomplete_count,
+                    item.caller_error_count,
+                );
+                let non_completion_count =
+                    item.cancelled_count.saturating_add(item.incomplete_count);
+                let non_completion_rate = rate_or_zero(non_completion_count, item.request_count);
                 let retry_rate = rate_or_zero(item.retried_request_count, item.request_count);
                 DiagnosticsItem {
                     account_upstream_peer: peers.get(&item.key).copied(),
@@ -366,8 +382,8 @@ impl ObservabilityService for DefaultObservabilityService {
                     account_plan_type: item.account_plan_type,
                     request_count: item.request_count,
                     success_count: item.success_count,
-                    error_count: item.failure_count,
-                    error_rate,
+                    error_count: health.non_success_requests(),
+                    error_rate: health.error_ratio(),
                     request_share: rate_or_zero(
                         item.request_count,
                         observation.total_request_count,
@@ -375,7 +391,7 @@ impl ObservabilityService for DefaultObservabilityService {
                     average_latency_ms: item.average_latency_ms,
                     latency_p95_ms: item.latency_p95_ms,
                     first_token_p95_ms: item.first_token_p95_ms,
-                    non_completion_count: item.non_completion_count,
+                    non_completion_count,
                     non_completion_rate,
                     retry_count: item.retry_count,
                     retry_rate,
@@ -566,9 +582,8 @@ fn build_usage_insights(
     }
 
     let requests = &overview.requests;
-    let health_window = HealthWindow::from_metrics(requests);
+    let health_window = RequestHealth::from_metrics(requests);
     let failed_requests = health_window.failed_requests;
-    let health_requests = health_window.eligible_requests();
     let health = UsageInsightsHealth {
         total_requests: requests.request_count,
         success_requests: requests.success_count,
@@ -576,7 +591,7 @@ fn build_usage_insights(
         cancelled_requests: requests.cancelled_count,
         incomplete_requests: requests.incomplete_count,
         caller_error_requests: requests.caller_error_count,
-        success_rate: rate_or_zero(requests.success_count, health_requests),
+        success_rate: health_window.success_ratio(),
         completion_rate: rate_or_zero(
             requests
                 .success_count
@@ -586,7 +601,7 @@ fn build_usage_insights(
         points: trend
             .iter()
             .map(|point| {
-                let health_window = HealthWindow::from_metrics(&point.metrics);
+                let health_window = RequestHealth::from_metrics(&point.metrics);
                 UsageInsightsHealthPoint {
                     total_requests: point.metrics.request_count,
                     bucket_start: point.bucket_start,
@@ -595,10 +610,7 @@ fn build_usage_insights(
                     cancelled_requests: point.metrics.cancelled_count,
                     incomplete_requests: point.metrics.incomplete_count,
                     caller_error_requests: point.metrics.caller_error_count,
-                    error_rate: rate_or_zero(
-                        health_window.non_success_requests(),
-                        health_window.eligible_requests(),
-                    ),
+                    error_rate: health_window.error_ratio(),
                 }
             })
             .collect(),
@@ -1117,7 +1129,7 @@ pub(super) fn health_timeline_at(
         .map(|index| {
             (
                 start + Duration::minutes(HEALTH_TIMELINE_SLOT_MINUTES * index),
-                HealthWindow::default(),
+                RequestHealth::default(),
             )
         })
         .collect::<Vec<_>>();
@@ -1143,7 +1155,7 @@ pub(super) fn health_timeline_at(
     let totals = buckets
         .iter()
         .filter(|(bucket_start, _)| *bucket_start <= current_slot)
-        .fold(HealthWindow::default(), |mut totals, (_, bucket)| {
+        .fold(RequestHealth::default(), |mut totals, (_, bucket)| {
             totals.add_window(*bucket);
             totals
         });
@@ -1207,11 +1219,9 @@ fn trend(
         }
     }
     let average_latency_ms = average(metrics.latency_sum_ms, metrics.latency_count);
-    let service_failure_count = service_failure_count(&metrics);
-    let success_rate = ratio(
-        metrics.success_count,
-        HealthWindow::from_metrics(&metrics).eligible_requests(),
-    );
+    let health = RequestHealth::from_metrics(&metrics);
+    let error_count = health.non_success_requests();
+    let success_rate = health.success_ratio();
     let cache_hit_request_rate = ratio(
         metrics.cache_hit_request_count,
         metrics.cache_eligible_request_count,
@@ -1240,7 +1250,7 @@ fn trend(
             output_tokens: metrics.output_tokens,
             cached_input_tokens: metrics.cached_input_tokens,
             total_tokens: metrics.total_tokens,
-            service_failure_count,
+            error_count,
             average_latency_ms,
             max_latency_ms: metrics.max_latency_ms,
             min_latency_ms: metrics.min_latency_ms,
@@ -1259,11 +1269,11 @@ fn trend(
 }
 
 fn trend_point(point: RequestMetricPoint) -> TrendPoint {
-    let service_failure_count = service_failure_count(&point.metrics);
+    let health = RequestHealth::from_metrics(&point.metrics);
     TrendPoint {
         bucket_start: point.bucket_start,
         granularity: point.granularity,
-        service_failure_count,
+        error_count: health.non_success_requests(),
         average_latency_ms: average(point.metrics.latency_sum_ms, point.metrics.latency_count),
         average_first_token_latency_ms: average(
             point.metrics.first_token_latency_sum_ms,
@@ -1277,10 +1287,7 @@ fn trend_point(point: RequestMetricPoint) -> TrendPoint {
             point.metrics.cache_hit_request_count,
             point.metrics.cache_eligible_request_count,
         ),
-        success_rate: ratio(
-            point.metrics.success_count,
-            HealthWindow::from_metrics(&point.metrics).eligible_requests(),
-        ),
+        success_rate: health.success_ratio(),
         metrics: point.metrics,
         cost_coverage: point.cost_coverage,
         costs: point.costs,
@@ -1364,57 +1371,7 @@ fn rate_or_zero(numerator: u64, denominator: u64) -> f64 {
     ratio(numerator, denominator).unwrap_or(0.0)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct HealthWindow {
-    success_requests: u64,
-    failed_requests: u64,
-    cancelled_requests: u64,
-    incomplete_requests: u64,
-    caller_error_requests: u64,
-}
-
-impl HealthWindow {
-    fn from_metrics(metrics: &RequestMetrics) -> Self {
-        Self {
-            success_requests: metrics.success_count,
-            failed_requests: service_failure_count(metrics),
-            cancelled_requests: metrics.cancelled_count,
-            incomplete_requests: metrics.incomplete_count,
-            caller_error_requests: metrics.caller_error_count,
-        }
-    }
-
-    // 未完成保留交付终态，但上游失败、超时和进程中断都不能视为服务成功
-    fn non_success_requests(self) -> u64 {
-        self.failed_requests
-            .saturating_add(self.incomplete_requests)
-    }
-
-    fn eligible_requests(self) -> u64 {
-        self.success_requests
-            .saturating_add(self.non_success_requests())
-    }
-
-    fn add_metrics(&mut self, metrics: &RequestMetrics) {
-        self.add_window(Self::from_metrics(metrics));
-    }
-
-    fn add_window(&mut self, other: Self) {
-        self.success_requests = self.success_requests.saturating_add(other.success_requests);
-        self.failed_requests = self.failed_requests.saturating_add(other.failed_requests);
-        self.cancelled_requests = self
-            .cancelled_requests
-            .saturating_add(other.cancelled_requests);
-        self.incomplete_requests = self
-            .incomplete_requests
-            .saturating_add(other.incomplete_requests);
-        self.caller_error_requests = self
-            .caller_error_requests
-            .saturating_add(other.caller_error_requests);
-    }
-}
-
-fn health_status(bucket: HealthWindow, is_future: bool) -> HealthStatus {
+fn health_status(bucket: RequestHealth, is_future: bool) -> HealthStatus {
     let eligible_requests = bucket.eligible_requests();
     if is_future {
         HealthStatus::Future
@@ -1435,14 +1392,6 @@ fn health_status(bucket: HealthWindow, is_future: bool) -> HealthStatus {
     }
 }
 
-fn health_reliability(bucket: HealthWindow) -> Option<f64> {
-    let eligible_requests = bucket.eligible_requests();
-    (eligible_requests > 0)
-        .then(|| bucket.success_requests as f64 / eligible_requests as f64 * 100.0)
-}
-
-fn service_failure_count(metrics: &RequestMetrics) -> u64 {
-    metrics
-        .failure_count
-        .saturating_sub(metrics.caller_error_count)
+fn health_reliability(bucket: RequestHealth) -> Option<f64> {
+    bucket.success_rate()
 }

@@ -50,6 +50,50 @@ pub struct Environment {
 }
 
 impl Environment {
+    pub async fn active_usage_transactions(&self) -> i64 {
+        sqlx::query_scalar(
+            "select count(distinct a.pid) from pg_stat_activity a
+             join pg_locks l on l.pid=a.pid
+             join pg_class c on c.oid=l.relation
+             join pg_namespace n on n.oid=c.relnamespace
+             where n.nspname=$1 and c.relname='model_requests'
+             and a.xact_start is not null",
+        )
+        .bind(&self.schema)
+        .fetch_one(&self.admin)
+        .await
+        .unwrap()
+    }
+
+    pub async fn prepare_empty_analytics(&self) {
+        use gateway_store::postgres::{ObservabilityQueryBudget, PgRequestAnalyticsRepository};
+        use std::time::Duration;
+
+        let options = self
+            .admin
+            .connect_options()
+            .as_ref()
+            .clone()
+            .options([("search_path", self.schema.as_str())]);
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let budget =
+            ObservabilityQueryBudget::try_new(1, Duration::from_secs(5), Duration::from_secs(10))
+                .unwrap();
+        let analytics = PgRequestAnalyticsRepository::new(pool.clone(), budget);
+        for _ in 0..10 {
+            analytics.maintain(100).await.unwrap();
+            if !analytics.status().await.unwrap().building {
+                pool.close().await;
+                return;
+            }
+        }
+        panic!("empty analytics did not become ready");
+    }
+
     pub async fn client_key(&self, id: &str, plaintext: &str) {
         self.client_key_with_limits(id, plaintext, gateway_core::policy::RateLimits::unlimited())
             .await;
@@ -72,6 +116,21 @@ impl Environment {
         )))
         .bind(id)
         .execute(&self.admin).await.unwrap();
+    }
+
+    pub async fn restore_weekly_budget_without_charge_history(&self, id: &str) {
+        // 模拟业务恢复后只有累计金额、窗口早于费用历史起点的账本
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "update {}.client_api_key_budget_windows set
+             weekly_start=date_trunc('milliseconds', now()) - interval '1 hour' + interval '456 microseconds',
+             weekly_end=date_trunc('milliseconds', now()) + interval '1 day' + interval '789 microseconds',
+             charge_history_since=now() where client_api_key_id=$1",
+            self.schema
+        )))
+        .bind(id)
+        .execute(&self.admin)
+        .await
+        .unwrap();
     }
 
     pub async fn client_key_with_limits(
@@ -888,7 +947,7 @@ impl PricingSource for UnusedAdminRuntime {
 impl ProxyProbe for UnusedAdminRuntime {
     async fn test(
         &self,
-        _: Option<&gateway_core::account::OutboundProxy>,
+        _: gateway_admin::ports::proxy::ProbeRoute<'_>,
         _: bool,
     ) -> ProxyTestResult {
         panic!("unexpected proxy probe")
@@ -915,7 +974,7 @@ impl SystemOperations for UnusedAdminRuntime {
 
     async fn update_detail(
         &self,
-        _: bool,
+        _: gateway_admin::model::system::SystemUpdateCheck,
         _: Option<gateway_admin::model::system::SystemUpdateChannel>,
     ) -> Result<SystemUpdateDetail, SystemOperationError> {
         Err(unused_system())

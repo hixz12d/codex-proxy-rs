@@ -6,6 +6,11 @@
       "globalConfiguration": "全局配置",
       "customConfiguration": "独立配置",
       "enterIntegerFromTo": "请输入 1～{version} 的正整数",
+      "installationSeed": "安装身份种子",
+      "generateInstallationSeed": "生成安装身份种子",
+      "installationSeedHelp": "按密钥和上游账号生成独立、稳定的安装身份，种子不会发送给上游，修改种子会切换身份",
+      "installationSeedPlaceholder": "留空使用上游账号的安装 ID",
+      "invalidInstallationSeed": "请输入带连字符的 UUID",
       "clientDefault": "客户端预设",
       "useCustomUserAgent": "使用自定义用户代理",
       "cliEntry": "CLI 入口",
@@ -145,6 +150,14 @@
       "unitLabel": "USD / 百万 Token"
     },
     "scheduling": {
+      "runtimeGroup": "运行状态",
+      "quotaGroup": "额度",
+      "queueGroup": "排队",
+      "windowMode": "重置窗口系数",
+      "windowHelp": "系数越大，该窗口越影响重置评分。设为 0 可忽略该窗口。",
+      "fiveHour": "5 小时",
+      "weekly": "周",
+      "monthly": "月",
       "roundRobin": "轮询",
       "autoReviewSlotsHelp": "仅对 Codex 账号生效，普通并发为 10、审批名额为 3 时，两类请求分别最多运行 10 个和 3 个，互不占用名额",
       "autoReviewQueueHelp": "开启独立额度后，审批请求单独排队，可超过账号队列容量，仍受总等待容量、排队超时与密钥限额约束",
@@ -175,7 +188,7 @@
         "preferred": "优先",
         "strict": "严格",
         "relaxedHelp": "宽松：会话内请求直接按调度策略选号，不优先主账号",
-        "preferredHelp": "优先：会话内请求优先沿用主账号，繁忙或不可用时临时分流，不改变会话绑定",
+        "preferredHelp": "优先：会话内请求优先沿用主账号，短时繁忙可临时分流，停用或长期不可用时迁移会话绑定",
         "strictHelp": "严格：同一会话共用账号，子线程等待当前账号，并跟随主线程换号"
       },
       "title": "亲和策略",
@@ -193,15 +206,15 @@
     "warmup": {
       "title": "账号预热",
       "description": "尝试启动空闲 Codex OAuth 账号的额度窗口",
-      "enableDailyWarmup": "启用每日预热",
-      "executionTime": "执行时间",
-      "timesPlaceholder": "HH:MM，多个时间用逗号分隔",
-      "scheduleLabel": "每日预热时间",
+      "enableWarmup": "启用预热",
+      "cronExpression": "Cron 表达式",
+      "cronHelp": "回车添加 Tag，支持多个",
       "modelLabel": "预热模型",
       "modelHelp": "启用时必填，需为账号可用模型",
       "modelPlaceholder": "输入模型名称",
       "helpTitle": "账号预热说明",
-      "help": "在设定时间向每个空闲的 Codex OAuth 账号发送一次请求，不保证额度窗口成功启动"
+      "help": "向可用的 Codex OAuth 账号发送轻量请求，跳过额度耗尽和已确认活跃的窗口，0% 账号允许预热，不保证窗口成功启动",
+      "scheduleHelp": "按部署时区执行，同一分钟只预热一次"
     },
     "adminApiKey": {
       "adminApiKey": "管理员 API密钥",
@@ -240,6 +253,10 @@
       "enterNewPasswordAgain": "再次输入新密码",
       "saveAndLogInAgain": "保存并重新登录"
     },
+    "units": {
+      "seconds": "秒",
+      "inSeconds": "{label}（秒）"
+    },
     "concurrency": {
       "title": "并发与重试",
       "accountLimit": {
@@ -250,20 +267,29 @@
       "keyQueueHelp": "每个密钥的等待上限，0 不排队",
       "accountQueueCapacity": "账号队列容量",
       "accountQueueHelp": "每个账号的等待上限，0 不排队",
-      "queueTimeoutLabel": "排队超时（秒）",
-      "queueTimeoutHelp": "两个队列共用，1–120 秒",
+      "keyTimeout": "密钥排队超时",
+      "keyTimeoutHelp": "等待密钥并发名额的时限，超时返回错误",
+      "accountTimeout": "账号排队超时",
+      "accountTimeoutHelp": "从首次进入账号队列起计时，重试不重置",
+      "queueFailure": "账号队满或超时后",
+      "queueFailureHelp": "尝试换到有空位的账号，无法换号时返回排队错误",
+      "queueFailureHelpTitle": "账号换号规则",
+      "queueFailureAttempt": "只尝试换号一次，不再排队",
+      "queueFailureRestrictions": "指定账号、需要原账号续写或必须跟随主会话的请求不能自行换号",
+      "returnError": "返回错误",
+      "trySwitch": "尝试换号",
       "autoReview": {
         "label": "自动审批独立并发",
         "description": "每个 Codex 账号的额外名额，0 共用普通并发",
         "helpTitle": "自动审批独立并发说明"
       },
-      "queueTimeoutHelpTitle": "排队超时说明",
-      "queueTimeoutDetails": "密钥与账号队列共用此时限，从首次入队起计时",
       "retryAfter": {
-        "label": "上游重试等待上限（秒）",
+        "label": "上游重试等待上限",
         "help": "超限时尝试换号",
         "helpTitle": "上游重试等待说明",
-        "details": "默认 240 秒，限制单次 Retry-After 等待，不是请求总时长。超限时尝试换号，无可用账号则返回错误。0 表示不接受正数等待。换号仍受最大换号次数和请求可重试条件限制。"
+        "waitLimit": "默认 240 秒，仅限制单次 Retry-After 等待，不限制请求总时长",
+        "zeroLimit": "设为 0 时，任何大于 0 秒的等待都算超限",
+        "switchConditions": "超限后，仅在请求可重试且未达到最大换号次数时尝试换号，无可用账号则返回错误"
       }
     },
     "modelMapping": "模型映射",
@@ -293,7 +319,11 @@
     "quotaReset": {
       "title": "主动重置卡",
       "enableHelp": "在账号的「额度重置」中开启自动使用",
-      "description": "全局设置，对已开启自动使用的账号生效",
+      "description": "到期前多久使用重置卡",
+      "timing": "使用时机",
+      "expiryMode": "临期使用",
+      "weeklyMode": "按周额度使用",
+      "earlyThresholdHelp": "剩余比例不高于此值时使用，留空或填 0 表示耗尽时使用",
       "thresholdHelp": "高于此值时暂不自动使用，留空表示不限制",
       "weeklyQuotaLimit": "重置卡剩余周额度上限"
     },
@@ -328,7 +358,7 @@
     },
     "tokenRefresh": {
       "title": "凭据刷新",
-      "leadTimeLabel": "提前刷新（秒）",
+      "leadTimeLabel": "提前刷新",
       "leadTimeHelp": "在访问令牌到期前触发刷新",
       "concurrencyLabel": "刷新并发上限",
       "concurrencyHelp": "同时刷新的上限，调低可减少限流"
@@ -599,7 +629,8 @@
       "invalidRetention": "历史保留天数应为 1–31 的整数",
       "invalidQueueSettings": "队列容量应为 0～1000 的整数，排队超时应为 1～120 秒的整数",
       "invalidProbeModel": "探测模型最多 128 个字符，不能包含控制字符",
-      "invalidWarmupTimes": "预激活时间格式无效，请输入 HH:MM 格式（如 08:00 或 08:00,13:00）",
+      "invalidWarmupCron": "请输入有效的 Cron 表达式",
+      "warmupCronTooLong": "总长度不能超过 255 字节",
       "warmupModelRequired": "启用预激活时请选择模型",
       "invalidWarmupModel": "预激活模型名称不能超过 128 个字符",
       "settingsSaved": "设置已保存",
@@ -614,7 +645,7 @@
         "access": "安全与访问",
         "backups": "数据备份"
       },
-      "description": "配置网关调度、上游与定价，管理访问安全、历史保留与备份",
+      "description": "管理调度、上游、定价、安全、数据留存与备份",
       "sectionsLabel": "设置分区",
       "undoAllBasicSettingsChanges": "撤销全部基础设置更改",
       "unsavedChanges": {
@@ -636,7 +667,6 @@
       "countValidity": "计数有效期",
       "windowHelp": "每次匹配失败后续期，普通调用成功后清零",
       "countValiditySeconds": "计数有效期秒数",
-      "seconds": "秒",
       "cooldownTime": "冷却时长",
       "cooldownHelp": "探测失败时，按此时长延后恢复",
       "cooldownTimeInSeconds": "冷却时长秒数",

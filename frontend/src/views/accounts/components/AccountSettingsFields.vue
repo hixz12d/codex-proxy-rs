@@ -15,6 +15,7 @@ withDefaults(defineProps<{
   currentProxyId?: string | null
   endpoint?: string | null
   accountId?: string
+  modelAccountId?: string
   preserveProxy?: boolean
   randomProxy?: boolean
   preserveModelAccess?: boolean
@@ -38,7 +39,9 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
 
 <template>
   <div class="grid gap-4.5">
-    <AccountModelAccessField v-model="modelAccess" form-prop="modelAccess" :account-id="accountId" :disabled="disabled" :allow-preserve="preserveModelAccess" />
+    <AccountNameField v-if="name !== undefined" v-model="name" :disabled="disabled" :placeholder="namePlaceholder" />
+    <slot name="connection" />
+    <AccountModelAccessField v-model="modelAccess" form-prop="modelAccess" :account-id="modelAccountId ?? accountId" :disabled="disabled" :allow-preserve="preserveModelAccess" />
     <slot name="scheduling">
       <div v-if="showScheduling" class="flex min-h-6 items-center justify-between gap-3">
         <span class="text-z leading-none font-medium text-z-text-secondary">{{ t('accounts.scheduling.scheduling') }}</span>
@@ -84,7 +87,6 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
       />
     </ZFormItem>
     <AccountProxyField v-model:mode="proxyMode" v-model:proxy-id="proxyId" form-prop="proxyId" :preserve="preserveProxy" :random="randomProxy" :current-proxy-id="currentProxyId" :endpoint="endpoint" :account-id="accountId" :disabled="disabled" />
-    <AccountNameField v-if="name !== undefined" v-model="name" :disabled="disabled" :placeholder="namePlaceholder" />
     <ZFormItem v-if="notes !== undefined" :label="t('common.fields.notes')">
       <ZTextarea v-model="notes" :rows="3" :maxlength="500" :placeholder="notesPlaceholder ?? t('accounts.editor.notesHelp')" :disabled="disabled" />
     </ZFormItem>

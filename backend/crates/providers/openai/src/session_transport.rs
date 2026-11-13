@@ -1,4 +1,4 @@
-//! 根会话的连续 WS 失败预算；耗尽后保持 HTTP，空闲过期后释放状态
+//! 按客户端线程维护 WS 失败预算，空闲过期后释放状态
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -46,39 +46,48 @@ impl CodexSessionTransportRecovery {
         key: &ProviderSessionAffinityKey,
         max_retries: u32,
     ) -> bool {
-        self.update(key, |state| match state {
-            TransportState::WebSocket { failures } if failures < max_retries => {
-                TransportState::WebSocket {
-                    failures: failures + 1,
+        self.update(key, |session| {
+            session.state = match session.state {
+                TransportState::WebSocket { failures } if failures < max_retries => {
+                    TransportState::WebSocket {
+                        failures: failures + 1,
+                    }
                 }
-            }
-            TransportState::WebSocket { .. } | TransportState::Http => TransportState::Http,
+                _ => TransportState::Http,
+            };
+            matches!(session.state, TransportState::Http)
         })
     }
 
     pub(crate) fn disable_websocket(&self, key: &ProviderSessionAffinityKey) {
-        self.update(key, |_| TransportState::Http);
+        self.update(key, |session| session.state = TransportState::Http);
     }
 
     pub(crate) fn websocket_succeeded(&self, key: &ProviderSessionAffinityKey) {
-        self.lock().remove(key);
+        self.update(key, |session| {
+            session.state = TransportState::WebSocket { failures: 0 }
+        });
     }
 
-    fn update(
+    fn update<T>(
         &self,
         key: &ProviderSessionAffinityKey,
-        update: impl FnOnce(TransportState) -> TransportState,
-    ) -> bool {
+        update: impl FnOnce(&mut SessionTransport) -> T,
+    ) -> T {
         let now = Instant::now();
         let mut sessions = self.lock();
-        let previous = sessions
+        let mut session = sessions
             .remove(key)
-            .filter(|session| {
-                now.saturating_duration_since(session.last_used) < SESSION_IDLE_RETENTION
-            })
-            .map_or(TransportState::WebSocket { failures: 0 }, |session| {
-                session.state
+            .filter(|s| now.saturating_duration_since(s.last_used) < SESSION_IDLE_RETENTION)
+            .unwrap_or(SessionTransport {
+                state: TransportState::WebSocket { failures: 0 },
+                last_used: now,
             });
+        let result = update(&mut session);
+        if matches!(session.state, TransportState::WebSocket { failures: 0 }) {
+            return result;
+        }
+        session.last_used = now;
         if sessions.len() >= MAX_SESSION_TRANSPORTS {
             sessions.retain(|_, session| {
                 now.saturating_duration_since(session.last_used) < SESSION_IDLE_RETENTION
@@ -92,16 +101,8 @@ impl CodexSessionTransportRecovery {
                 sessions.remove(&oldest);
             }
         }
-        let state = update(previous);
-        let uses_http = matches!(state, TransportState::Http);
-        sessions.insert(
-            key.clone(),
-            SessionTransport {
-                state,
-                last_used: now,
-            },
-        );
-        uses_http
+        sessions.insert(key.clone(), session);
+        result
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<ProviderSessionAffinityKey, SessionTransport>> {

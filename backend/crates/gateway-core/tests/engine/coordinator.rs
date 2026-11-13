@@ -1,5 +1,6 @@
 //! 单行 `model_requests`、账号重试与下游提交屏障测试
 
+use gateway_core::engine::probe::AccountProbeTarget;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::{
@@ -2753,7 +2754,7 @@ fn continuation_history_failure_without_replay_proof_is_delivered_without_hidden
 }
 
 #[test]
-fn diagnostic_account_reaches_provider_and_matching_metadata_succeeds() {
+fn recovery_probe_reaches_provider_with_read_only_account() {
     let operation = generate_operation();
     let route_plan = plan(&operation);
     let (coordinator, _, provider) = coordinator(vec![Script::Stream {
@@ -2765,7 +2766,7 @@ fn diagnostic_account_reaches_provider_and_matching_metadata_succeeds() {
         model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
         operation,
         route_plan,
-        required.clone(),
+        AccountProbeTarget::FreezeRecovery(required.clone()),
         None,
         CancellationToken::new(),
     ))
@@ -2777,6 +2778,11 @@ fn diagnostic_account_reaches_provider_and_matching_metadata_succeeds() {
     assert_eq!(contexts.len(), 1);
     assert_eq!(contexts[0].required_account(), Some(&required));
     assert!(contexts[0].is_diagnostic_required_account());
+    assert!(
+        !contexts[0]
+            .account_eligibility()
+            .allows_account_state_mutation(true)
+    );
 }
 
 #[test]
@@ -4315,6 +4321,87 @@ fn retry_after_above_the_configured_limit_rotates_without_waiting() {
                     .excluded_accounts()
                     .contains(&ProviderAccountId::new("acct_first").unwrap())
             );
+        }
+    }
+}
+
+#[test]
+fn no_more_retry_skips_same_account_wait_even_when_retry_after_is_short() {
+    let advised = Duration::from_secs(30);
+    for (rejection, rotates) in [
+        (
+            transient_rejection()
+                .with_same_account_retry_blocked()
+                .with_retry_after(advised),
+            true,
+        ),
+        (
+            transient_rejection()
+                .with_transient_retry(
+                    NonZeroU32::MIN,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    TransientRetryPolicy::RetryThenReturnError,
+                )
+                .with_same_account_retry_blocked()
+                .with_retry_after(advised),
+            false,
+        ),
+    ] {
+        let operation = generate_operation();
+        let route_plan = retry_after_plan(&operation, 240);
+        let mut scripts = vec![Script::Stream {
+            account_id: "acct_first",
+            items: vec![Err(rejection)],
+        }];
+        if rotates {
+            scripts.push(Script::Stream {
+                account_id: "acct_second",
+                items: complete_stream(None),
+            });
+        }
+        let (coordinator, _, provider) = coordinator(scripts);
+        let mut session = block_on(coordinator.start(
+            model_request(&operation, SystemTime::now() + Duration::from_secs(30)),
+            operation,
+            route_plan,
+            None,
+            None,
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let trace = session.trace().clone();
+        let mut collection = Box::pin(session.collect_uncommitted());
+        let polled = block_on(async { futures::poll!(&mut collection) });
+        let trace = trace.snapshot().unwrap();
+        let retry = trace["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["stage"] == "retry.decided")
+            .unwrap();
+        assert_eq!(retry["data"]["sameAccountRetryBlocked"], true);
+        assert_eq!(retry["data"]["transientRetry"], false);
+        assert_eq!(retry["data"]["retryAfterExceeded"], false);
+        if rotates {
+            assert!(matches!(polled, std::task::Poll::Ready(Ok(_))));
+            drop(collection);
+            let contexts = provider.contexts.lock().unwrap();
+            assert_eq!(contexts.len(), 2);
+            assert_eq!(contexts[1].required_account(), None);
+            assert!(
+                contexts[1]
+                    .excluded_accounts()
+                    .contains(&ProviderAccountId::new("acct_first").unwrap())
+            );
+        } else {
+            assert!(matches!(
+                polled,
+                std::task::Poll::Ready(Err(EngineError::Provider(error)))
+                    if error.retry_after() == Some(advised)
+            ));
+            assert_eq!(provider.contexts.lock().unwrap().len(), 1);
         }
     }
 }
@@ -7397,7 +7484,9 @@ fn error_protection_tracks_real_retry_attempts_and_skips_diagnostic_runs() {
                         request,
                         operation,
                         route_plan,
-                        ProviderAccountId::new("acct_first").unwrap(),
+                        AccountProbeTarget::ConnectionTest(
+                            ProviderAccountId::new("acct_first").unwrap(),
+                        ),
                         None,
                         CancellationToken::new(),
                     )

@@ -30,6 +30,7 @@ use crate::openai::service::OpenAiService;
 pub mod admin;
 pub mod auth;
 mod client_error;
+mod diagnostics;
 mod health;
 mod key_usage;
 mod middleware;
@@ -136,6 +137,7 @@ pub enum ApiConfigError {
 
 /// 完成组装的唯一 API router
 pub struct ApiBundle {
+    peer_node: HeaderValue,
     router: Router,
     settings: middleware::SettingsSource,
     middleware: Option<middleware::PlanSource>,
@@ -168,6 +170,7 @@ impl ApiBundle {
                 self.timeout,
                 self.request_id_header.clone(),
                 self.settings.clone(),
+                self.peer_node.clone(),
             ),
             settings: self.settings.clone(),
         })
@@ -180,12 +183,15 @@ impl ApiBundle {
             self.timeout,
             self.request_id_header,
             self.settings,
+            self.peer_node,
         )
     }
 }
 
 /// 组装客户端、管理端、健康检查和静态资源路由
+#[expect(clippy::too_many_arguments)]
 pub fn initialize(
+    peer_node: uuid::Uuid,
     mut config: ApiConfig,
     execution: Arc<dyn ExecutionService>,
     admin: AdminServices,
@@ -216,6 +222,7 @@ pub fn initialize(
     };
     let index = config.asset_directory.join("index.html");
     let mut router = Router::new()
+        .route("/readyz", get(health::readyz))
         .route("/healthz", get(health::healthz))
         .merge(openai::router::router())
         .merge(provider::router())
@@ -248,6 +255,8 @@ pub fn initialize(
                     axum::http::header::AUTHORIZATION,
                     axum::http::header::CONTENT_TYPE,
                     HeaderName::from_static("x-api-key"),
+                    HeaderName::from_static("anthropic-version"),
+                    HeaderName::from_static("anthropic-beta"),
                     request_id_header.clone(),
                 ])
                 .allow_credentials(true),
@@ -280,6 +289,10 @@ pub fn initialize(
     });
     let router = router
         .layer(axum::middleware::from_fn_with_state(
+            diagnostics.clone(),
+            diagnostics::record_ingress,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
             diagnostics,
             admin::diagnostics::record_failure,
         ))
@@ -291,6 +304,13 @@ pub fn initialize(
         ))
         .with_state(state);
     Ok(ApiBundle {
+        peer_node: HeaderValue::from_bytes(
+            peer_node
+                .simple()
+                .encode_lower(&mut uuid::Uuid::encode_buffer())
+                .as_bytes(),
+        )
+        .expect("UUID encodes as ASCII"),
         settings,
         router,
         middleware: None,

@@ -16,6 +16,7 @@ async fn peer_refresh_uses_the_account_quota_endpoint_and_requires_admin() {
     fixture.auth.insert_session("valid-session");
     *fixture.account.lock().unwrap() = Some(account_page_item(
         AccountStatusFacts {
+            quota_paused: false,
             enabled: true,
             credential_state: CredentialState::Ready,
             access_token_expires_at: None,
@@ -73,6 +74,7 @@ async fn account_model_reads_and_refreshes_preserve_provider_observation_time() 
     let observed_at: DateTime<Utc> = "2026-09-12T08:00:00Z".parse().unwrap();
     *fixture.account.lock().unwrap() = Some(account_page_item(
         AccountStatusFacts {
+            quota_paused: false,
             enabled: true,
             credential_state: CredentialState::Ready,
             access_token_expires_at: None,
@@ -161,6 +163,7 @@ async fn account_proxy_binding_is_distinct_from_the_redacted_endpoint() {
     ] {
         let now = Utc::now();
         let facts = AccountStatusFacts {
+            quota_paused: false,
             enabled: true,
             credential_state: CredentialState::Ready,
             access_token_expires_at: None,
@@ -239,6 +242,7 @@ async fn account_cooldown_returns_an_instant_and_server_formatted_recovery() {
             let now = Utc::now();
             let until = seconds.map(|seconds| now + Duration::seconds(seconds));
             let facts = AccountStatusFacts {
+                quota_paused: false,
                 enabled: true,
                 credential_state: CredentialState::Ready,
                 access_token_expires_at: None,
@@ -323,6 +327,7 @@ async fn account_quota_refresh_time_uses_server_clock_and_deployment_timezone() 
         let now = Utc::now();
         *fixture.account.lock().unwrap() = Some(account_page_item(
             AccountStatusFacts {
+                quota_paused: false,
                 enabled: true,
                 credential_state: CredentialState::Ready,
                 access_token_expires_at: None,
@@ -356,6 +361,7 @@ async fn account_quota_refresh_time_uses_server_clock_and_deployment_timezone() 
             ),
         ] {
             *fixture.provider_quota.lock().unwrap() = Some(ProviderQuota {
+                paused_windows: Vec::new(),
                 upstream: None,
                 plan_type: None,
                 observed_at,
@@ -406,6 +412,9 @@ fn account_page_item(
     AccountPageItem {
         protection_rules: Vec::new(),
         account: AccountRecord {
+            quota_paused: false,
+            quota_limits: Default::default(),
+            auto_use_quota_credits: false,
             outbound_proxy_id: None,
             outbound_proxy_enabled: true,
             id: "acct_cooldown".to_owned(),
@@ -444,15 +453,20 @@ fn account_page_item(
 }
 
 #[tokio::test]
-async fn account_usage_preserves_cache_read_and_write_counts_and_missing_values() {
+async fn account_usage_preserves_periods_cache_counts_and_missing_values() {
     use chrono::Utc;
-    use gateway_admin::model::accounts::AccountUsage;
+    use gateway_admin::model::accounts::{AccountModelUsage, AccountUsage};
+    use gateway_admin::model::observability::RequestHealth;
+    use gateway_admin::model::provider_credentials::{
+        ProviderQuota, ProviderQuotaWindow, QuotaLocalUsageAttribution,
+    };
     use gateway_core::account::{AccountStatusFacts, CredentialState, QuotaState};
 
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     let now = Utc::now();
     let facts = AccountStatusFacts {
+        quota_paused: false,
         enabled: true,
         credential_state: CredentialState::Ready,
         access_token_expires_at: None,
@@ -461,9 +475,19 @@ async fn account_usage_preserves_cache_read_and_write_counts_and_missing_values(
         last_error_reason: None,
         last_error_message: None,
     };
-    *fixture.account.lock().unwrap() = Some(account_page_item(facts, now, "api_key"));
-    for (read, write) in [(Some(13), Some(7)), (None, None)] {
-        *fixture.account_usage.lock().unwrap() = vec![AccountUsage {
+    for (authentication_kind, read, write) in [
+        ("api_key", Some(13), Some(7)),
+        ("api_key", None, None),
+        ("oauth", Some(13), Some(7)),
+        ("oauth", None, None),
+    ] {
+        let mut account = account_page_item(facts.clone(), now, authentication_kind);
+        if authentication_kind == "oauth" {
+            account.account.provider_kind =
+                gateway_core::routing::ProviderKind::new("xai").unwrap();
+        }
+        *fixture.account.lock().unwrap() = Some(account);
+        let local_usage = AccountUsage {
             account_id: "acct_cooldown".to_owned(),
             request_count: 1,
             success_count: 1,
@@ -480,9 +504,61 @@ async fn account_usage_preserves_cache_read_and_write_counts_and_missing_values(
             cost_coverage: Default::default(),
             costs: Vec::new(),
             last_used_at: Some(now),
-            request_buckets: Vec::new(),
-            models: Vec::new(),
-        }];
+            request_buckets: vec![gateway_admin::model::accounts::AccountRequestBucket {
+                bucket_start: now,
+                request_count: 1,
+            }],
+            models: [
+                (
+                    "mixed",
+                    RequestHealth::from_counts(1, 2, 3, 1, 1),
+                    Some(now),
+                ),
+                ("failed", RequestHealth::from_counts(0, 1, 0, 0, 0), None),
+                ("no-sample", RequestHealth::from_counts(0, 1, 1, 0, 1), None),
+            ]
+            .into_iter()
+            .map(|(model, health, last_used_at)| AccountModelUsage {
+                model: model.to_owned(),
+                request_count: u64::from(last_used_at.is_some()),
+                health,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                reasoning_output_tokens: None,
+                image_input_tokens: None,
+                image_output_tokens: None,
+                image_request_count: 0,
+                image_request_failed_count: 0,
+                total_tokens: None,
+                cost_coverage: Default::default(),
+                costs: Vec::new(),
+                last_used_at,
+            })
+            .collect(),
+        };
+        *fixture.account_usage.lock().unwrap() = vec![local_usage.clone()];
+        *fixture.provider_quota.lock().unwrap() =
+            (authentication_kind == "oauth").then(|| ProviderQuota {
+                windows: vec![ProviderQuotaWindow {
+                    upstream: None,
+                    key: "rolling-day".to_owned(),
+                    group: "shortTerm".to_owned(),
+                    label: "日限额".to_owned(),
+                    limit_id: None,
+                    limit_name: None,
+                    role: None,
+                    local_usage_attribution: QuotaLocalUsageAttribution::AccountWide,
+                    window_seconds: Some(86_400),
+                    used_percent: None,
+                    reset_at: None,
+                    limit_reached: false,
+                    local_usage: Some(local_usage),
+                    provider_data: None,
+                }],
+                ..Default::default()
+            });
         let response = admin::accounts::router::<AdminTestState>()
             .with_state(fixture.state())
             .oneshot(
@@ -500,6 +576,34 @@ async fn account_usage_preserves_cache_read_and_write_counts_and_missing_values(
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status, StatusCode::OK, "{value}");
         let usage = &value["data"]["items"][0]["usage"];
+        assert_eq!(
+            usage["windowKind"],
+            if authentication_kind == "oauth" {
+                "daily"
+            } else {
+                "general"
+            }
+        );
+        assert_eq!(usage["models"][0]["successRateDisplay"], "33.3%");
+        assert!((usage["models"][0]["successRate"].as_f64().unwrap() - 100.0 / 3.0).abs() < 0.001);
+        assert_eq!(usage["models"][1]["successRate"], 0.0);
+        assert_eq!(usage["models"][1]["successRateDisplay"], "0.0%");
+        assert!(usage["models"][1]["lastUsedAt"].is_null());
+        assert!(usage["models"][2]["successRate"].is_null());
+        assert_eq!(usage["models"][2]["successRateDisplay"], "—");
+        assert_eq!(usage["requestCount"], 1);
+        assert_eq!(usage["totalTokens"], 120);
+        if authentication_kind == "oauth" {
+            let window = &value["data"]["items"][0]["quota"]["windows"][0];
+            assert_eq!(window["localUsage"]["requestCount"], 1);
+            assert_eq!(
+                window["localUsage"]["requestBuckets"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
         assert_eq!(usage["cachedInputTokens"], serde_json::json!(read));
         assert_eq!(usage["cacheWriteInputTokens"], serde_json::json!(write));
         assert_eq!(
@@ -646,6 +750,7 @@ async fn concurrency_details_require_admin_validate_paging_and_report_lease_time
     fixture.auth.insert_session("valid-session");
     *fixture.account.lock().unwrap() = Some(account_page_item(
         gateway_core::account::AccountStatusFacts {
+            quota_paused: false,
             enabled: true,
             credential_state: gateway_core::account::CredentialState::Ready,
             access_token_expires_at: None,

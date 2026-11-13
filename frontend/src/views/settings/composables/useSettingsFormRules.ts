@@ -38,7 +38,8 @@ export function useSettingsFormRules(form: () => SettingsForm) {
     'openaiSessionAffinityTtlHours': integer(1, 720, t('settings.form.invalidAffinityDuration')),
     'maxWaitingPerKey': integer(0, 1000, t('settings.form.invalidQueueSettings')),
     'maxWaitingPerAccount': integer(0, 1000, t('settings.form.invalidQueueSettings')),
-    'concurrencyWaitTimeoutSeconds': integer(1, 120, t('settings.form.invalidQueueSettings')),
+    'keyQueueTimeoutSeconds': integer(1, 120, t('settings.form.invalidQueueSettings')),
+    'accountQueueTimeoutSeconds': integer(1, 120, t('settings.form.invalidQueueSettings')),
     'maxRetryAfterSeconds': integer(0, 4_294_967_295, t('settings.form.invalidRetryAfterLimit')),
     'responsesMaxDecompressedBodyMiB': integer(1, Math.floor(Number.MAX_SAFE_INTEGER / 1024 / 1024), t('settings.form.invalidBodyLimit')),
     'resetCreditLeadMinutes': integer(1, 1440, t('settings.form.invalidResetLeadTime')),
@@ -49,13 +50,19 @@ export function useSettingsFormRules(form: () => SettingsForm) {
     'usageRetentionDays': integer(1, 31, t('settings.form.invalidRetention')),
     'minCodexDesktopVersion': version(),
     'minCodexCliVersion': version(),
-    'accountWarmupScheduleTime': {
-      required: true,
-      pattern: /^(?:[01]\d|2[0-3]):[0-5]\d(?:,(?:[01]\d|2[0-3]):[0-5]\d)*$/,
-      transform: value => value.trim(),
-      trigger: ['blur', 'change'],
-      message: t('settings.form.invalidWarmupTimes'),
-    },
+    'accountWarmupCron': [
+      {
+        validator: (_rule, expressions: string[]) => (!form().accountWarmupEnabled || expressions.length > 0)
+          && expressions.every(expression => /^[^\s;]+(?: +[^\s;]+){4}$/u.test(expression)),
+        message: t('settings.form.invalidWarmupCron'),
+        trigger: ['blur', 'change'],
+      },
+      {
+        validator: (_rule, expressions: string[]) => new TextEncoder().encode(expressions.join(';')).length <= 255,
+        message: t('settings.form.warmupCronTooLong'),
+        trigger: ['blur', 'change'],
+      },
+    ],
     'accountWarmupModel': [
       {
         required: form().accountWarmupEnabled,
@@ -87,7 +94,8 @@ export function useSettingsFormRules(form: () => SettingsForm) {
       },
     ],
     'accountErrorProtection.rules': {
-      trigger: 'change',
+      // 子字段保留输入校验，整组完整性只在提交时检查
+      trigger: [],
       validator: () => {
         const error = protectionPolicyError(form().accountErrorProtection)
         return error

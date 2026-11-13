@@ -80,9 +80,22 @@ export interface UsageRecordMetadata {
 
 export type UsageRecordStatus = 'success' | 'error' | 'all'
 
-export interface UsageListRecord {
-  logicalOutcome: string
+export type UsageErrorOrigin = 'proxy' | 'upstream' | 'connection' | 'unknown'
+
+export interface UsageErrorFacts {
+  errorOrigin: UsageErrorOrigin
   errorCode: string | null
+  errorKind: string | null
+  websocketCloseCode: number | null
+  continuationUnavailableReason: string | null
+  upstreamConnectionExitReason: string | null
+  recovered: boolean
+}
+
+export interface UsageListRecord extends UsageErrorFacts {
+  logicalOutcome: string
+  clientStatusCode: number | null
+  upstreamStatusCode: number | null
   errorMessage: string | null
   clientApiKeyName: string | null
   id: string
@@ -117,7 +130,16 @@ export interface UsageListRecord {
   userAgent: string | null
 }
 
-export interface UsageRecord {
+export interface UsageRecord extends UsageErrorFacts {
+  upstreamError: {
+    code: string | null
+    errorType: string | null
+    message: string | null
+    param: string | null
+    closeReason: string | null
+    lastEventType: string | null
+  } | null
+  retryAfterMs: number | null
   id: string
   requestId: string
   clientApiKeyId: string | null
@@ -184,7 +206,7 @@ export interface UsageAttempt {
   transport: string
   sendState: string
   outcome: string
-  downstreamCommitted: boolean
+  downstreamCommitted: boolean | null
   statusCode: number | null
   providerErrorCode: string | null
   failureClass: string | null
@@ -240,7 +262,7 @@ export interface UsageOverviewHealthPoint {
   cancelledRequests: number
   incompleteRequests: number
   callerErrorRequests: number
-  errorRate: number
+  errorRate: number | null
 }
 
 export interface UsageOverviewHealth {
@@ -250,7 +272,7 @@ export interface UsageOverviewHealth {
   cancelledRequests: number
   incompleteRequests: number
   callerErrorRequests: number
-  successRate: number
+  successRate: number | null
   completionRate: number
   requestChangeRate: number | null
   successRateChange: number | null
@@ -369,7 +391,7 @@ export interface UsageDiagnosticItem {
   requestCount: number
   successCount: number
   errorCount: number
-  errorRate: number
+  errorRate: number | null
   requestShare: number
   averageLatencyMs: number | null
   latencyP95Ms: number | null

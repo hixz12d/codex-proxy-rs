@@ -394,7 +394,7 @@ impl GrokCredentialRepository {
         )?;
         let outcome = self
             .store
-            .compare_and_swap_credential(prepared.credential)
+            .compare_and_swap_credential(prepared.credential.preserving_profile())
             .await
             .map_err(map_store_error)?;
         let CredentialCasOutcome::Updated(revision) = outcome else {
@@ -439,7 +439,8 @@ impl GrokCredentialRepository {
             GrokCredentialRepositoryError::InvalidCredentialData(Some(
                 gateway_core::error::ErrorSource::new(source),
             ))
-        })?;
+        })?
+        .preserving_profile();
         match self
             .store
             .compare_and_swap_credential(update)
@@ -566,6 +567,7 @@ impl GrokCredentialRepository {
         let outcome = self
             .store
             .compare_and_swap_quota(QuotaObservation {
+                quota_pause: None,
                 expected_connection: None,
                 plan_type: None,
                 account_id,

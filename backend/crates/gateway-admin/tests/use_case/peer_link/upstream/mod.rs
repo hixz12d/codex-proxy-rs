@@ -239,13 +239,15 @@ async fn discovery_uses_provider_capabilities_and_publishes_neutral_signals() {
             initialize_peer_upstream(accounts.clone(), &registry, transport.clone()).unwrap();
         let initial_accounts = accounts.accounts.lock().unwrap().clone();
         let reader = UpstreamInfoReader::default();
+        assert!(!reader.is_peer(&initial_accounts[0]));
         assert!(
             reader
-                .signal(&initial_accounts[0], "model", SystemTime::now())
+                .signal(&initial_accounts[0], Some("model"), SystemTime::now())
                 .is_none()
         );
         let source = bundle.scheduling_source();
         reader.bind(&source).unwrap();
+        assert!(!reader.is_peer(&initial_accounts[0]));
         assert!(reader.bind(&source).is_err());
         drop(source);
         let WorkerContribution::Registration(worker) = bundle.take_worker_contributions().remove(0)
@@ -272,8 +274,16 @@ async fn discovery_uses_provider_capabilities_and_publishes_neutral_signals() {
             }
         );
         for account in &initial_accounts[..2] {
+            assert_eq!(
+                reader.is_peer(account),
+                Some(account.provider().as_str()) != failed_provider
+            );
             if Some(account.provider().as_str()) == failed_provider {
-                assert!(reader.signal(account, "model", SystemTime::now()).is_none());
+                assert!(
+                    reader
+                        .signal(account, Some("model"), SystemTime::now())
+                        .is_none()
+                );
                 continue;
             }
             let observed = bundle
@@ -288,21 +298,22 @@ async fn discovery_uses_provider_capabilities_and_publishes_neutral_signals() {
             );
             assert!(
                 reader
-                    .signal(account, "model", SystemTime::now())
+                    .signal(account, Some("model"), SystemTime::now())
                     .unwrap()
                     .exhausted
             );
         }
         assert!(
             reader
-                .signal(&initial_accounts[2], "model", SystemTime::now())
+                .signal(&initial_accounts[2], Some("model"), SystemTime::now())
                 .is_none()
         );
         drop(worker);
         drop(bundle);
+        assert!(!reader.is_peer(&initial_accounts[0]));
         assert!(
             reader
-                .signal(&initial_accounts[0], "model", SystemTime::now())
+                .signal(&initial_accounts[0], Some("model"), SystemTime::now())
                 .is_none()
         );
     }
@@ -332,10 +343,11 @@ async fn account_edits_preserve_observation_and_refresh_budget_until_connection_
     assert!(
         bundle
             .scheduling_source()
-            .signal(&edited, "model", SystemTime::now())
+            .signal(&edited, Some("model"), SystemTime::now())
             .is_some()
     );
     let after = service.refresh_quota(edited.id()).await.unwrap();
+    assert!(bundle.scheduling_source().is_peer(&edited));
     assert_eq!(after.upstream, before.upstream);
     assert_eq!(transport.0.lock().unwrap().len(), 1);
 
@@ -343,11 +355,12 @@ async fn account_edits_preserve_observation_and_refresh_budget_until_connection_
         OutboundProxy::parse("http://proxy.invalid:8080").unwrap(),
     ));
     *accounts.accounts.lock().unwrap() = vec![reconnected.clone()];
+    assert!(!bundle.scheduling_source().is_peer(&reconnected));
     service.account_changed(reconnected.id()).await.unwrap();
     assert!(
         bundle
             .scheduling_source()
-            .signal(&reconnected, "model", SystemTime::now())
+            .signal(&reconnected, Some("model"), SystemTime::now())
             .is_none()
     );
     service.refresh_quota(reconnected.id()).await.unwrap();
@@ -392,7 +405,7 @@ impl PeerTransport for TestTransport {
             .push(account.id().as_str().to_owned());
         let now = Utc::now();
         Ok(serde_json::to_vec(&serde_json::json!({
-            "object":"cpr.peer", "schema_version":2,
+            "object":"cpr.peer", "schema_version":3,
             "observed_at":now.to_rfc3339(),
             "expires_at":(now + chrono::Duration::minutes(5)).to_rfc3339(),
             "capabilities":["key_usage"],
@@ -418,6 +431,21 @@ fn loaded(account: &ProviderAccount) -> LoadedCredential {
 
 #[async_trait]
 impl ProviderAccountStore for TestAccounts {
+    async fn load_account_catalogs(
+        &self,
+        _: &gateway_core::routing::ProviderKind,
+    ) -> Result<Vec<gateway_core::account::StoredAccountCatalog>, gateway_core::error::StoreError>
+    {
+        Ok(Vec::new())
+    }
+    async fn save_account_catalog(
+        &self,
+        _: &gateway_core::account::AccountCatalogObservation,
+        _: &[u8],
+    ) -> Result<bool, gateway_core::error::StoreError> {
+        unreachable!("fixture does not discover account catalogs")
+    }
+
     async fn create_account(&self, _account: NewProviderAccount) -> Result<(), StoreError> {
         panic!("unused account operation")
     }
@@ -449,6 +477,31 @@ impl ProviderAccountStore for TestAccounts {
             .unwrap()
             .iter()
             .filter(|account| account.provider() == provider)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_for_provider_accounts(
+        &self,
+        provider: &ProviderKind,
+        account_ids: &[ProviderAccountId],
+    ) -> Result<Vec<ProviderAccount>, StoreError> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if Some(provider.as_str()) == self.failed_provider {
+            return Err(StoreError::new(StoreErrorKind::Unavailable));
+        }
+        Ok(self
+            .accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|account| {
+                account.provider() == provider
+                    && account.enabled()
+                    && account_ids.contains(account.id())
+            })
             .cloned()
             .collect())
     }

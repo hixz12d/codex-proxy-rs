@@ -140,10 +140,14 @@ impl PendingPeer {
 }
 
 impl UpstreamInfoSource for PendingPeer {
+    fn is_peer(&self, _: &ProviderAccount) -> bool {
+        false
+    }
+
     fn signal(
         &self,
         _: &ProviderAccount,
-        _: &str,
+        _: Option<&str>,
         _: std::time::SystemTime,
     ) -> Option<UpstreamSchedulingSignal> {
         None
@@ -152,6 +156,14 @@ impl UpstreamInfoSource for PendingPeer {
 
 #[async_trait]
 impl PeerUpstreamService for PendingPeer {
+    fn observed_concurrency_limit(
+        &self,
+        _: &gateway_core::account::QuotaObservationVersion,
+        _: std::time::SystemTime,
+    ) -> Option<gateway_core::account::AccountConcurrencyLimit> {
+        None
+    }
+
     async fn account_changed(&self, id: &ProviderAccountId) -> Result<(), StoreError> {
         self.changed.lock().unwrap().push(id.as_str().into());
         Ok(())

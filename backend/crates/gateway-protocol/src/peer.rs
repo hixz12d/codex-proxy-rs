@@ -1,13 +1,23 @@
-//! CPR 互联的版本化只读线协议，不包含授权、采集或调度策略
+//! CPR 互联的推理路径和版本化只读线协议，不包含授权、采集或调度策略
 
 use serde::{Deserialize, Serialize};
 
+/// 节点间推理的部署路径，使用逗号分隔的 UUID
+pub const ROUTE_HEADER: &str = "x-cpr-route";
+pub const ROUTING_LOOP_CODE: &str = "peer_routing_loop";
+pub const SHARING_DISABLED_CODE: &str = "peer_sharing_disabled";
 pub const OBJECT: &str = "cpr.peer";
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const MAX_ACCOUNTS: usize = 3_000;
 pub const MAX_QUOTA_WINDOWS: usize = 6_000;
 pub const MAX_MODELS: usize = 2_000;
 pub const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// 普通 5xx 和第三方错误不代表 CPR 确认了环路
+#[must_use]
+pub fn is_routing_loop(status: Option<u16>, code: Option<&str>) -> bool {
+    status == Some(508) && code == Some(ROUTING_LOOP_CODE)
+}
 
 /// 可选能力按当前认证主体公开，未知能力可以忽略
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -20,11 +30,22 @@ pub struct PeerLink {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<PeerUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_limits: Option<PeerKeyLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<PeerPool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<PeerQuota>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<PeerModelAvailability>,
+}
+
+/// 当前认证密钥公开的请求上限，缺失表示未知，零表示不限
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerKeyLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -25,6 +25,7 @@ pub(super) fn account_page_data(
         summary: AccountSummaryView {
             total: result.summary.total,
             normal: result.summary.normal,
+            quota_paused: result.summary.quota_paused,
             quota_exhausted: result.summary.quota_exhausted,
             rate_limited: result.summary.rate_limited,
             disabled: result.summary.disabled,
@@ -116,6 +117,8 @@ pub(super) fn account_view(
     let (mut quota, refresh_token_expires_at) = account_quota_view(quota, cooldown, now, time);
     quota.protection_rules = protection_rules;
     AccountView {
+        quota_limits: account.quota_limits,
+        auto_use_quota_credits: account.auto_use_quota_credits,
         upstream,
         capabilities: capabilities.into(),
         id: account.id.clone(),
@@ -193,6 +196,7 @@ fn quota_forecast_view(
         period: match forecast.period {
             AccountUsagePeriod::Weekly => "weekly",
             AccountUsagePeriod::Monthly => "monthly",
+            AccountUsagePeriod::Daily => "daily",
         },
         target_days: forecast.target_seconds as f64 / 86_400.0,
         extrapolated: forecast.extrapolated,
@@ -270,6 +274,7 @@ pub(super) fn account_quota_view(
     let recovery_probe_required = cooldown.is_some_and(|value| value.kind.requires_probe());
     (
         AccountQuotaView {
+            paused_windows: quota.paused_windows,
             refreshed_at: quota.observed_at.map(|value| time.rfc3339(&value)),
             refreshed_at_relative: quota
                 .observed_at
@@ -304,7 +309,7 @@ pub(crate) fn quota_window_view(
         limit_id,
         limit_name,
         role,
-        local_usage_attribution: _,
+        local_usage_attribution,
         window_seconds,
         used_percent,
         reset_at,
@@ -316,6 +321,8 @@ pub(crate) fn quota_window_view(
         .as_ref()
         .map_or_else(|| label.clone(), |name| format!("{name} · {label}"));
     AccountQuotaWindowView {
+        account_wide: local_usage_attribution
+            == gateway_admin::model::provider_credentials::QuotaLocalUsageAttribution::AccountWide,
         source_account_id: upstream.as_ref().and_then(|value| value.account_id.clone()),
         amount: upstream
             .as_ref()
@@ -389,6 +396,7 @@ pub(super) fn account_usage_view(
     };
     AccountUsageView {
         window_kind: match period {
+            Some(AccountUsagePeriod::Daily) => AccountUsageWindowKind::Daily,
             Some(AccountUsagePeriod::Weekly) => AccountUsageWindowKind::Weekly,
             Some(AccountUsagePeriod::Monthly) => AccountUsageWindowKind::Monthly,
             None => AccountUsageWindowKind::Quota,
@@ -453,20 +461,14 @@ pub(super) fn account_model_usage_view(
         .costs
         .iter()
         .find(|cost| cost.currency.eq_ignore_ascii_case("USD"));
+    let success_rate = usage.health.success_rate();
     ModelUsageView {
         model: usage.model,
         request_count: usage.request_count,
         request_count_display: format_number(usage.request_count),
-        success_rate: (usage.request_count > 0)
-            .then(|| usage.success_count as f64 * 100.0 / usage.request_count as f64),
-        success_rate_display: if usage.request_count == 0 {
-            "—".to_owned()
-        } else {
-            format!(
-                "{:.1}%",
-                usage.success_count as f64 * 100.0 / usage.request_count as f64
-            )
-        },
+        success_rate,
+        success_rate_display: success_rate
+            .map_or_else(|| "—".to_owned(), |rate| format!("{rate:.1}%")),
         input_tokens: usage.input_tokens,
         input_tokens_display: display_optional_tokens(usage.input_tokens),
         output_tokens: usage.output_tokens,
@@ -493,9 +495,11 @@ pub(super) fn account_model_usage_view(
         partial_cost_count: u64::from(cost_estimate_status == "partial"),
         unknown_cost_count: usage.cost_coverage.unavailable_count,
         costs: usage.costs.iter().map(account_currency_cost_view).collect(),
-        last_used_at: time.rfc3339(&usage.last_used_at),
-        last_used_at_full_display: Some(time.datetime(&usage.last_used_at)),
-        last_used_at_display: time.relative(usage.last_used_at, now),
+        last_used_at: usage.last_used_at.map(|value| time.rfc3339(&value)),
+        last_used_at_full_display: usage.last_used_at.map(|value| time.datetime(&value)),
+        last_used_at_display: usage
+            .last_used_at
+            .map_or_else(|| "—".to_owned(), |value| time.relative(value, now)),
     }
 }
 

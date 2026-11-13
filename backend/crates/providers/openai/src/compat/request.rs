@@ -5,6 +5,7 @@ use serde_json::{Map, Value, json};
 /// 非官方客户端及跨客户端历史回填的兼容入口；调用方必须已选定 Codex/OAuth 上游
 /// 只处理已验证被拒绝的字段，不根据客户端品牌推断整份历史是否合法
 pub(super) fn normalize_non_codex_request_body(body: &mut Map<String, Value>) {
+    normalize_codex_oauth_options(body);
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
@@ -30,6 +31,46 @@ pub(super) fn normalize_non_codex_request_body(body: &mut Map<String, Value>) {
         {
             item.shift_remove("content");
         }
+    }
+}
+
+fn normalize_codex_oauth_options(body: &mut Map<String, Value>) {
+    // Codex OAuth 拒绝这些客户端选项，即使采样参数取默认值
+    for field in [
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "chat_template_kwargs",
+        "user",
+        "metadata",
+        "safety_identifier",
+    ] {
+        body.shift_remove(field);
+    }
+    // Responses 自带用量；保留官方流式推理摘要等其他选项
+    if let Some(options) = body
+        .get_mut("stream_options")
+        .and_then(Value::as_object_mut)
+    {
+        options.shift_remove("include_usage");
+    }
+    // 只省略没有实际效果的配置，不静默取消客户端要求的截断、停止条件或缓存策略
+    if body.get("truncation").and_then(Value::as_str) == Some("disabled") {
+        body.shift_remove("truncation");
+    }
+    if body
+        .get("stop_sequences")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        body.shift_remove("stop_sequences");
+    }
+    if body
+        .get("prompt_cache_options")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        body.shift_remove("prompt_cache_options");
     }
 }
 
@@ -71,15 +112,15 @@ pub(crate) fn normalize_codex_request_body(body: &mut Map<String, Value>) {
         }
     }
 
+    // Responses 上游统一忽略客户端输出上限，避免请求因上限低于模型下限被拒
+    // Codex 也不接受显式采样温度和缓存保留时长
     for field in [
-        // Pi 普通 Responses 适配将 maxTokens 映射为 max_output_tokens，
-        // temperature 则原样写入；Pi 的 Codex 适配也可能发送 temperature
         "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens",
         "temperature",
-        // Pi 开启长缓存时发送 24h；保留有效的 prompt_cache_key，
-        // 只剥离 Codex Responses 明确拒绝的缓存保留时长参数
         "prompt_cache_retention",
     ] {
-        body.remove(field);
+        body.shift_remove(field);
     }
 }
