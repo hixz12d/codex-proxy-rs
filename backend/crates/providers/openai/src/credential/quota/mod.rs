@@ -5,6 +5,7 @@
 //! - [`evidence`]：额度接口错误到凭据/额度事实的分类
 //! - [`recovery`]：各额度窗口独立的恢复基准与访问结论
 
+mod bucket_warmup;
 mod document;
 pub(crate) mod evidence;
 mod passive;
@@ -14,6 +15,8 @@ mod scheduling;
 mod service;
 pub(crate) mod snapshot;
 mod warmup;
+
+const BUCKET_USAGE_FIELD: &str = "_cpr_bucket_last_used_at";
 
 pub use reset_credits::CodexResetCreditsError;
 use reset_credits::ResetCreditLocks;
@@ -140,6 +143,8 @@ pub struct CodexWarmupSummary {
 
 #[derive(Debug, Error)]
 pub enum CodexCredentialQuotaError {
+    #[error("Codex warmup client profile is unavailable")]
+    Profile(#[source] gateway_core::error::ErrorSource),
     #[error("Codex quota response is invalid")]
     InvalidCredentialData,
     #[error("Codex OAuth access token must be refreshed before querying quota")]

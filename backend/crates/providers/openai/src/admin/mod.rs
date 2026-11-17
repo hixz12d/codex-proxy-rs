@@ -206,7 +206,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
     ) -> gateway_admin::model::accounts::ProviderAccountCapabilities {
         let oauth = authentication_kind == crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH;
         gateway_admin::model::accounts::ProviderAccountCapabilities {
-            quota_limits_supported: oauth,
+            quota_settings_supported: oauth,
             quota_credits: oauth,
             quota: oauth,
             quota_refresh: oauth,
@@ -761,7 +761,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
         Ok(project_quota(
             snapshot,
             account.quota().is_exhausted(),
-            account.quota_limits(),
+            account.quota_settings(),
         ))
     }
 
@@ -1245,7 +1245,7 @@ fn empty_quota() -> ProviderQuota {
 fn project_quota(
     snapshot: Option<CodexAccountQuotaSnapshot>,
     limit_reached: bool,
-    limits: &gateway_core::account::AccountQuotaLimits,
+    limits: &gateway_core::account::AccountQuotaSettings,
 ) -> ProviderQuota {
     let mut quota = snapshot
         .map(|s| project_quota_snapshot(s, limits))
@@ -1256,7 +1256,7 @@ fn project_quota(
 
 fn project_quota_snapshot(
     snapshot: CodexAccountQuotaSnapshot,
-    limits: &gateway_core::account::AccountQuotaLimits,
+    limits: &gateway_core::account::AccountQuotaSettings,
 ) -> ProviderQuota {
     let mut provider_data = Map::new();
     provider_data.insert(
@@ -1966,6 +1966,11 @@ fn map_quota_error(error: CodexCredentialQuotaError) -> ProviderAdminError {
     use CodexCredentialQuotaError as Error;
     use ProviderAdminErrorKind as Kind;
     let (kind, public_message, upstream_message) = match error {
+        Error::Profile(source) => {
+            return provider_admin_error(Kind::Unavailable)
+                .with_public_message("OpenAI 账号预热客户端身份不可用")
+                .with_source(source);
+        }
         Error::InvalidCredentialData => (
             Kind::Invalid,
             "OpenAI 额度查询凭据无效，请检查账号授权",
@@ -2140,6 +2145,11 @@ fn map_catalog_error(error: CodexCredentialCatalogError) -> ProviderAdminError {
             "OpenAI 模型查询失败，请检查出站连接与上游服务",
         ),
         Error::Cache => (Kind::Unavailable, "OpenAI 模型目录缓存暂不可用"),
+        Error::Profile(source) => {
+            return provider_admin_error(Kind::Unavailable)
+                .with_public_message("OpenAI 模型目录客户端身份不可用")
+                .with_source(source);
+        }
     };
     provider_admin_error(kind).with_public_message(message)
 }

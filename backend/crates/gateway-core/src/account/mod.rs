@@ -13,22 +13,28 @@ pub use model_access::{
     AccountModelAccess, AccountModelAccessMode, InvalidAccountModelAccess,
     MAX_ACCOUNT_ACCESS_MODELS,
 };
-mod quota_limits;
-pub use quota_limits::{AccountQuotaLimits, QuotaMergeBase, QuotaPauseDecision};
+mod quota_settings;
+pub use quota_settings::{
+    AccountQuotaSettings, QuotaBucketSettings, QuotaBucketWarmup, QuotaMergeBase,
+    QuotaPauseDecision,
+};
 mod proxy;
 pub use proxy::{InvalidOutboundProxy, OutboundProxy};
+mod scheduling;
 pub mod scope;
 mod selection;
-mod smart_scheduling;
 mod store;
 mod upstream;
 
 pub use error::CredentialError;
 pub use model::*;
+pub use scheduling::{
+    QuotaResetPeriod, ResetWindowWeights, SchedulingConfigError, SmartSchedulingConfig,
+};
 pub(crate) use selection::smart_score;
 pub use selection::*;
-pub use smart_scheduling::{QuotaResetPeriod, SmartSchedulingConfig, SmartSchedulingConfigError};
 pub use store::{
-    AccountCatalogObservation, AccountCatalogOmissions, ProviderAccountStore, StoredAccountCatalog,
+    AccountCatalogObservation, AccountCatalogOmissions, ProviderAccountStore, QuotaWarmupState,
+    QuotaWarmupStateUpdate, StoredAccountCatalog,
 };
 pub use upstream::*;
