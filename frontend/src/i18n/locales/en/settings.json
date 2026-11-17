@@ -172,6 +172,8 @@
         "latencyHelp": "Higher values favor accounts with faster first useful output",
         "reset": "Quota reset weight",
         "resetHelp": "Higher values favor accounts whose quota resets soon, unknown or past reset times receive no bonus",
+        "age": "Older account priority",
+        "ageHelp": "Higher values send new sessions to accounts added earlier: the oldest gets the full bonus, the next gets half, and each later one half again, only the first account pick of a new session is affected, load and other weights still apply, 0 turns it off",
         "queue": "Queue weight",
         "queueHelp": "When queuing is needed, higher values favor accounts with fewer waiting requests, set to 0 to use the shortest queue"
       },

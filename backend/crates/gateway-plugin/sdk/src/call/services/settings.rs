@@ -260,6 +260,8 @@ pub struct SmartSchedulingConfig {
     pub queue_weight: f64,
     #[serde(default)]
     pub reset_window_weights: ResetWindowWeights,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_weight: Option<f64>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

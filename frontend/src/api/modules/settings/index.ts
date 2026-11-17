@@ -37,6 +37,8 @@ export interface SmartSchedulingConfig {
   resetWeight: number
   queueWeight: number
   resetWindowWeights: ResetWindowWeights
+  /** 老账号优先，为 0 时服务端不返回 */
+  ageWeight?: number
 }
 
 export interface RuntimeSettings {

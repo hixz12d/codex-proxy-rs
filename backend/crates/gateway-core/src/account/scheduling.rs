@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct SmartSchedulingConfig {
     weights: [u8; 6],
     reset_windows: ResetWindowWeights,
+    // 老账号优先系数单独保存，保持原有六项的顺序与接口不变
+    age: u8,
 }
 
 /// 账号通用额度的周期；Provider 按上游周期事实投影，不依赖窗口名称和槽位
@@ -53,6 +55,7 @@ impl Default for SmartSchedulingConfig {
         Self {
             weights: [10, 8, 10, 5, 0, 0],
             reset_windows: ResetWindowWeights::default(),
+            age: 0,
         }
     }
 }
@@ -68,6 +71,14 @@ pub enum SchedulingConfigError {
 impl SmartSchedulingConfig {
     /// 顺序为负载、剩余额度、健康、首输出延迟、额度重置和排队压力
     pub fn new(weights: [f64; 6]) -> Result<Self, SchedulingConfigError> {
+        Self::with_age_weight(weights, 0.0)
+    }
+
+    /// 在六项系数之外附带老账号优先系数，0 表示关闭
+    pub fn with_age_weight(
+        weights: [f64; 6],
+        age_weight: f64,
+    ) -> Result<Self, SchedulingConfigError> {
         let mut tenths = [0; 6];
         for (index, field) in [
             "loadWeight",
@@ -82,11 +93,13 @@ impl SmartSchedulingConfig {
         {
             tenths[index] = weight_tenths(weights[index], field)?;
         }
-        if tenths == [0; 6] {
+        let age = weight_tenths(age_weight, "ageWeight")?;
+        if tenths == [0; 6] && age == 0 {
             return Err(SchedulingConfigError::EmptyWeights);
         }
         Ok(Self {
             weights: tenths,
+            age,
             ..Self::default()
         })
     }
@@ -94,6 +107,12 @@ impl SmartSchedulingConfig {
     #[must_use]
     pub fn weights(self) -> [f64; 6] {
         self.weights.map(|weight| f64::from(weight) / 10.0)
+    }
+
+    /// 老账号优先系数；只作用于智能策略下新会话的首轮选号
+    #[must_use]
+    pub fn age_weight(self) -> f64 {
+        f64::from(self.age) / 10.0
     }
 
     fn reset_enabled(self) -> bool {
@@ -110,13 +129,15 @@ impl SmartSchedulingConfig {
     pub(crate) fn score_tolerance(self) -> f64 {
         // 与系数同步缩放，避免仅放大相同比例的系数就改变近似最优候选集合
         // 排队和未启用的重置窗口不能放大立即选号的容差
+        // 老账号加分参与立即选号，同样计入；为 0 时与不计入完全相同
         let count = if self.reset_enabled() { 5 } else { 4 };
         0.05 * f64::from(
             self.weights[..count]
                 .iter()
                 .copied()
                 .map(u16::from)
-                .sum::<u16>(),
+                .sum::<u16>()
+                + u16::from(self.age),
         ) / 33.0
     }
 }
@@ -132,6 +153,9 @@ struct SmartSchedulingValues {
     queue_weight: f64,
     #[serde(default)]
     reset_window_weights: ResetWindowWeights,
+    // 缺省按 0 读取，为 0 时不输出，关闭时存储与接口 JSON 保持原有字段集合
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    age_weight: Option<f64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -146,14 +170,17 @@ impl TryFrom<SmartSchedulingValues> for SmartSchedulingConfig {
     type Error = SchedulingConfigError;
 
     fn try_from(value: SmartSchedulingValues) -> Result<Self, Self::Error> {
-        let mut config = Self::new([
-            value.load_weight,
-            value.quota_weight,
-            value.health_weight,
-            value.latency_weight,
-            value.reset_weight,
-            value.queue_weight,
-        ])?;
+        let mut config = Self::with_age_weight(
+            [
+                value.load_weight,
+                value.quota_weight,
+                value.health_weight,
+                value.latency_weight,
+                value.reset_weight,
+                value.queue_weight,
+            ],
+            value.age_weight.unwrap_or_default(),
+        )?;
         config.reset_windows = value.reset_window_weights;
         Ok(config)
     }
@@ -177,6 +204,7 @@ impl From<SmartSchedulingConfig> for SmartSchedulingValues {
             reset_weight,
             queue_weight,
             reset_window_weights: value.reset_windows,
+            age_weight: (value.age > 0).then(|| value.age_weight()),
         }
     }
 }

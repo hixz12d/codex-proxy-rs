@@ -60,6 +60,11 @@ const groups = computed<WeightGroup[]>(() => [
         label: t('settings.scheduling.weights.reset'),
         help: t('settings.scheduling.weights.resetHelp'),
       },
+      {
+        key: 'ageWeight',
+        label: t('settings.scheduling.weights.age'),
+        help: t('settings.scheduling.weights.ageHelp'),
+      },
     ],
   },
   {
@@ -83,6 +88,7 @@ const draft = reactive({
   latencyWeight: '',
   resetWeight: '',
   queueWeight: '',
+  ageWeight: '',
 })
 const submitted = shallowRef(false)
 const errors = computed(() => Object.fromEntries(fields.value.map(({ key }) => {
@@ -98,7 +104,7 @@ const emptyWeights = computed(() => fields.value.every(({ key }) => Number(draft
 
 function replaceDraft(config: SmartSchedulingConfig) {
   for (const { key } of fields.value)
-    draft[key] = String(config[key])
+    draft[key] = String(config[key] ?? 0)
   for (const key of Object.keys(windows.value) as (keyof typeof windows.value)[])
     windows.value[key] = String(config.resetWindowWeights[key])
   submitted.value = false
@@ -113,7 +119,7 @@ function confirm() {
   submitted.value = true
   if (Object.values(errors.value).some(Boolean) || emptyWeights.value || !Object.values(windows.value).every(validWeight))
     return
-  emit('confirm', {
+  const config: SmartSchedulingConfig = {
     resetWindowWeights: {
       fiveHour: Number(windows.value.fiveHour),
       weekly: Number(windows.value.weekly),
@@ -125,7 +131,12 @@ function confirm() {
     latencyWeight: Number(draft.latencyWeight),
     resetWeight: Number(draft.resetWeight),
     queueWeight: Number(draft.queueWeight),
-  })
+  }
+  // 与服务端一致，为 0 时省略，避免与未设置该项的配置比较时误判为已修改
+  const ageWeight = Number(draft.ageWeight)
+  if (ageWeight > 0)
+    config.ageWeight = ageWeight
+  emit('confirm', config)
   open.value = false
 }
 </script>

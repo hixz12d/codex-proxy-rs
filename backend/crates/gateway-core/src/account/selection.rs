@@ -927,10 +927,21 @@ impl AccountSelector {
             return waiting.wait(keys).await;
         }
         // 账号信号在队列锁外评分，锁内只读取实时队长并查表，避免扫描候选阻塞其他等待者
-        let scores = candidates
+        let mut scores = candidates
             .iter()
             .map(|candidate| (candidate.account.id(), smart_score(candidate, context)))
             .collect::<HashMap<_, _>>();
+        let age_weight = config.age_weight();
+        if age_weight > 0.0 {
+            // 与立即选号一致，只在可排队的候选内按加入顺序排名
+            let mut ranked = keys.iter().collect::<Vec<_>>();
+            ranked.sort_unstable();
+            for (key, bonus) in ranked.into_iter().zip(age_bonuses(age_weight)) {
+                if let Some(score) = scores.get_mut(key) {
+                    *score += bonus;
+                }
+            }
+        }
         waiting
             .wait_with_priority(keys, |key, count| {
                 scores[key] + queue_weight / (1.0 + count as f64)
@@ -996,6 +1007,13 @@ fn select_smart_candidate<'a>(
         .iter()
         .map(|candidate| (*candidate, smart_score(candidate, context)))
         .collect::<Vec<_>>();
+    let age_weight = context.policy.smart_scheduling().age_weight();
+    if age_weight > 0.0 {
+        ranked.sort_unstable_by(|(left, _), (right, _)| left.account.id().cmp(right.account.id()));
+        for ((_, score), bonus) in ranked.iter_mut().zip(age_bonuses(age_weight)) {
+            *score += bonus;
+        }
+    }
     let best_score = ranked
         .iter()
         .map(|(_, score)| *score)
@@ -1007,6 +1025,14 @@ fn select_smart_candidate<'a>(
     ranked.sort_unstable_by(|(left, _), (right, _)| left.account.id().cmp(right.account.id()));
     let index = (context.round_robin_cursor % ranked.len() as u64) as usize;
     Some(ranked[index].0)
+}
+
+/// 按账号 ID 升序排名后的老账号加分：第 i 名加 `age_weight × 0.5^i`
+///
+/// 账号 ID 为 UUID v7，升序即加入顺序；用户按加入顺序消耗账号
+/// 只在本次候选内排名，最老的号满载或被排除时第二老的自动拿满分
+fn age_bonuses(age_weight: f64) -> impl Iterator<Item = f64> {
+    std::iter::successors(Some(age_weight), |bonus| Some(bonus * 0.5))
 }
 
 pub(crate) fn smart_score(candidate: &AccountCandidate, context: &AccountSelectionContext) -> f64 {
