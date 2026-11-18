@@ -841,6 +841,14 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 )
             })?;
         let request_id = context.request_id().as_str().to_owned();
+        let turn_state_owner = TurnStateOwnerRecorder {
+            selector: Arc::clone(&selector),
+            account_id: lease.account_id().clone(),
+            ttl: context
+                .account_selection_policy()
+                .openai_session_affinity_ttl(),
+            request_id: request_id.clone(),
+        };
         let cancellation = context.cancellation().clone();
         let account_selection = CodexAccountSelectionTelemetry::new(
             lease.affinity_hit(),
@@ -939,6 +947,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 OpenAiContinuationScope::ReplayRequired
             });
             capture.turn_state = response.turn_state.clone().or(capture.turn_state.clone());
+        }
+        if let Some(turn_state) = response.turn_state.as_deref() {
+            turn_state_owner.record(turn_state);
         }
         let mut observation_state = OpenAiResponseObservationState::from_backend_response(
             &response,
@@ -1072,6 +1083,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         response_metadata_updates.as_ref(),
                         &mut session_capture,
                         &mut observation_state,
+                        &turn_state_owner,
                     )
                     .await;
                     let observation_event = if rate_limits_changed || metadata_merge.is_some()
@@ -1150,6 +1162,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 response_metadata_updates.as_ref(),
                 &mut session_capture,
                 &mut observation_state,
+                &turn_state_owner,
             )
             .await;
             let metadata_changed = metadata_merge.unwrap_or(false);
@@ -1356,6 +1369,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             response_metadata_updates.as_ref(),
             &mut session_capture,
             &mut observation_state,
+            &turn_state_owner,
         )
         .await
         .unwrap_or(false);
@@ -1415,12 +1429,49 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     })
 }
 
+/// 记录上游 turn-state 的签发账号，发往其他账号前据此拦截
+/// 写入在后台完成，失败只影响后续拦截精度，不阻塞也不中断响应流
+struct TurnStateOwnerRecorder {
+    selector: Arc<CodexCredentialSelector>,
+    account_id: gateway_core::account::ProviderAccountId,
+    ttl: Duration,
+    request_id: String,
+}
+
+impl TurnStateOwnerRecorder {
+    fn record(&self, turn_state: &str) {
+        if turn_state.is_empty() {
+            return;
+        }
+        let selector = Arc::clone(&self.selector);
+        let account_id = self.account_id.clone();
+        let ttl = self.ttl;
+        let request_id = self.request_id.clone();
+        let turn_state = turn_state.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = selector
+                .record_turn_state_owner(&turn_state, &account_id, ttl)
+                .await
+            {
+                tracing::warn!(
+                    request_id = %request_id,
+                    account_id = %account_id,
+                    error = %error,
+                    "OpenAI turn state owner record failed"
+                );
+            }
+        });
+    }
+}
+
 async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
+    turn_state_owner: &TurnStateOwnerRecorder,
 ) -> Option<bool> {
     let turn_state = updates?.lock().await.turn_state.take()?;
+    turn_state_owner.record(&turn_state);
     if let Some(capture) = session_capture.as_mut() {
         capture.turn_state = Some(turn_state.clone());
     }

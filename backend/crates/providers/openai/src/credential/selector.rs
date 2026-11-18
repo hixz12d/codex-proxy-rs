@@ -32,7 +32,10 @@ use secrecy::ExposeSecret;
 use thiserror::Error;
 use url::Url;
 
-use super::affinity::{CodexSessionAffinity, bound_history_marker_alias, bound_history_marker_key};
+use super::affinity::{
+    CodexSessionAffinity, bound_history_marker_alias, bound_history_marker_key,
+    turn_state_owner_alias, turn_state_owner_key,
+};
 use super::catalog::CodexCredentialCatalogService;
 use super::codec::CodexRuntimeAuthentication;
 use super::cookie::CodexCookiePolicy;
@@ -1881,6 +1884,52 @@ impl CodexCredentialSelector {
         .map_err(binding_store_error)?
         .map(|alias| alias.map(|alias| alias.session_key.expose_to_store().to_owned()))
         .map_err(binding_store_error)
+    }
+
+    /// 记下上游下发的 turn-state 由哪个账号签发，同一令牌重复写入即续期
+    pub(crate) async fn record_turn_state_owner(
+        &self,
+        turn_state: &str,
+        account: &ProviderAccountId,
+        ttl: Duration,
+    ) -> Result<(), CredentialSelectionError> {
+        let (Some(key), Some(alias)) = (
+            turn_state_owner_key(turn_state),
+            turn_state_owner_alias(account.as_str()),
+        ) else {
+            return Ok(());
+        };
+        tokio::time::timeout(
+            SESSION_AFFINITY_TIMEOUT,
+            self.session_affinity
+                .bind_alias(&self.provider_kind, &key, &alias, ttl),
+        )
+        .await
+        .map_err(binding_store_error)?
+        .map_err(binding_store_error)?;
+        Ok(())
+    }
+
+    /// 令牌是否由该账号签发；`None` 表示没有签发记录
+    pub(crate) async fn turn_state_owned_by(
+        &self,
+        turn_state: &str,
+        account: &ProviderAccountId,
+    ) -> Result<Option<bool>, CredentialSelectionError> {
+        let (Some(key), Some(expected)) = (
+            turn_state_owner_key(turn_state),
+            turn_state_owner_alias(account.as_str()),
+        ) else {
+            return Ok(None);
+        };
+        let owner = tokio::time::timeout(
+            SESSION_AFFINITY_TIMEOUT,
+            self.session_affinity.load_alias(&self.provider_kind, &key),
+        )
+        .await
+        .map_err(binding_store_error)?
+        .map_err(binding_store_error)?;
+        Ok(owner.map(|owner| owner.session_key == expected.session_key))
     }
 
     /// 首次写入或同一分界点续期；同一会话再次迁入该账号且分界点不同时返回 false

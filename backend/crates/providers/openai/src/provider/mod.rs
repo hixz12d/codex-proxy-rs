@@ -223,6 +223,56 @@ struct SelectedGenerate {
 }
 
 impl CodexProvider {
+    /// 客户端在同一轮内回放的 turn-state 可能来自迁移前的账号，发给当前账号前按签发记录拦截
+    /// 签发未知时只在会话已迁移时拦截；查询失败也拦截，只损失路由粘性，不让请求失败
+    async fn isolate_foreign_turn_state(
+        &self,
+        request: &mut CodexResponsesRequest,
+        lease: &CodexCredentialLease,
+        installation_id: &str,
+        context: &AttemptContext,
+    ) {
+        let Some(turn_state) = request
+            .turn_state
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let reason = match self
+            .selector
+            .turn_state_owned_by(turn_state, lease.account_id())
+            .await
+        {
+            Ok(Some(true)) => return,
+            Ok(Some(false)) => "other_account",
+            Ok(None) if lease.strip_bound_history_through().is_some() => "unknown_migrated",
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    request_id = %context.request_id(),
+                    account_id = %lease.account_id(),
+                    error = %error,
+                    "OpenAI turn state owner lookup failed"
+                );
+                "lookup_failed"
+            }
+        };
+        let turn_id_scoped =
+            crate::transport::request::isolate_foreign_turn(request, installation_id);
+        tracing::info!(
+            request_id = %context.request_id(),
+            account_id = %lease.account_id(),
+            reason,
+            turn_id_scoped,
+            "OpenAI foreign turn state dropped for account"
+        );
+        context.trace().record(
+            "provider.request.foreign_turn_state",
+            serde_json::json!({"reason": reason, "turnIdScoped": turn_id_scoped}),
+        );
+    }
+
     fn prepare_generate_request(
         &self,
         generate: &GenerateRequest,
@@ -1033,6 +1083,8 @@ impl CodexProvider {
             lease.installation_id(),
         );
         scope_request_to_account(&mut upstream_request, &installation_id, account_scope);
+        self.isolate_foreign_turn_state(&mut upstream_request, &lease, &installation_id, &context)
+            .await;
         // 会话从其他账号迁入：旧账号的加密推理不能发给新账号，按分界点剥离后只保留明文历史
         if let Some(through) = lease.strip_bound_history_through() {
             let stripped = crate::credential::strip_bound_history_through(

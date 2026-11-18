@@ -481,14 +481,7 @@ pub(crate) fn scope_request_to_account(
     // 全量请求缺少续接归属并不表示换号，客户端回传的轮次 token 不依赖本地缓存
     if account_scope == RequestAccountScope::Different {
         clear_request_turn_state(request);
-        // 明确换号时同步清理各 wire 副本，避免把原账号的追踪与合规上下文带给新账号
-        for name in CROSS_ACCOUNT_CLIENT_HEADERS {
-            request.passthrough_headers.remove(*name);
-        }
-        clear_cross_account_client_metadata(request.body_mut());
-        if let Some(raw) = &mut request.turn_metadata {
-            clear_cross_account_turn_metadata(raw);
-        }
+        clear_cross_account_client_context(request);
     }
     let reset_account_state = !account_scope.can_reuse_account_state();
     let turn_metadata = request
@@ -584,6 +577,83 @@ pub(crate) fn scope_request_to_account(
     request.set_client_metadata(scoped);
 
     request.turn_metadata = turn_metadata;
+}
+
+/// 换号时同步清理各 wire 副本，避免把原账号的追踪与合规上下文带给新账号
+fn clear_cross_account_client_context(request: &mut CodexResponsesRequest) {
+    for name in CROSS_ACCOUNT_CLIENT_HEADERS {
+        request.passthrough_headers.remove(*name);
+    }
+    clear_cross_account_client_metadata(request.body_mut());
+    if let Some(raw) = &mut request.turn_metadata {
+        clear_cross_account_turn_metadata(raw);
+    }
+}
+
+/// 请求携带其他账号签发的 turn-state 时收敛到当前账号
+///
+/// 客户端在同一轮内持续回放首个响应下发的令牌，会话迁到新账号后令牌仍属于原账号；
+/// 令牌和原轮次编号会让上游把两个账号关联起来，因此删除令牌与追踪上下文，
+/// 并把出站副本中的 `turn_id` 按当前安装身份派生；`client_turn_id` 仍保留原值供本地判断同一轮次
+/// 返回是否改写了 `turn_id`
+pub(crate) fn isolate_foreign_turn(
+    request: &mut CodexResponsesRequest,
+    installation_id: &str,
+) -> bool {
+    clear_request_turn_state(request);
+    clear_cross_account_client_context(request);
+    let mut scoped = scope_turn_id_field(request.body_mut(), installation_id);
+    if let Some(Value::Object(metadata)) = request.body_mut().get_mut("client_metadata") {
+        scoped |= scope_turn_id_field(metadata, installation_id);
+        for key in TURN_METADATA_KEYS {
+            if let Some(Value::String(raw)) = metadata.get_mut(*key) {
+                scoped |= scope_turn_id_in_metadata(raw, installation_id);
+            }
+        }
+    }
+    for key in TURN_METADATA_KEYS {
+        if let Some(Value::String(raw)) = request.body_mut().get_mut(*key) {
+            scoped |= scope_turn_id_in_metadata(raw, installation_id);
+        }
+    }
+    if let Some(raw) = &mut request.turn_metadata {
+        scoped |= scope_turn_id_in_metadata(raw, installation_id);
+    }
+    for (name, value) in &mut request.passthrough_headers {
+        if name == "x-codex-turn-metadata"
+            && let Ok(raw) = value.to_str()
+        {
+            let mut raw = raw.to_owned();
+            if scope_turn_id_in_metadata(&mut raw, installation_id)
+                && let Ok(scoped_value) = HeaderValue::from_str(&raw)
+            {
+                *value = scoped_value;
+                scoped = true;
+            }
+        }
+    }
+    scoped
+}
+
+fn scope_turn_id_field(object: &mut Map<String, Value>, installation_id: &str) -> bool {
+    match object.get_mut(TURN_ID_CLIENT_METADATA_KEY) {
+        Some(Value::String(turn_id)) if !turn_id.is_empty() => {
+            *turn_id = super::correlation::scoped_id(installation_id, turn_id);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn scope_turn_id_in_metadata(raw: &mut String, installation_id: &str) -> bool {
+    if let Ok(Value::Object(mut metadata)) = serde_json::from_str(raw)
+        && scope_turn_id_field(&mut metadata, installation_id)
+        && let Some(encoded) = serialize_ascii_turn_metadata(&Value::Object(metadata))
+    {
+        *raw = encoded;
+        return true;
+    }
+    false
 }
 
 fn clear_cross_account_client_metadata(metadata: &mut Map<String, Value>) -> bool {

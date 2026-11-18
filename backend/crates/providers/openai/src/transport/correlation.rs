@@ -32,7 +32,7 @@ const ID_HEADERS: &[&str] = &[
     "x-client-request-id",
 ];
 
-fn scoped_id(installation_id: &str, original: &str) -> String {
+pub(crate) fn scoped_id(installation_id: &str, original: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"codex-account-correlation-v1\0");
     digest.update(installation_id.as_bytes());

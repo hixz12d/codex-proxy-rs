@@ -275,6 +275,20 @@ pub(crate) fn bound_history_marker_alias(tail: &str) -> Option<ProviderSessionAl
     })
 }
 
+/// turn-state 签发账号的存放键：只存令牌哈希，不落令牌原文
+pub(crate) fn turn_state_owner_key(turn_state: &str) -> Option<ProviderSessionAffinityKey> {
+    opaque_affinity_key("turn-state-owner", turn_state)
+}
+
+/// 签发账号以哈希形式作为别名目标，满足亲和键字符约束且只用于相等比较
+pub(crate) fn turn_state_owner_alias(account_id: &str) -> Option<ProviderSessionAlias> {
+    Some(ProviderSessionAlias {
+        session_key: opaque_affinity_key("turn-state-account", account_id)?,
+        root_session_key: None,
+        follow_only: false,
+    })
+}
+
 /// 只有上游账号生成的不透明内容会把历史绑在主账号上：加密推理、压缩项、服务端条目引用，
 /// 以及消息里的加密片段。助手文本、工具调用及其结果换号重放不会关联账号，
 /// Chat Completions 等转换来的历史只有这类明文条目，不算
