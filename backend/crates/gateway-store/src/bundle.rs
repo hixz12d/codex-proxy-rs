@@ -232,7 +232,8 @@ async fn connect(
         plugins.clone(),
         plugins,
         usage_data,
-    );
+    )
+    .with_iq_probe(Arc::new(postgres::PgIqProbeStore { pool: pool.clone() }));
 
     let execution_repository = Arc::new(postgres::PgExecutionStore::new(pool.clone()));
     let (execution, execution_writer) =

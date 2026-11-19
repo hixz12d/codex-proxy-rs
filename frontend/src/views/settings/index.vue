@@ -13,6 +13,7 @@ import SettingsBackupSection from './components/backup/SettingsBackupSection.vue
 import ClientProfileCard from './components/ClientProfileCard.vue'
 import ConcurrencyPolicyCard from './components/ConcurrencyPolicyCard.vue'
 import AccountErrorProtectionCard from './components/error-protection/AccountErrorProtectionCard.vue'
+import IqProbeCard from './components/IqProbeCard.vue'
 import ModelAliasesCard from './components/ModelAliasesCard.vue'
 import PrivacyPolicyCard from './components/privacy/PrivacyPolicyCard.vue'
 import RequestHistoryCard from './components/RequestHistoryCard.vue'
@@ -136,7 +137,8 @@ function resetForm() {
   formRef.value?.clearValidate()
 }
 const backupSection = useTemplateRef<InstanceType<typeof SettingsBackupSection>>('backupSection')
-const hasUnsavedChanges = computed(() => hasChanges.value || !!backupSection.value?.hasChanges)
+const iqProbeCard = useTemplateRef<InstanceType<typeof IqProbeCard>>('iqProbeCard')
+const hasUnsavedChanges = computed(() => hasChanges.value || !!backupSection.value?.hasChanges || !!iqProbeCard.value?.hasChanges)
 const { showLeaveConfirm, confirmLeave } = useSettingsLeaveGuard(hasUnsavedChanges)
 
 watch(() => !loading.value && route.hash === '#reset-credits', async (ready) => {
@@ -226,6 +228,8 @@ watch(section, (value) => {
             v-model:cron="form.accountWarmupCron"
             v-model:model="form.accountWarmupModel"
           />
+          <!-- 降智检测独立读写，不进入设置页统一表单 -->
+          <IqProbeCard ref="iqProbeCard" :disabled="disabled" />
           <ResetCreditCard
             v-model="resetCreditLeadMinutesValue"
             v-model:on-low-weekly-quota="form.resetCreditOnLowWeeklyQuota"

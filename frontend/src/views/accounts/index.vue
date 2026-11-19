@@ -13,6 +13,8 @@ import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import AccountCreateModal from './components/account-create-modal/index.vue'
 import AccountImportTasks from './components/account-import-tasks/index.vue'
+import AccountIqProbeCell from './components/account-iq-probe-cell/index.vue'
+import { useIqProbeRounds } from './components/account-iq-probe-cell/useIqProbeRounds'
 import AccountQuotaPanel from './components/account-quota-panel/index.vue'
 import AccountQuotaSummaryCell from './components/account-quota-summary-cell/index.vue'
 import AccountStatusBadge from './components/account-status-badge/index.vue'
@@ -64,6 +66,8 @@ const {
   handlePageSizeChange,
   handleSortChange,
 } = useAccountsQuery()
+
+const { roundsByAccount: iqProbeRounds } = useIqProbeRounds(accounts)
 
 const {
   groups,
@@ -352,6 +356,12 @@ const {
                 :next-refresh-at="row.nextRefreshAt"
                 :next-refresh-at-display="row.nextRefreshAtDisplay"
               />
+            </template>
+
+            <template #iqProbe="{ row }">
+              <div class="flex w-full justify-center">
+                <AccountIqProbeCell :rounds="iqProbeRounds?.get(row.id) ?? null" />
+              </div>
             </template>
 
             <template #planType="{ row }">

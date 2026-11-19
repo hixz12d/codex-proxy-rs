@@ -53,6 +53,14 @@ export const accountColumns = computed(() => (defineTableColumns<Account>([
     sortable: true,
   },
   {
+    key: 'iqProbe',
+    label: t('accounts.fields.iqProbe'),
+    kind: 'custom',
+    // 24 格方块约 190px，留出单元格内边距
+    size: '2xl',
+    align: 'center',
+  },
+  {
     key: 'planType',
     label: t('accounts.profile.subscription.label'),
     kind: 'status',

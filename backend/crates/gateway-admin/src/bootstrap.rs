@@ -7,7 +7,7 @@ use gateway_core::{engine::probe::AccountProbe, runtime::SnapshotControl};
 use crate::{
     AccountsService, AdminBundle, AdminConfig, AdminRuntimePorts, AdminServices, ClientConfig,
     ClientKeyService, CredentialsService, PluginDistributionPorts, PluginManagementService,
-    PluginsService, SettingsService, UsageDataService, backup, freeze_recovery,
+    PluginsService, SettingsService, UsageDataService, backup, freeze_recovery, iq_probe,
     model::AdminError,
     ports::{
         self, plugin_accounts::PluginAccountAccess, plugin_client_keys::PluginClientKeyAccess,
@@ -224,6 +224,7 @@ async fn initialize_inner(
         _plugin_accounts: plugin_accounts,
         import_tasks,
         backups,
+        iq_probe: Arc::new(iq_probe::DefaultIqProbeService::new(store.iq_probe())),
     };
     let freeze_recovery =
         freeze_recovery::FreezeRecoveryTask::new(freeze_recovery::FreezeRecoveryDeps {
@@ -232,7 +233,15 @@ async fn initialize_inner(
             runtime: store.account_runtime(),
             settings: store.settings(),
         });
-    let worker_contributions = vec![
+    let iq_probe_task = store.iq_probe().map(|probes| {
+        iq_probe::worker::IqProbeTask::new(iq_probe::worker::IqProbeWorkerDeps {
+            accounts: Arc::clone(&accounts),
+            store: store.accounts(),
+            runtime: store.account_runtime(),
+            probes,
+        })
+    });
+    let mut worker_contributions = vec![
         backup_task.into_worker()?,
         import_task.into_worker()?,
         freeze_recovery.into_worker()?,
@@ -243,6 +252,10 @@ async fn initialize_inner(
         }
         .into_worker()?,
     ];
+    // 生产 Store Bundle 总会挂载降智检测存储；未挂载的测试组装不注册该任务
+    if let Some(task) = iq_probe_task {
+        worker_contributions.push(task.into_worker()?);
+    }
     Ok(AdminBundle {
         services,
         worker_contributions,

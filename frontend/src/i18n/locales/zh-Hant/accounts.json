@@ -625,7 +625,41 @@
       "credentialsHaveExpired": "憑據已過期",
       "invalidCredentials": "憑據無效",
       "accountUnavailable": "賬號不可用或已被封禁",
-      "count": "賬號數"
+      "count": "賬號數",
+      "iqProbe": "智商"
+    },
+    "iqProbe": {
+      "empty": "暫無降智檢測結果",
+      "recentRounds": "最近 {count} 輪降智檢測",
+      "roundLabel": "{time} {kind}，{outcome}，處理：{action}",
+      "detailTitle": "降智檢測詳情",
+      "kind": "類型",
+      "action": "處理",
+      "questionIndex": "第 {index} 題",
+      "attemptIndex": "第 {index} 次",
+      "noQuestions": "沒有題目記錄",
+      "noAnswer": "沒有回答",
+      "kinds": {
+        "scheduled": "定時",
+        "recheck": "復測"
+      },
+      "outcomes": {
+        "passed": "通過",
+        "passedAfterRetry": "追問後通過",
+        "failed": "不及格",
+        "error": "沒測成"
+      },
+      "actions": {
+        "none": "無",
+        "disabled": "已停用",
+        "breakerHeld": "熔斷未停"
+      },
+      "attemptVerdicts": {
+        "pass": "算對",
+        "fail": "算錯",
+        "unclear": "沒答清",
+        "error": "出錯"
+      }
     },
     "page": {
       "description": "維護賬號池，查看可用性、配額與使用狀態",

@@ -59,14 +59,18 @@ pub async fn connect_and_migrate(
             }
         }
     };
-    migration_pool.close().await;
     if let Err(error) = result {
+        migration_pool.close().await;
         tracing::error!(target: "gateway_startup", elapsed_seconds = started.elapsed().as_secs_f64(),
             "数据库迁移失败");
         return Err(postgres_unavailable("apply PostgreSQL migrations", error));
     }
     tracing::info!(target: "gateway_startup", elapsed_seconds = started.elapsed().as_secs_f64(),
         "数据库迁移检查完成");
+    // fork 自有表不进 migrations/，避免与原版迁移编号冲突；回滚旧镜像时旧版忽略这些表
+    let fork_schema = super::iq_probe::ensure_fork_iq_probe_schema(&migration_pool).await;
+    migration_pool.close().await;
+    fork_schema?;
 
     connect_pool(connect_options, pool_config, false).await
 }

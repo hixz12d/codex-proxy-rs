@@ -21,6 +21,8 @@ const EXCLUDED_DATA: &[&str] = &[
     "request_analytics_pending_requests",
     "request_analytics_pending_buckets",
     "request_analytics_build_state",
+    // fork 降智检测结果是可丢弃的观测数据
+    "fork_iq_probe_rounds",
 ];
 
 pub(super) struct BusinessSnapshot {

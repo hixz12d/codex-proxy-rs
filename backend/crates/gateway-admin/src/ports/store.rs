@@ -640,12 +640,27 @@ pub struct AdminStorePorts {
     plugin_state: Arc<dyn super::plugins::PluginStateStore>,
     plugin_resources: Arc<dyn super::plugin_resources::PluginResourceStore>,
     usage_data: Arc<dyn super::usage_data::UsageDataStore>,
+    // fork 降智检测；单独挂载以免改动 new() 的参数与已有测试
+    iq_probe: Option<Arc<dyn super::iq_probe::IqProbeStore>>,
 }
 
 impl AdminStorePorts {
     #[must_use]
     pub fn usage_data(&self) -> Arc<dyn super::usage_data::UsageDataStore> {
         self.usage_data.clone()
+    }
+
+    /// 挂载降智检测存储；生产 Store Bundle 总会挂载
+    #[must_use]
+    pub fn with_iq_probe(mut self, store: Arc<dyn super::iq_probe::IqProbeStore>) -> Self {
+        self.iq_probe = Some(store);
+        self
+    }
+
+    /// 未挂载时降智检测服务返回不可用，后台任务不注册
+    #[must_use]
+    pub fn iq_probe(&self) -> Option<Arc<dyn super::iq_probe::IqProbeStore>> {
+        self.iq_probe.clone()
     }
 
     #[must_use]
@@ -691,6 +706,7 @@ impl AdminStorePorts {
             plugin_state,
             plugin_resources,
             usage_data,
+            iq_probe: None,
         }
     }
 

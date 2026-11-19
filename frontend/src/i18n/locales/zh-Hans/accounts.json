@@ -625,7 +625,41 @@
       "credentialsHaveExpired": "凭据已过期",
       "invalidCredentials": "凭据无效",
       "accountUnavailable": "账号不可用或已被封禁",
-      "count": "账号数"
+      "count": "账号数",
+      "iqProbe": "智商"
+    },
+    "iqProbe": {
+      "empty": "暂无降智检测结果",
+      "recentRounds": "最近 {count} 轮降智检测",
+      "roundLabel": "{time} {kind}，{outcome}，处理：{action}",
+      "detailTitle": "降智检测详情",
+      "kind": "类型",
+      "action": "处理",
+      "questionIndex": "第 {index} 题",
+      "attemptIndex": "第 {index} 次",
+      "noQuestions": "没有题目记录",
+      "noAnswer": "没有回答",
+      "kinds": {
+        "scheduled": "定时",
+        "recheck": "复测"
+      },
+      "outcomes": {
+        "passed": "通过",
+        "passedAfterRetry": "追问后通过",
+        "failed": "不及格",
+        "error": "没测成"
+      },
+      "actions": {
+        "none": "无",
+        "disabled": "已停用",
+        "breakerHeld": "熔断未停"
+      },
+      "attemptVerdicts": {
+        "pass": "算对",
+        "fail": "算错",
+        "unclear": "没答清",
+        "error": "出错"
+      }
     },
     "page": {
       "description": "维护账号池，查看可用性、配额与使用状态",

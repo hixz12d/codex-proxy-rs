@@ -2638,6 +2638,56 @@ HTTP 拒绝使用原始上游状态码；SSE 或 WS 流内失败只使用错误�
 
 设置更新必须包含 `accountErrorProtection`，不接受未知字段；已有部署或备份的配置处理见[升级前检查](../deploy/README.md#升级前检查)
 
+### 降智检测（fork）
+
+后台任务按设置定时用固定题目考每个状态正常的上游账号，按关键词判定回答；一轮不及格后复测，复测仍不及格则停用该账号。
+设置与结果存在 fork 自有表 `fork_iq_probe_settings`、`fork_iq_probe_schedule`、`fork_iq_probe_rounds`，不属于运行设置的 `configRevision`。
+三个接口都要求管理员登录，使用管理接口响应信封，字段为 camelCase，时间为 RFC 3339 字符串
+
+| 方法 | 路由 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/admin/iq-probe/settings` | 返回 `{ settings, revision, status }`；还没保存过时返回默认设置，`revision` 为 `0` |
+| `POST` | `/api/admin/iq-probe/settings/update` | 请求体 `{ settings, revision }`，返回同上 |
+| `GET` | `/api/admin/iq-probe/rounds?accountIds=a,b,c` | 返回 `{ items }`，每个账号最近 24 轮，同一账号内新的在前 |
+
+`settings` 字段（请求体不接受未知字段，校验失败返回 `400`）：
+
+| 字段 | 默认值 | 约束与含义 |
+| --- | --- | --- |
+| `enabled` | `false` | 总开关；从关闭变为开启时清空排期，按账号 ID 升序重新错开 |
+| `intervalMinutes` | `10` | 1～1,440，每个账号以上一轮开测时间为准的测试间隔 |
+| `staggerMinutes` | `2` | 0～60，相邻账号首次开测相隔的分钟数 |
+| `recheckDelayMinutes` | `2` | 1～60，一轮不及格后到复测的分钟数 |
+| `breakerThreshold` | `3` | 1～100，最近 120 分钟自动停号数达到该值时只标记不停号 |
+| `questions` | 两道默认题 | 1～10 道，按顺序提问 |
+
+题目形状为 `{ prompt, model, reasoningEffort, passKeywords, failKeywords, maxAttempts }`：`prompt` 去两端空白后 1～2,000 字；
+`model` 1～128 字；`reasoningEffort` 为 `null` 或 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`，空字符串按 `null` 保存；
+`passKeywords` 1～10 个、`failKeywords` 0～10 个，每个去两端空白后 1～64 字；`maxAttempts` 1～5。
+关键词不分大小写，纯英文关键词按整词匹配，其他按包含匹配
+
+`revision` 是读取时拿到的版本，保存成功后返回新版本；与库中版本不符返回 `409`，需重新读取后再提交。
+保存后的 `settings` 是去除空白后的实际保存值
+
+`status` 为 `{ breakerActive, autoDisabledInWindow, windowMinutes }`：`windowMinutes` 固定 `120`，
+`autoDisabledInWindow` 是窗口内自动停号数，达到 `breakerThreshold` 时 `breakerActive` 为 `true`
+
+`accountIds` 逗号分隔，去除空白、空项和重复项后须为 1～200 个，否则返回 `400`；不存在或没有结果的账号不返回条目。
+`items` 每项为：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 轮次 ID，`iqr_` 开头 |
+| `accountId` | 账号 ID |
+| `kind` | `scheduled` 定时，`recheck` 复测 |
+| `startedAt`、`finishedAt` | 开测与结束时间 |
+| `outcome` | `passed` 通过，`passed_after_retry` 重问后通过，`failed` 不及格，`error` 没测成（超时、限流、上游 5xx 等，不算不及格） |
+| `action` | `none` 无处置，`disabled` 已停用账号，`breaker_held` 熔断中未停号 |
+| `detail.questions[]` | 每题的 `prompt`、`model`、`reasoningEffort`、`verdict`（取值同 `outcome`）与 `attempts[]` |
+
+`attempts[]` 每项为 `{ answer, verdict, error, elapsedMs }`：`answer` 最多 2,000 字符；`verdict` 为 `pass`、`fail`、`unclear` 或 `error`；
+`error` 是没拿到回答时的原因摘要，否则为 `null`。结果保留 7 天，不进入业务备份
+
 ### Windows 客户端下载
 
 Windows 离线包接口固定解析 Microsoft Store Product ID `9PLM9XGG6VKS` 的 Retail 包，不接受调用方提供

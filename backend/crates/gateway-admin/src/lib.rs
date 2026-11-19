@@ -14,12 +14,15 @@ use serde::Deserialize;
 pub mod backup;
 mod bootstrap;
 pub mod freeze_recovery;
+mod iq_probe;
 pub mod model;
 pub mod ports;
 pub mod public_service;
 mod reset_credit_worker;
 mod use_case;
 pub use use_case::plugins::{PluginDistributionPorts, PluginManagementService, PluginsService};
+
+pub use iq_probe::IqProbeService;
 
 pub use use_case::key_usage::KeyUsageService;
 pub use use_case::peer_link::{PeerLinkError, PeerLinkService};
@@ -220,6 +223,7 @@ pub struct AdminServices {
     _plugin_accounts: Arc<dyn PluginAccountAccess>,
     backups: Arc<dyn BackupService>,
     import_tasks: Arc<dyn ImportTasksService>,
+    iq_probe: Arc<dyn IqProbeService>,
 }
 
 impl AdminServices {
@@ -314,6 +318,11 @@ impl AdminServices {
     #[must_use]
     pub fn backups(&self) -> &dyn BackupService {
         self.backups.as_ref()
+    }
+
+    #[must_use]
+    pub fn iq_probe(&self) -> &dyn IqProbeService {
+        self.iq_probe.as_ref()
     }
 }
 

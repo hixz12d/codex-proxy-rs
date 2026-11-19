@@ -625,7 +625,41 @@
       "credentialsHaveExpired": "Credentials have expired",
       "invalidCredentials": "Invalid credentials",
       "accountUnavailable": "Account is unavailable or has been banned",
-      "count": "Accounts"
+      "count": "Accounts",
+      "iqProbe": "IQ"
+    },
+    "iqProbe": {
+      "empty": "No IQ check results yet",
+      "recentRounds": "Last {count} IQ check rounds",
+      "roundLabel": "{time} {kind}, {outcome}, action: {action}",
+      "detailTitle": "IQ check details",
+      "kind": "Type",
+      "action": "Action",
+      "questionIndex": "Question {index}",
+      "attemptIndex": "Attempt {index}",
+      "noQuestions": "No question records",
+      "noAnswer": "No answer",
+      "kinds": {
+        "scheduled": "Scheduled",
+        "recheck": "Recheck"
+      },
+      "outcomes": {
+        "passed": "Passed",
+        "passedAfterRetry": "Passed after retry",
+        "failed": "Failed",
+        "error": "Not tested"
+      },
+      "actions": {
+        "none": "None",
+        "disabled": "Disabled",
+        "breakerHeld": "Held by breaker"
+      },
+      "attemptVerdicts": {
+        "pass": "Correct",
+        "fail": "Wrong",
+        "unclear": "Unclear",
+        "error": "Error"
+      }
     },
     "page": {
       "description": "Manage the account pool and monitor availability, quota, and usage",
