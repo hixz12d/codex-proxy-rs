@@ -701,8 +701,6 @@ pub(super) fn codex_request_context<'a>(
         request_id,
         turn_state: request.turn_state.as_deref(),
         turn_metadata: request.turn_metadata.as_deref(),
-        beta_features: request.beta_features.as_deref(),
-        include_timing_metrics: request.include_timing_metrics.as_deref(),
         version: request.version.as_deref(),
         codex_window_id: request.codex_window_id.as_deref(),
         parent_thread_id: request.parent_thread_id.as_deref(),
@@ -711,7 +709,6 @@ pub(super) fn codex_request_context<'a>(
         session_id: request.client_session_id.as_deref(),
         thread_id: request.client_thread_id.as_deref(),
         client_request_id: request.client_request_id.as_deref(),
-        turn_id: request.client_turn_id.as_deref(),
         account_selection,
     }
 }
@@ -831,6 +828,15 @@ fn selection_failure(error: &CredentialSelectionError) -> ProviderError {
         CredentialSelectionError::QueueRejected(error) => {
             provider_error(error.provider_kind(), UpstreamSendState::NotSent)
         }
+        CredentialSelectionError::IneligibleSessionAccountTimeout(_) => provider_error(
+            ProviderErrorKind::ConcurrencyQueueTimeout,
+            UpstreamSendState::NotSent,
+        )
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            error.to_string(),
+            None,
+            None,
+        )),
         CredentialSelectionError::CapacityUnavailable { retry_after } => {
             let error = provider_error(
                 ProviderErrorKind::AccountCapacityUnavailable,

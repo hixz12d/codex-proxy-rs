@@ -643,6 +643,11 @@ impl AttemptContext {
         self.request.client_transport
     }
 
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        self.request.endpoint()
+    }
+
     /// 原生响应可交付可替换前导事件；中间件可能改变其输出语义
     #[must_use]
     pub fn allows_replayable_prelude(&self) -> bool {
@@ -982,11 +987,19 @@ impl AttemptContext {
         model: Option<&str>,
         candidates: &'a [AccountCandidate],
         context: &mut AccountSelectionContext,
+        ownership: policy::AccountScheduleOwnership<'_>,
     ) -> Result<Option<AccountSelection<'a>>, policy::AccountPolicyError> {
         match self.request.request_policy() {
             Some(policy) => {
                 policy
-                    .select_account(self.attempt_index, provider, model, candidates, context)
+                    .select_account(
+                        self.attempt_index,
+                        provider,
+                        model,
+                        candidates,
+                        context,
+                        ownership,
+                    )
                     .await
             }
             None => Ok(crate::account::AccountSelector.select(candidates, context)),

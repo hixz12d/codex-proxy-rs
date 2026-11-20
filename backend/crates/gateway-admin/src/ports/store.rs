@@ -180,6 +180,16 @@ pub trait AccountStore:
         windows: &[AccountUsageWindowQuery],
     ) -> AdminStoreResult<Vec<AccountUsageWindowResult>>;
 
+    /// 按完成时间倒序读取一页保留的请求观测，不按本地计费结果筛选
+    async fn quota_documents(
+        &self,
+        account: &gateway_core::account::ProviderAccountId,
+        provider: &gateway_core::routing::ProviderKind,
+        created_at: DateTime<Utc>,
+        range: TimeRange,
+        before: Option<&crate::model::quota_history::QuotaHistoryCursor>,
+    ) -> AdminStoreResult<crate::model::quota_history::QuotaDocumentPage>;
+
     /// 从同一数据库语句取得截止快照的累计用量和有界历史观测
     async fn load_quota_forecast_history(
         &self,
@@ -470,6 +480,7 @@ pub trait AccountGroupStore: Send + Sync {
         context: &MutationContext,
     ) -> AdminStoreResult<AccountGroupMutation>;
 
+    /// 仍有 API Key 引用分组时返回 Conflict
     async fn delete_account_group(
         &self,
         command: DeleteAccountGroup,

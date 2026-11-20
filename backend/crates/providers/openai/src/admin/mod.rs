@@ -265,8 +265,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
     }
 
     fn plan_type_display(&self, plan_type: &str) -> String {
-        // Pro 系列按套餐类型区分展示，其他套餐遵循官方 KnownPlan::display_name
-        // 只映射展示名称，原始套餐值与未知套餐保持不变
+        // Pro 三档沿用管理端短名，其余已知套餐使用 Codex /status 的名称
         match plan_type.to_ascii_lowercase().as_str() {
             "free" => "Free",
             "go" => "Go",
@@ -274,16 +273,17 @@ impl ProviderAdmin for OpenAiAdminProvider {
             "pro" => "Pro",
             "prolite" => "ProLite",
             "promax" => "ProMax",
-            "team" => "Team",
-            "self_serve_business_prolite" => "Self Serve Business ProLite",
-            "self_serve_business_usage_based" => "Self Serve Business Usage Based",
-            "business" => "Business",
-            "ent26" | "enterprise" | "hc" => "Enterprise",
+            "team" | "self_serve_business_usage_based" => "Business",
+            "self_serve_business_prolite" => "Business Premium",
+            "business" | "ent26" | "enterprise" | "hc" | "enterprise_cbp_usage_based" => {
+                "Enterprise"
+            }
             "enterprise_cbp_automation" => "Enterprise (Automation)",
-            "enterprise_cbp_usage_based" => "Enterprise CBP Usage Based",
             "edu" | "education" => "Edu",
             "edu_plus" => "Edu Plus",
             "edu_pro" => "Edu Pro",
+            "sci" => "Academic Researchers",
+            "sci_plus" => "Academic Researchers Plus",
             _ => plan_type,
         }
         .to_owned()
@@ -798,35 +798,31 @@ impl ProviderAdmin for OpenAiAdminProvider {
         }
     }
 
+    fn quota_history_parser(
+        &self,
+    ) -> Option<gateway_admin::model::quota_history::QuotaHistoryParser> {
+        Some(quota::history_reading)
+    }
+
     fn quota_forecast_observation(
         &self,
         document: &ProviderDocument,
         window: &ProviderQuotaWindow,
     ) -> Option<QuotaForecastObservation> {
-        use gateway_protocol::openai::events::parse_rate_limit_headers;
-
         if window.local_usage_attribution != QuotaLocalUsageAttribution::AccountWide {
             return None;
         }
-        let value = document
-            .expose_to_provider()
-            .expose_to_provider()
-            .get("rateLimitHeaders")?;
-        let headers: Vec<(String, String)> = serde_json::from_value(value.clone()).ok()?;
-        let parsed = parse_rate_limit_headers(&headers)?;
-        let limit = parsed.limits.get(window.limit_id.as_deref()?)?;
-        let observed = match window.role? {
-            ProviderQuotaWindowRole::Primary => limit.primary?,
-            ProviderQuotaWindowRole::Secondary => limit.secondary?,
-            ProviderQuotaWindowRole::Monthly => return None,
-        };
-        if observed.window_minutes?.checked_mul(60)? != window.window_seconds? {
+        let (observed, plan_type) = quota::history_window(document, &window.key)?;
+        if Some(observed.source()) != window.limit_id.as_deref()
+            || Some(quota_role(observed.role())) != window.role
+            || observed.window_seconds()? != window.window_seconds?
+        {
             return None;
         }
         Some(QuotaForecastObservation {
-            used_percent: observed.used_percent,
-            reset_at: DateTime::<Utc>::from_timestamp(observed.reset_at?, 0)?,
-            plan_type: parsed.plan_type,
+            used_percent: observed.used_percent()?,
+            reset_at: observed.reset_at()?,
+            plan_type,
         })
     }
 
