@@ -228,6 +228,7 @@ impl AdminTestFixture {
                 upstream_info: Some(Arc::new(upstream_info::TestPeerInfo(Arc::clone(
                     &provider_quota,
                 )))),
+                team48: None,
                 timezone,
                 service_middleware: std::sync::Arc::new(|| None),
                 plugin_preparation: plugin_ports.clone(),

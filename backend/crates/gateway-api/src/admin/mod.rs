@@ -18,6 +18,7 @@ pub mod backups;
 pub mod client_keys;
 mod compression;
 pub(crate) mod diagnostics;
+pub mod email_auth;
 mod extract;
 pub mod iq_probe;
 pub mod observability;
@@ -51,6 +52,7 @@ where
         .merge(accounts::router::<S>())
         .merge(backups::router::<S>())
         .merge(client_keys::router::<S>())
+        .merge(email_auth::router::<S>())
         .merge(iq_probe::router::<S>())
         .merge(observability::router::<S>())
         .merge(settings::router::<S>())

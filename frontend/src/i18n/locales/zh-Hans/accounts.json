@@ -203,6 +203,7 @@
       "deleteSelected": "删除 ({count})",
       "exportSelected": "导出 ({count})",
       "importTasks": "导入任务",
+      "emailAuth": "邮箱授权",
       "importAccount": "导入账号",
       "editSelected": "编辑 ({count})"
     },
@@ -704,6 +705,58 @@
       "morePlans": "查看其余 {count} 种套餐",
       "nodeQuota": "节点额度",
       "quota": "上游额度"
+    },
+    "emailAuth": {
+      "modeLabel": "邮箱自动授权",
+      "modalDescription": "由 48team 用邮箱验证码自动登录并导入 OpenAI Team 账号",
+      "inputHelpTitle": "仅支持已加入单个 Team 的 iCloud 隐藏邮箱",
+      "inputHelpDetail": "每行一个 HME 邮箱，单批最多 50 个，48team 会在后台逐个收码登录授权（每号约 2～4 分钟），遇到手机验证或多个 Team 会停下并说明原因",
+      "emailsLabel": "邮箱列表",
+      "emailsPlaceholder": "每行粘贴一个 iCloud 隐藏邮箱，最多 50 个",
+      "submitButton": "开始自动授权",
+      "notConfigured": "服务器未配置 48team 连接",
+      "batchRunning": "上一批还没结束",
+      "openProgress": "查看进度",
+      "tooManyEmails": "最多提交 {max} 个邮箱，当前共 {count} 个",
+      "invalidEmails": "以下 {count} 行邮箱格式不正确，请修正后再提交",
+      "progressTitle": "邮箱授权进度",
+      "progressDescription": "48team 在后台串行完成验证码登录与导入，关闭弹窗不影响执行",
+      "loadingBatch": "正在读取批次进度",
+      "emptyTitle": "还没有提交过邮箱自动授权",
+      "emptyDescription": "在导入账号中选择 OpenAI 邮箱自动授权即可创建批次",
+      "startedAt": "开始时间：{time}",
+      "stop": "停止",
+      "stopConfirmTitle": "停止当前批次",
+      "stopConfirmDescription": "只停排队中的号，正在处理的号会跑完",
+      "confirmStop": "确认停止",
+      "retry": "重试",
+      "viewAccounts": "查看账号",
+      "progressLabel": "批次处理进度",
+      "itemListLabel": "邮箱授权明细",
+      "readFailed": "读取邮箱授权进度失败",
+      "counts": {
+        "succeeded": "成功 {count}",
+        "skipped": "跳过 {count}",
+        "failed": "失败 {count}",
+        "running": "处理中 {count}",
+        "pending": "排队 {count}",
+        "stopped": "已停止 {count}",
+        "total": "共 {count}"
+      },
+      "batchStates": {
+        "running": "执行中",
+        "stopping": "停止中",
+        "stopped": "已停止",
+        "finished": "已完成"
+      },
+      "itemStates": {
+        "pending": "排队",
+        "running": "处理中",
+        "succeeded": "成功",
+        "skipped": "跳过",
+        "failed": "失败",
+        "stopped": "已停止"
+      }
     }
   }
 }

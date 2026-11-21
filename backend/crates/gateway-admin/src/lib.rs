@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 pub mod backup;
 mod bootstrap;
+mod email_auth;
 pub mod freeze_recovery;
 mod iq_probe;
 pub mod model;
@@ -22,7 +23,9 @@ mod reset_credit_worker;
 mod use_case;
 pub use use_case::plugins::{PluginDistributionPorts, PluginManagementService, PluginsService};
 
+pub use email_auth::{EmailAuthService, TEAM48_NOT_CONFIGURED_MESSAGE};
 pub use iq_probe::IqProbeService;
+pub use ports::team48::ForkTeam48Config;
 
 pub use use_case::key_usage::KeyUsageService;
 pub use use_case::peer_link::{PeerLinkError, PeerLinkService};
@@ -224,6 +227,7 @@ pub struct AdminServices {
     backups: Arc<dyn BackupService>,
     import_tasks: Arc<dyn ImportTasksService>,
     iq_probe: Arc<dyn IqProbeService>,
+    email_auth: Arc<EmailAuthService>,
 }
 
 impl AdminServices {
@@ -324,6 +328,11 @@ impl AdminServices {
     pub fn iq_probe(&self) -> &dyn IqProbeService {
         self.iq_probe.as_ref()
     }
+
+    #[must_use]
+    pub fn email_auth(&self) -> &EmailAuthService {
+        self.email_auth.as_ref()
+    }
 }
 
 /// Admin 初始化完成后的封闭能力包
@@ -351,6 +360,7 @@ pub use use_case::peer_link::upstream::{
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入
 pub struct AdminRuntimePorts {
     pub upstream_info: Option<Arc<dyn ports::peer::PeerUpstreamService>>,
+    pub team48: Option<Arc<dyn ports::team48::Team48Onboard>>,
     pub timezone: gateway_core::time::DeploymentTimeZone,
     pub service_middleware: public_service::PlanSource,
     pub plugin_preparation: Arc<dyn ports::plugins::PluginPreparation>,

@@ -298,6 +298,7 @@ impl AdminHarness {
             ),
             gateway_admin::AdminRuntimePorts {
                 upstream_info: self.upstream_info,
+                team48: None,
                 timezone: Default::default(),
                 service_middleware: self.service_middleware,
                 plugin_preparation: Arc::new(plugins::TestPluginPorts),

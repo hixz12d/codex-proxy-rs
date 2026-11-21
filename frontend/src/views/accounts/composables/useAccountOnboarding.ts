@@ -1,12 +1,15 @@
 import type { Account, AccountImportParam, AccountImportTask } from '@/api'
+import type { EmailAuthState } from '@/api/modules/email-auth'
 import { computed, ref, shallowRef, watch } from 'vue'
 import { createAccountImportTask, importAccounts } from '@/api'
+import { startEmailAuth } from '@/api/modules/email-auth'
+import { ApiError } from '@/api/request'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { t } from '@/i18n'
 import { notification as ZNotification } from '@/utils/notification'
 import { errorMessage, generateRequestId } from '@/utils/operation'
 import { isSupportedProvider } from '@/utils/providers'
-import { accountCreateProvider, accountCreateSourceKey, accountImportModes, accountImportSettings, emptyAccountCreateForm } from '../utils/accountCreate'
+import { accountCreateProvider, accountCreateSourceKey, accountImportModes, accountImportSettings, emptyAccountCreateForm, parseEmailAuthInput } from '../utils/accountCreate'
 import { accountImportBatches, accountImportDocuments, mixedImportDocuments } from '../utils/accountImport'
 import { loadRandomProxyPool, pickRandomProxy } from '../utils/randomProxy'
 import { emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
@@ -15,11 +18,14 @@ import { useAccountAuthorization } from './useAccountAuthorization'
 export function useAccountOnboarding(options: {
   reload: () => Promise<unknown>
   onImportTaskCreated: (task: AccountImportTask, reveal?: boolean) => void
+  onEmailAuthCreated: (state: EmailAuthState) => void
+  onEmailAuthRefresh?: () => void
 }) {
   const createModalOpen = shallowRef(false)
   const reauthorizingAccount = shallowRef<Account | null>(null)
   const creatingAccountAction = useAsyncAction()
   const createForm = ref(emptyAccountCreateForm())
+  const emailAuthSubmitError = shallowRef('')
   const authorization = useAccountAuthorization(() => finishCreate(reauthorizingAccount.value
     ? t('accounts.onboarding.reauthorized')
     : t('accounts.onboarding.accountAdded')))
@@ -30,6 +36,21 @@ export function useAccountOnboarding(options: {
     submissionIds = []
     submissionBatches = undefined
   }, { deep: true, flush: 'sync' })
+  watch(
+    () => [createForm.value.mode, createForm.value.importTexts.email],
+    () => {
+      emailAuthSubmitError.value = ''
+    },
+    { flush: 'sync' },
+  )
+  // 只在切到邮箱模式时刷新一次配置与批次状态，输入邮箱时不逐键请求
+  watch(
+    () => createForm.value.mode,
+    (mode) => {
+      if (mode === 'email' && createModalOpen.value)
+        options.onEmailAuthRefresh?.()
+    },
+  )
 
   const showCreateModal = computed({
     get: () => createModalOpen.value,
@@ -43,6 +64,7 @@ export function useAccountOnboarding(options: {
   function clearCreate() {
     authorization.reset()
     reauthorizingAccount.value = null
+    emailAuthSubmitError.value = ''
     createForm.value = emptyAccountCreateForm()
   }
 
@@ -59,11 +81,41 @@ export function useAccountOnboarding(options: {
       await authorization.complete()
       return
     }
+    if (createForm.value.mode === 'email') {
+      await creatingAccountAction.run(async () => {
+        const form = createForm.value
+        const provider = accountCreateProvider(form)
+        if (requireImportProvider(provider) !== 'openai')
+          throw new Error(t('accounts.onboarding.accountPlatformIsNotSupported'))
+        const parsed = parseEmailAuthInput(form.importTexts.email)
+        if (!parsed.emails.length || parsed.invalidEmails.length > 0 || parsed.tooMany)
+          return
+        emailAuthSubmitError.value = ''
+        const settings = accountImportSettings(form)
+        const result = await startEmailAuth({
+          emails: parsed.emails,
+          settings,
+        }, { silent: true })
+        showCreateModal.value = false
+        options.onEmailAuthCreated(result)
+      }, {
+        errorText: false,
+        onError: (cause) => {
+          emailAuthSubmitError.value = cause instanceof ApiError
+            ? cause.message
+            : errorMessage(cause)
+          options.onEmailAuthRefresh?.()
+        },
+      })
+      return
+    }
     let submitted = 0
     await creatingAccountAction.run(async () => {
       const form = createForm.value
       const settings = accountImportSettings(form)
-      const randomPool = form.proxyMode === 'random' ? await loadRandomProxyPool() : undefined
+      const randomPool = form.proxyMode === 'random'
+        ? await loadRandomProxyPool()
+        : undefined
       const outboundProxyId = () => randomPool
         ? pickRandomProxy(randomPool)
         : form.proxyMode === 'proxy'
@@ -171,6 +223,7 @@ export function useAccountOnboarding(options: {
   function openCreateAccount() {
     authorization.reset()
     reauthorizingAccount.value = null
+    emailAuthSubmitError.value = ''
     createForm.value = emptyAccountCreateForm()
     showCreateModal.value = true
   }
@@ -196,6 +249,7 @@ export function useAccountOnboarding(options: {
   }
 
   watch(() => accountCreateSourceKey(createForm.value), () => {
+    emailAuthSubmitError.value = ''
     createForm.value = {
       ...createForm.value,
       mode: reauthorizingAccount.value
@@ -204,7 +258,12 @@ export function useAccountOnboarding(options: {
           ? 'json'
           : accountImportModes(accountCreateProvider(createForm.value))[0]?.value ?? 'json',
       apiKey: emptyApiKeyAccountForm(),
-      importTexts: { access_token: '', refresh_token: '', json: '' },
+      importTexts: {
+        access_token: '',
+        refresh_token: '',
+        json: '',
+        email: '',
+      },
     }
   }, { flush: 'sync' })
 
@@ -226,6 +285,7 @@ export function useAccountOnboarding(options: {
     creatingAccount: creatingAccountAction.loading,
     authorization: authorization.view,
     authorizationCallback: authorization.callback,
+    emailAuthSubmitError,
     createForm,
     handleCreate,
     handleAuthorizeOAuth,

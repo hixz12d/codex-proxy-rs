@@ -14,6 +14,7 @@ pub mod proxy_probe;
 pub mod retention;
 pub mod serve;
 pub mod system_update;
+mod team48;
 pub mod workers;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use gateway_core::lifecycle::ConnectionLifecycle;
 use gateway_core::task::{WorkerContribution, WorkerLeaderLeasePort};
 
 pub use config::{HostConfig, LoadableConfig, load_config};
+pub use team48::HttpTeam48Onboard;
 
 /// Host 配置加载与各能力配置校验共用的脱敏错误
 #[derive(Debug, thiserror::Error)]
