@@ -17,5 +17,4 @@ pub mod reset_credit_automation;
 pub mod retention;
 pub mod store;
 pub mod system;
-pub mod team48;
 pub mod usage_data;

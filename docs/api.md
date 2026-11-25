@@ -1613,25 +1613,6 @@ OAuth 等待回调期间允许修改代理。提交时若代理已删除、停�
 终态结果保留 1 小时后自动清理。服务重启会丢失任务与未执行输入，已提交的账号不受影响；
 任务记录仍在保留期内时，可通过列表接口查询当前管理员的任务及进度
 
-### 邮箱自动授权（fork）
-
-把一批已在 ChatGPT Team 内、邮箱可收验证码的 OpenAI 账号交给同机 48team，由它在后台逐个用邮箱验证码登录、
-授权，再调用上文导入接口以新账号写入。rs 不保存批次，只转发；未配置部署配置段 `fork_team48`
-（`base_url`、`api_key`，密钥至少 24 位，不回显）时该能力显示未配置
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/admin/accounts/email-auth` | 返回 `{ configured, batch }`；未配置时 `configured: false`、`batch: null`，不连接 48team |
-| `POST` | `/api/admin/accounts/email-auth` | 请求体 `{ emails, settings }`，`emails` 1–50 个，`settings` 与导入接口的 `settings` 相同 |
-| `POST` | `/api/admin/accounts/email-auth/stop` | 停止排队中的条目，正在处理的条目跑完为止 |
-| `POST` | `/api/admin/accounts/email-auth/retry` | 请求体 `{ email }`，重试 `retryable` 为 true 的条目 |
-
-`batch` 为 `{ id, state, createdAt, finishedAt, counts, items }`，`state` 为 `running`、`stopping`、`stopped`、`finished`；
-`items` 每项 `{ email, state, code, message, retryable, remoteAccountId, updatedAt }`，`state` 为 `pending`、`running`、
-`succeeded`、`skipped`、`failed`、`stopped`，`message` 是 48team 给出的中文说明。只保留当前或最近一批，
-已有批次在执行时再提交返回 409。48team 的 400 / 404 / 409 / 503 按原状态与说明返回；连不上或超时（10 秒）、
-内部密钥不对或 48team 未配置密钥返回 502；rs 未配置时提交、停止、重试返回 503
-
 ### 账号能力、导入与 OAuth
 
 敏感账号导出要求所选全部账号属于支持导出的内置平台。不支持时整个请求在读取任何凭据前拒绝，不返回部分导出结果

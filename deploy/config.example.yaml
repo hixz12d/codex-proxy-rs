@@ -94,11 +94,6 @@ openai:
   #   idle_timeout_ms: 300000 # 仅回收未绑定活跃客户端 WS 的空闲连接，必须大于零。
   #   stream_idle_timeout_ms: 300000
 
-# fork：邮箱自动授权新号，转给同机 48team 执行；不配置则该功能显示"未配置"
-# fork_team48:
-#   base_url: 'http://team48-manager:8008'
-#   api_key: ''   # 与 48team 的 CODEX_RS_ONBOARD_TOKEN 相同，至少 24 位
-
 # Compose 启动桥接区；密码仍只维护在 store 中。
 services:
   app-runtime:

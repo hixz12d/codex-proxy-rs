@@ -2,7 +2,7 @@
 import type { AccountGroupRef } from '@/api'
 
 import { ZButton, ZIconButton, ZInput, ZMenuItem, ZPopover, ZSelect } from '@codex-proxy/ui'
-import { Download, ListTodo, Mail, MessagesSquare, MoreHorizontal, Pencil, Search, Trash2, Upload } from '@lucide/vue'
+import { Download, ListTodo, MessagesSquare, MoreHorizontal, Pencil, Search, Trash2, Upload } from '@lucide/vue'
 
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -12,8 +12,6 @@ import { accountStatusFilterOptions } from '../constants'
 const props = defineProps<{
   hasImportTasks: boolean
   activeImportCount: number
-  hasEmailAuth: boolean
-  activeEmailAuthCount: number
   selectedCount: number
   batchDeleting: boolean
   exportingAccounts: boolean
@@ -26,7 +24,6 @@ const emit = defineEmits<{
   deleteSelected: []
   exportSelected: []
   importTasks: []
-  emailAuth: []
   create: []
   editSelected: []
   compareSelected: []
@@ -154,10 +151,6 @@ const groupOptions = computed(() => [
       <ZButton v-if="hasImportTasks" class="whitespace-nowrap" @click="emit('importTasks')">
         <ListTodo class="size-4" />
         {{ t('accounts.filters.importTasks') }} <span v-if="activeImportCount" class="font-mono text-z-link">{{ activeImportCount }}</span>
-      </ZButton>
-      <ZButton v-if="hasEmailAuth" class="whitespace-nowrap" @click="emit('emailAuth')">
-        <Mail class="size-4" />
-        {{ t('accounts.filters.emailAuth') }} <span v-if="activeEmailAuthCount" class="font-mono text-z-link">{{ activeEmailAuthCount }}</span>
       </ZButton>
       <slot name="actions" />
       <ZButton type="primary" class="whitespace-nowrap" @click="emit('create')">

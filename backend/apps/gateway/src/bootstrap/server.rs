@@ -75,18 +75,6 @@ pub async fn run() -> Result<(), BootstrapError> {
             gateway_admin::ProviderUsageBillingProjector::new(providers.admin.clone()),
         ))
     );
-    let team48 = or_shutdown!(
-        plugin_runtime,
-        config
-            .fork_team48
-            .map(gateway_host::HttpTeam48Onboard::new)
-            .transpose()
-    )
-    .map(
-        |client| -> std::sync::Arc<dyn gateway_admin::ports::team48::Team48Onboard> {
-            std::sync::Arc::new(client)
-        },
-    );
     let mut admin = or_shutdown!(
         plugin_runtime,
         gateway_admin::initialize_with_plugin_accounts(
@@ -95,7 +83,6 @@ pub async fn run() -> Result<(), BootstrapError> {
             store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
                 upstream_info: Some(providers.peer.service()),
-                team48,
                 timezone,
                 service_middleware: service_middleware(core.snapshots(), &plugin_runtime),
                 providers: providers.admin,

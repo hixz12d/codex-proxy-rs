@@ -1,20 +1,18 @@
 import type { AccountAuthorizationView } from '../../composables/useAccountAuthorization'
-import type { AccountEmailAuthStatusView } from '../../composables/useAccountEmailAuth'
 import type { AccountCreateForm } from '../../utils/accountCreate'
 import { t } from '@/i18n'
 import { formatProviderLabel } from '@/utils/providers'
-import { accountCreateProvider, accountImportModes, parseEmailAuthInput } from '../../utils/accountCreate'
+import { accountCreateProvider, accountImportModes } from '../../utils/accountCreate'
 
 export function resolveAccountCreatePresentation(input: {
   form: AccountCreateForm
   provider: string | undefined
   authorization: AccountAuthorizationView
-  emailAuth: AccountEmailAuthStatusView
   callback: string
   busy: boolean
   reauthorizing: boolean
 }) {
-  const { form, provider, authorization, emailAuth } = input
+  const { form, provider, authorization } = input
   const id = accountCreateProvider(form)
   const label = formatProviderLabel(id)
   const isBatch = form.source?.kind === 'bundle'
@@ -32,25 +30,12 @@ export function resolveAccountCreatePresentation(input: {
     description = t('accounts.onboarding.pasteAccessTokenLineByLineIf')
   else if (form.mode === 'refresh_token')
     description = t('accounts.onboarding.refreshTokenDescription')
-  else if (form.mode === 'email')
-    description = t('accounts.emailAuth.modalDescription')
 
   let canSubmit = available && !input.busy
-  if (form.mode === 'oauth') {
+  if (form.mode === 'oauth')
     canSubmit &&= Boolean(authorization.flow && input.callback.trim())
-  }
-  else if (form.mode === 'email') {
-    const parsed = parseEmailAuthInput(form.importTexts.email)
-    canSubmit &&= emailAuth.initialized
-      && emailAuth.configured
-      && !emailAuth.isRunning
-      && parsed.emails.length > 0
-      && parsed.invalidEmails.length === 0
-      && !parsed.tooMany
-  }
-  else if (form.mode !== 'api_key') {
+  else if (form.mode !== 'api_key')
     canSubmit &&= Boolean(form.importTexts[form.mode].trim())
-  }
 
   return {
     configuring,
@@ -108,10 +93,8 @@ export function resolveAccountCreatePresentation(input: {
       ? input.reauthorizing
         ? t('accounts.onboarding.completeReauthorization')
         : t('accounts.onboarding.completeImport')
-      : form.mode === 'email'
-        ? t('accounts.emailAuth.submitButton')
-        : isBatch
-          ? t('accounts.onboarding.batchImport')
-          : t('accounts.filters.importAccount'),
+      : isBatch
+        ? t('accounts.onboarding.batchImport')
+        : t('accounts.filters.importAccount'),
   }
 }

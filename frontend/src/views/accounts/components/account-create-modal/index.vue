@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import type { AccountAuthorizationView } from '../../composables/useAccountAuthorization'
-import type { AccountEmailAuthStatusView } from '../../composables/useAccountEmailAuth'
 
 import type { AccountCreateForm, AccountImportMode } from '../../utils/accountCreate'
 import type { Account, AccountGroupRef } from '@/api'
@@ -19,7 +18,6 @@ import { accountCreateProvider } from '../../utils/accountCreate'
 import AccountApiKeyFields from '../AccountApiKeyFields.vue'
 import AccountIdentityCell from '../AccountIdentityCell.vue'
 import AccountNameField from '../AccountNameField.vue'
-import AccountEmailAuthFields from './AccountEmailAuthFields.vue'
 import AccountImportFields from './AccountImportFields.vue'
 import AccountOAuthFields from './AccountOAuthFields.vue'
 import AccountSetupFields from './AccountSetupFields.vue'
@@ -32,14 +30,13 @@ const props = withDefaults(defineProps<{
   reauthorizing?: boolean
   account?: Account | null
   authorization: AccountAuthorizationView
-  emailAuth: AccountEmailAuthStatusView
 }>(), {
   saving: false,
   reauthorizing: false,
   account: null,
 })
 
-const emit = defineEmits<{ create: [], generateOauth: [], openEmailAuth: [], afterLeave: [] }>()
+const emit = defineEmits<{ create: [], generateOauth: [], afterLeave: [] }>()
 
 const { t } = useI18n({ useScope: 'global' })
 
@@ -69,7 +66,6 @@ const view = computed(() => resolveAccountCreatePresentation({
   form: form.value,
   provider: accountCreateProvider(form.value),
   authorization: props.authorization,
-  emailAuth: props.emailAuth,
   callback: callback.value,
   busy: busy.value,
   reauthorizing: props.reauthorizing,
@@ -193,13 +189,6 @@ async function requestCreate() {
           <AccountNameField v-model="form.name" required :disabled="busy" :placeholder="t('accounts.credentials.enterUpstreamName')" />
           <AccountApiKeyFields v-model="form.apiKey" :disabled="busy" />
         </ZForm>
-        <AccountEmailAuthFields
-          v-else-if="mode === 'email'"
-          v-model="importText"
-          :disabled="busy"
-          :email-auth="emailAuth"
-          @open-progress="emit('openEmailAuth')"
-        />
         <AccountImportFields
           v-else
           :key="mode"

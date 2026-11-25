@@ -4,7 +4,7 @@ import type { Account } from '@/api'
 import { useTableColumns, ZCard, ZCheckbox, ZConfirmDialog, ZIconButton, ZPageHeader, ZPagination, ZTable, ZTableColumnSettings } from '@codex-proxy/ui'
 
 import { ChevronDown } from '@lucide/vue'
-import { computed, ref, shallowRef, watch } from 'vue'
+import { ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AccountPlanBadge from '@/components/account/AccountPlanBadge.vue'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
@@ -12,7 +12,6 @@ import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import AccountCreateModal from './components/account-create-modal/index.vue'
-import AccountEmailAuth from './components/account-email-auth/index.vue'
 import AccountImportTasks from './components/account-import-tasks/index.vue'
 import AccountIqProbeCell from './components/account-iq-probe-cell/index.vue'
 import { useIqProbeRounds } from './components/account-iq-probe-cell/useIqProbeRounds'
@@ -32,7 +31,6 @@ import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 import { useAccountConnectionTest } from './composables/useAccountConnectionTest'
 import { useAccountEditor } from './composables/useAccountEditor'
-import { useAccountEmailAuth } from './composables/useAccountEmailAuth'
 import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountsQuery } from './composables/useAccountsQuery'
@@ -94,23 +92,6 @@ const {
   activeCount: activeImportCount,
 } = importTasks
 
-const emailAuth = useAccountEmailAuth({
-  reload: () => Promise.all([
-    loadAccounts(),
-    loadGroups(),
-  ]),
-})
-const {
-  open: showEmailAuth,
-  batch: emailAuthBatch,
-  loading: loadingEmailAuth,
-  stopping: stoppingEmailAuth,
-  retryingEmails,
-  error: emailAuthError,
-  hasBatch: hasEmailAuth,
-  activeCount: activeEmailAuthCount,
-} = emailAuth
-
 const {
   showCreateModal,
   showDeleteModal,
@@ -126,7 +107,6 @@ const {
   creatingAccount,
   authorization,
   authorizationCallback,
-  emailAuthSubmitError,
   batchDeleting,
   exportingAccounts,
   exportDisabledReason,
@@ -149,8 +129,6 @@ const {
   handleToggleScheduling,
 } = useAccountMutations({
   onImportTaskCreated: importTasks.created,
-  onEmailAuthCreated: emailAuth.created,
-  onEmailAuthRefresh: () => void emailAuth.refresh(true),
   accounts,
   selectedIds,
   reload: () => Promise.all([
@@ -159,13 +137,6 @@ const {
   ]),
   replaceAccount,
 })
-
-const emailAuthStatusView = computed(() => ({
-  initialized: emailAuth.initialized.value,
-  configured: emailAuth.configured.value,
-  isRunning: emailAuth.isRunning.value,
-  submitError: emailAuthSubmitError.value,
-}))
 
 const {
   showConnectionTestModal,
@@ -298,10 +269,7 @@ const {
           :export-disabled-reason="exportDisabledReason"
           :has-import-tasks="recentImportTasks.length > 0"
           :active-import-count="activeImportCount"
-          :has-email-auth="hasEmailAuth"
-          :active-email-auth-count="activeEmailAuthCount"
           @import-tasks="showImportTasks = true"
-          @email-auth="showEmailAuth = true"
           @delete-selected="showDeleteModal = true"
           @export-selected="handleExportAccounts"
           @create="openCreateAccount"
@@ -502,26 +470,11 @@ const {
       @view-accounts="showImportTasks = false; loadAccounts()"
     />
 
-    <AccountEmailAuth
-      v-model="showEmailAuth"
-      :batch="emailAuthBatch"
-      :accounts="accounts"
-      :loading="loadingEmailAuth"
-      :stopping="stoppingEmailAuth"
-      :retrying-emails="retryingEmails"
-      :error="emailAuthError"
-      @stop="emailAuth.stop"
-      @retry="emailAuth.retry"
-      @after-leave="emailAuth.refresh(true)"
-      @view-accounts="showEmailAuth = false; loadAccounts()"
-    />
-
     <AccountCreateModal
       v-model="showCreateModal"
       v-model:form="createForm"
       v-model:callback="authorizationCallback"
       :authorization="authorization"
-      :email-auth="emailAuthStatusView"
       :account="reauthorizingAccount"
       :groups="groups"
       :groups-loading="groupsLoading"
@@ -529,7 +482,6 @@ const {
       :saving="creatingAccount"
       @create="handleCreate"
       @generate-oauth="handleAuthorizeOAuth"
-      @open-email-auth="showCreateModal = false; showEmailAuth = true"
       @after-leave="clearCreate"
     />
 

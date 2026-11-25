@@ -644,7 +644,6 @@ impl Environment {
             self.store.admin_ports(),
             gateway_admin::AdminRuntimePorts {
                 upstream_info: None,
-                team48: None,
                 timezone: Default::default(),
                 service_middleware: {
                     let snapshots = core.snapshots();

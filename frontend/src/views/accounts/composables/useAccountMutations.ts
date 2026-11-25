@@ -1,6 +1,5 @@
 import type { Ref } from 'vue'
 import type { Account, AccountImportTask } from '@/api'
-import type { EmailAuthState } from '@/api/modules/email-auth'
 import type { RequestOptions } from '@/api/request'
 import { computed, ref, shallowReactive, watch } from 'vue'
 import {
@@ -28,8 +27,6 @@ export function useAccountMutations(options: {
   accounts: Ref<Account[]>
   selectedIds: Ref<Set<string>>
   onImportTaskCreated: (task: AccountImportTask, reveal?: boolean) => void
-  onEmailAuthCreated: (state: EmailAuthState) => void
-  onEmailAuthRefresh?: () => void
   reload: () => Promise<unknown>
   replaceAccount: (account: Account) => Promise<boolean>
 }) {
@@ -38,8 +35,6 @@ export function useAccountMutations(options: {
   const onboarding = useAccountOnboarding({
     reload: loadAccounts,
     onImportTaskCreated: options.onImportTaskCreated,
-    onEmailAuthCreated: options.onEmailAuthCreated,
-    onEmailAuthRefresh: options.onEmailAuthRefresh,
   })
   const selectedAccountsById = shallowReactive(new Map<string, Account>())
   const showDeleteModal = ref(false)

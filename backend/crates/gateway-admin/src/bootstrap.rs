@@ -7,8 +7,8 @@ use gateway_core::{engine::probe::AccountProbe, runtime::SnapshotControl};
 use crate::{
     AccountsService, AdminBundle, AdminConfig, AdminRuntimePorts, AdminServices, ClientConfig,
     ClientKeyService, CredentialsService, PluginDistributionPorts, PluginManagementService,
-    PluginsService, SettingsService, UsageDataService, backup, email_auth, freeze_recovery,
-    iq_probe, model::AdminError,
+    PluginsService, SettingsService, UsageDataService, backup, freeze_recovery, iq_probe,
+    model::AdminError,
     ports::{
         self, plugin_accounts::PluginAccountAccess, plugin_client_keys::PluginClientKeyAccess,
         provider::ProviderAdminRegistry, store::AdminStorePorts,
@@ -61,7 +61,6 @@ async fn initialize_inner(
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
         upstream_info,
-        team48,
         timezone,
         service_middleware,
         plugin_preparation,
@@ -226,7 +225,6 @@ async fn initialize_inner(
         import_tasks,
         backups,
         iq_probe: Arc::new(iq_probe::DefaultIqProbeService::new(store.iq_probe())),
-        email_auth: Arc::new(email_auth::EmailAuthService::new(team48)),
     };
     let freeze_recovery =
         freeze_recovery::FreezeRecoveryTask::new(freeze_recovery::FreezeRecoveryDeps {

@@ -203,7 +203,6 @@
       "deleteSelected": "Delete ({count})",
       "exportSelected": "Export ({count})",
       "importTasks": "Import tasks",
-      "emailAuth": "Email auth",
       "importAccount": "Import",
       "editSelected": "Edit ({count})"
     },
@@ -705,58 +704,6 @@
       "morePlans": "View {count} more plans",
       "nodeQuota": "Node quota",
       "quota": "Upstream quota"
-    },
-    "emailAuth": {
-      "modeLabel": "Email auth",
-      "modalDescription": "Sign in with email verification codes via 48team and import OpenAI Team accounts",
-      "inputHelpTitle": "Only iCloud Hide My Email addresses already in a single Team",
-      "inputHelpDetail": "Enter one HME address per line (up to 50 per batch), 48team signs in sequentially in the background (~2–4 min each) and stops with a reason if phone verification or multiple Teams appear",
-      "emailsLabel": "Email list",
-      "emailsPlaceholder": "Paste one iCloud Hide My Email address per line, up to 50",
-      "submitButton": "Start email auth",
-      "notConfigured": "Server has not configured the 48team connection",
-      "batchRunning": "The previous batch is still running",
-      "openProgress": "View progress",
-      "tooManyEmails": "Up to {max} emails allowed, currently {count}",
-      "invalidEmails": "Fix {count} invalid email line before submitting | Fix {count} invalid email lines before submitting",
-      "progressTitle": "Email auth progress",
-      "progressDescription": "48team signs in and imports accounts in the background, closing this dialog does not stop execution",
-      "loadingBatch": "Loading batch progress",
-      "emptyTitle": "No email authorization batch submitted yet",
-      "emptyDescription": "Choose OpenAI Email auth under Import to start a batch",
-      "startedAt": "Started: {time}",
-      "stop": "Stop",
-      "stopConfirmTitle": "Stop current batch",
-      "stopConfirmDescription": "Only queued accounts will be stopped, the account currently running will finish",
-      "confirmStop": "Stop queued",
-      "retry": "Retry",
-      "viewAccounts": "View accounts",
-      "progressLabel": "Batch processing progress",
-      "itemListLabel": "Email authorization items",
-      "readFailed": "Failed to load email auth progress",
-      "counts": {
-        "succeeded": "Succeeded {count}",
-        "skipped": "Skipped {count}",
-        "failed": "Failed {count}",
-        "running": "Running {count}",
-        "pending": "Queued {count}",
-        "stopped": "Stopped {count}",
-        "total": "Total {count}"
-      },
-      "batchStates": {
-        "running": "Running",
-        "stopping": "Stopping",
-        "stopped": "Stopped",
-        "finished": "Finished"
-      },
-      "itemStates": {
-        "pending": "Queued",
-        "running": "Running",
-        "succeeded": "Succeeded",
-        "skipped": "Skipped",
-        "failed": "Failed",
-        "stopped": "Stopped"
-      }
     }
   }
 }
