@@ -153,11 +153,8 @@ pub(crate) fn derive_codex_session_affinity(
     request: &CodexResponsesRequest,
     client_api_key_id: &ClientApiKeyId,
 ) -> Option<CodexSessionAffinity> {
-    let session_id = non_empty(request.client_account_session_id.as_deref())?;
-    session_affinity(
-        "root-session",
-        session_id,
-        Some(session_id),
+    root_session_affinity(
+        request.client_account_session_id.as_deref(),
         client_api_key_id,
     )
     .map(|affinity| {
@@ -169,6 +166,19 @@ pub(crate) fn derive_codex_session_affinity(
             .flatten();
         affinity
     })
+}
+
+pub(crate) fn root_session_affinity(
+    session_id: Option<&str>,
+    client_api_key_id: &ClientApiKeyId,
+) -> Option<CodexSessionAffinity> {
+    let session_id = non_empty(session_id)?;
+    session_affinity(
+        "root-session",
+        session_id,
+        Some(session_id),
+        client_api_key_id,
+    )
 }
 
 fn encrypted_content(value: &Value) -> Option<&str> {

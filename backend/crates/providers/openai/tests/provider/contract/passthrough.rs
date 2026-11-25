@@ -91,6 +91,84 @@ async fn responses_options_follow_the_selected_upstream_on_both_transports() {
 }
 
 #[tokio::test]
+async fn request_country_follows_the_selected_account_across_transports() {
+    use OpenAiRequestCountry::{Custom, Default, FollowLocation, Passthrough};
+    let location = global_request_location();
+    for (policy, location, input, oauth_country) in [
+        (FollowLocation {}, None, None, Some(Value::Null)),
+        (FollowLocation {}, Some(&location), None, Some(json!("NZ"))),
+        (
+            Default {},
+            Some(&location),
+            Some(json!("CA")),
+            Some(Value::Null),
+        ),
+        (Passthrough {}, Some(&location), None, None),
+        (
+            Passthrough {},
+            Some(&location),
+            Some(json!("CA")),
+            Some(json!("CA")),
+        ),
+        (
+            Custom {
+                country: "JP".into(),
+            },
+            Some(&location),
+            Some(Value::Null),
+            Some(json!("JP")),
+        ),
+    ] {
+        let mut body = json!({
+            "model": "gpt-5.4", "input": "hello",
+            "client_metadata": {"request_country": "business"},
+            "tools": [{"type": "web_search"}],
+        });
+        if let Some(country) = &input {
+            body["request_country"] = country.clone();
+        }
+        for api_key in [false, true] {
+            let expected = if api_key { &input } else { &oauth_country };
+            for websocket in [false, true] {
+                let sent = capture_downstream_with_country(
+                    body.clone(),
+                    api_key,
+                    websocket,
+                    false,
+                    location.cloned(),
+                    policy.clone(),
+                )
+                .await;
+                assert_eq!(
+                    sent.get("request_country"),
+                    expected.as_ref(),
+                    "{policy:?}, api_key={api_key}, websocket={websocket}",
+                );
+                assert_eq!(
+                    sent.pointer("/client_metadata/request_country"),
+                    body.pointer("/client_metadata/request_country"),
+                );
+                assert_eq!(
+                    sent.pointer("/tools/0/user_location/country")
+                        .and_then(Value::as_str),
+                    location.map(|location| location.country.as_str()),
+                );
+                assert_eq!(
+                    sent.pointer("/tools/0/user_location/city")
+                        .and_then(Value::as_str),
+                    location.map(|location| location.city.as_str()),
+                );
+                assert_eq!(
+                    sent.pointer("/tools/0/user_location/timezone")
+                        .and_then(Value::as_str),
+                    location.map(|location| location.timezone.name()),
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn codex_oauth_keeps_explicit_context_options() {
     let body = json!({
         "model": "gpt-5.4", "input": "hello",

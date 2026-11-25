@@ -146,44 +146,63 @@ async fn advertised_websocket_limit_counts_final_utf8_bytes_and_allows_equality(
 }
 
 #[tokio::test]
-async fn advertised_websocket_limit_rejects_warmup_without_http_fallback() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut websocket = accept_codex_test_websocket_with(socket, |_, response| {
-            response
-                .headers_mut()
-                .insert("x-codex-websocket-max-message-bytes", "1".parse().unwrap());
-        })
-        .await;
-        while let Some(Ok(message)) = websocket.next().await {
-            assert!(!message.is_text());
-        }
-        assert!(
-            timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err()
-        );
-    });
-    let backend = CodexBackendClient::new(
-        reqwest::Client::builder().no_proxy().build().unwrap(),
-        format!("http://{addr}"),
-        test_wire_profile(),
-    )
-    .with_websocket_pool(Arc::new(CodexWebSocketPool::default()));
-    let error = backend
-        .create_response(
-            &explicit_websocket_warmup_request("oversized-warmup"),
-            request_context("req_oversized_warmup", Some("chatgpt-account")),
+async fn websocket_size_rejection_keeps_warmup_on_websocket() {
+    for advertised in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_codex_test_websocket_with(socket, |_, response| {
+                if advertised {
+                    response
+                        .headers_mut()
+                        .insert("x-codex-websocket-max-message-bytes", "1".parse().unwrap());
+                }
+            })
+            .await;
+            if advertised {
+                while let Some(Ok(message)) = websocket.next().await {
+                    assert!(!message.is_text());
+                }
+            } else {
+                assert!(websocket.next().await.unwrap().unwrap().is_text());
+                websocket
+                    .close(Some(CloseFrame {
+                        code: CloseCode::Size,
+                        reason: "too large".into(),
+                    }))
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let backend = CodexBackendClient::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{addr}"),
+            test_wire_profile(),
         )
-        .await
-        .unwrap_err();
-    std::assert_matches!(
-        error,
-        CodexClientError::WebSocket(CodexWebSocketExchangeError::MessageTooLarge)
-    );
-    server.await.unwrap();
+        .with_websocket_pool(Arc::new(CodexWebSocketPool::default()));
+        let error = backend
+            .create_response(
+                &explicit_websocket_warmup_request("oversized-warmup"),
+                request_context("req_oversized_warmup", Some("chatgpt-account")),
+            )
+            .await
+            .unwrap_err();
+        let CodexClientError::WebSocket(error) = error else {
+            panic!("expected WebSocket size rejection")
+        };
+        if advertised {
+            std::assert_matches!(error, CodexWebSocketExchangeError::MessageTooLarge);
+        } else {
+            assert_eq!(error.close_before_terminal().unwrap().code(), Some(1009));
+        }
+        server.await.unwrap();
+    }
 }
 
 async fn reject_websocket_openings(listener: &TcpListener, attempts: usize) {
@@ -234,8 +253,18 @@ async fn cold_websocket_should_fall_back_without_recording_a_successful_connect(
         assert!(opening.starts_with("GET /codex/responses HTTP/1.1"));
 
         let (mut http, _) = listener.accept().await.unwrap();
-        let request = read_http_request(&mut http).await;
-        assert!(request.starts_with("POST /codex/responses HTTP/1.1"));
+        let request = read_http_request_with_body(&mut http).await;
+        assert!(request.starts_with(b"POST /codex/responses HTTP/1.1"));
+        let separator = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap();
+        let body = zstd::stream::decode_all(&request[separator + 4..]).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body.pointer("/client_metadata/x-codex-ws-stream-request-start-ms")
+                .is_none()
+        );
         write_completed_sse_response(&mut http).await;
     });
     let pool = Arc::new(CodexWebSocketPool::default());
@@ -266,6 +295,21 @@ async fn cold_websocket_should_fall_back_without_recording_a_successful_connect(
     pool.shutdown().await;
 }
 
+fn assert_ws_start_after(payload: &Value, boundary: std::time::SystemTime) {
+    let start_ms = payload["client_metadata"]["x-codex-ws-stream-request-start-ms"]
+        .as_str()
+        .unwrap()
+        .parse::<u128>()
+        .unwrap();
+    assert!(
+        start_ms
+            >= boundary
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+    );
+}
+
 #[tokio::test]
 async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_opening() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -282,8 +326,12 @@ async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_
                 return;
             }
         }
+        let opening_start = std::time::SystemTime::now();
         let mut websocket = accept_codex_test_websocket(stream).await;
-        let _first = websocket.next().await.unwrap().unwrap();
+        let first = websocket.next().await.unwrap().unwrap();
+        let first: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        assert_ws_start_after(&first, opening_start);
+        let next_turn_start = std::time::SystemTime::now();
         websocket
             .send(Message::Text(
                 completed_websocket_response("resp_slow_seed", 2, 1).into(),
@@ -294,6 +342,7 @@ async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_
         let second = websocket.next().await.unwrap().unwrap();
         let second: Value = serde_json::from_str(second.to_text().unwrap()).unwrap();
         assert_eq!(second["previous_response_id"], "resp_slow_seed");
+        assert_ws_start_after(&second, next_turn_start);
         websocket
             .send(Message::Text(
                 completed_websocket_response("resp_slow_continuation", 2, 1).into(),
@@ -929,7 +978,8 @@ async fn concurrent_same_handle_should_allow_one_claim_and_advance_the_live_sock
     std::assert_matches!(
         concurrent_error,
         CodexClientError::WebSocket(CodexWebSocketExchangeError::ContinuationUnavailable {
-            reason: PreviousResponseUnavailableReason::ConnectionBusy
+            reason: PreviousResponseUnavailableReason::ConnectionBusy,
+            ..
         })
     );
 
@@ -946,7 +996,8 @@ async fn concurrent_same_handle_should_allow_one_claim_and_advance_the_live_sock
     std::assert_matches!(
         stale_error,
         CodexClientError::WebSocket(CodexWebSocketExchangeError::ContinuationUnavailable {
-            reason: PreviousResponseUnavailableReason::FreshConnectionRequired
+            reason: PreviousResponseUnavailableReason::FreshConnectionRequired,
+            ..
         })
     );
     let latest = backend
@@ -1118,7 +1169,8 @@ async fn missing_exact_socket_should_fail_without_opening_a_connection() {
     std::assert_matches!(
         error,
         CodexClientError::WebSocket(CodexWebSocketExchangeError::ContinuationUnavailable {
-            reason: PreviousResponseUnavailableReason::FreshConnectionRequired
+            reason: PreviousResponseUnavailableReason::FreshConnectionRequired,
+            ..
         })
     );
     assert!(
@@ -1152,7 +1204,8 @@ async fn connection_local_continuation_without_a_pool_should_not_open_http_or_we
     std::assert_matches!(
         error,
         CodexClientError::WebSocket(CodexWebSocketExchangeError::ContinuationUnavailable {
-            reason: PreviousResponseUnavailableReason::PoolUnavailable
+            reason: PreviousResponseUnavailableReason::PoolUnavailable,
+            ..
         })
     );
     assert!(

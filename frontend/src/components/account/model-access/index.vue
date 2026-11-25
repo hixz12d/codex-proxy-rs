@@ -3,17 +3,18 @@ import type { AccountModelAccess } from '@/api'
 
 import { ZButton, ZEmpty, ZFormItem, ZIconButton, ZInput, ZPopover, ZSegmented } from '@codex-proxy/ui'
 
-import { CircleAlert, ListChecks, ListMinus, Plus, RefreshCw, Search } from '@lucide/vue'
+import { CircleAlert, ImagePlus, ListChecks, ListMinus, Plus, RefreshCw, Search } from '@lucide/vue'
 import { computed, ref, useTemplateRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { getAccountModels, refreshAccountModels } from '@/api'
+import { getAccountGroupModels, getAccountModels, refreshAccountModels } from '@/api'
 import { useRequestState } from '@/composables/useRequestState'
-import { accountModelAccessError, accountModelIdError } from '../utils/modelAccess'
 import AccountModelCleanupPopover from './AccountModelCleanupPopover.vue'
 import AccountModelOption from './AccountModelOption.vue'
+import { accountModelAccessError, accountModelIdError, commonImageModels } from './modelAccess'
 
 const props = withDefaults(defineProps<{
   accountId?: string
+  groupId?: string | null
   disabled?: boolean
   allowPreserve?: boolean
   formProp: string
@@ -33,6 +34,8 @@ const searchInput = useTemplateRef<InstanceType<typeof ZInput>>('searchInput')
 const selectionError = ref('')
 const request = useRequestState()
 const { loading, error } = request
+const groupCatalog = computed(() => props.groupId !== undefined)
+const catalogOwner = computed(() => props.groupId ?? props.accountId)
 const modes = computed(() => [
   ...(props.allowPreserve
     ? [
@@ -44,7 +47,9 @@ const modes = computed(() => [
     : []),
   {
     value: 'all',
-    label: t('common.values.unlimited'),
+    label: groupCatalog.value
+      ? t('common.values.default')
+      : t('common.values.unlimited'),
   },
   {
     value: 'allowlist',
@@ -75,6 +80,7 @@ const mode = computed({
 })
 const restricted = computed(() => mode.value === 'allowlist' || mode.value === 'denylist')
 const selectedIds = computed(() => new Set(model.value?.models))
+const allImageModelsSelected = computed(() => commonImageModels.every(id => selectedIds.value.has(id)))
 // 候选项保留到本次编辑结束，取消勾选只修改待保存的模型限制。
 const availableIds = ref<string[]>([])
 const catalogReady = computed(() => catalog.value !== undefined && !loading.value && !error.value)
@@ -101,7 +107,9 @@ const groups = computed(() => [
   },
   {
     key: 'catalog',
-    label: t('accounts.modelAccess.upstreamCatalog'),
+    label: groupCatalog.value
+      ? t('groups.editor.memberModels')
+      : t('accounts.modelAccess.upstreamCatalog'),
     ids: catalogResults.value,
   },
 ].filter(group => group.ids.length))
@@ -155,10 +163,8 @@ function select(modelIds: string[], selected: boolean) {
     model.value = next
 }
 
-function addModel() {
-  if (props.disabled || !restricted.value || !canAdd.value)
-    return
-  select([newModelId.value], true)
+function addModels(ids: string[]) {
+  select(ids, true)
   if (!selectionError.value) {
     search.value = ''
     searchInput.value?.focus()
@@ -169,7 +175,8 @@ function handleSearchEnter(event: KeyboardEvent) {
   if (event.isComposing)
     return
   event.preventDefault()
-  addModel()
+  if (canAdd.value)
+    addModels([newModelId.value])
 }
 
 function handleCatalogHelpKeydown(event: KeyboardEvent, open: boolean, close: () => void) {
@@ -182,18 +189,23 @@ function handleCatalogHelpKeydown(event: KeyboardEvent, open: boolean, close: ()
 }
 
 async function load(refresh = false) {
-  const accountId = props.accountId
-  if (!accountId || !restricted.value)
+  const id = catalogOwner.value
+  if (!id || !restricted.value)
     return
   const requestId = request.start()
+  const options = { signal: request.signal }
   try {
-    const result = await (refresh ? refreshAccountModels : getAccountModels)(
-      { accountId },
-      { signal: request.signal },
-    )
-    if (request.isCurrent(requestId)) {
-      catalog.value = result.models
-      catalogObservedAtDisplay.value = result.observedAt ? result.observedAtDisplay : undefined
+    if (groupCatalog.value) {
+      const result = await getAccountGroupModels(id, options)
+      if (request.isCurrent(requestId))
+        catalog.value = result.models
+    }
+    else {
+      const result = await (refresh ? refreshAccountModels : getAccountModels)({ accountId: id }, options)
+      if (request.isCurrent(requestId)) {
+        catalog.value = result.models
+        catalogObservedAtDisplay.value = result.observedAt ? result.observedAtDisplay : undefined
+      }
     }
   }
   catch (cause) {
@@ -205,7 +217,7 @@ async function load(refresh = false) {
 }
 
 watch([
-  () => props.accountId,
+  catalogOwner,
   () => model.value?.models,
 ], ([accountId, ids], [previousAccountId]) => {
   const retained = accountId === previousAccountId
@@ -220,7 +232,7 @@ watch([
 }, { immediate: true })
 
 watch([
-  () => props.accountId,
+  catalogOwner,
   restricted,
 ], () => {
   request.invalidate()
@@ -248,7 +260,7 @@ watch(search, () => {
           </span>
         </span>
       </template>
-      <template v-if="restricted" #label-extra>
+      <template v-if="restricted && !groupCatalog" #label-extra>
         <ZPopover class="-my-1 -ml-1.5 shrink-0" trigger="hover-click" placement="top-start" role="tooltip">
           <template #reference="{ open, id, close }">
             <ZIconButton
@@ -273,8 +285,8 @@ watch(search, () => {
         </ZPopover>
       </template>
       <div class="flex min-w-0 items-center justify-between gap-2">
-        <ZSegmented v-model="mode" class="w-80 min-w-0 max-w-full" :aria-label="t('accounts.modelAccess.modelRestrictionMode')" :options="modes" :disabled="disabled" />
-        <div v-if="restricted && accountId" class="flex shrink-0 items-center gap-1">
+        <ZSegmented v-model="mode" :class="{ 'w-80': !groupCatalog }" :aria-label="t('accounts.modelAccess.modelRestrictionMode')" :options="modes" :disabled="disabled" />
+        <div v-if="restricted && catalogOwner" class="flex shrink-0 items-center gap-1">
           <AccountModelCleanupPopover v-if="mode === 'allowlist'" :models="missingModels" :model-count="model?.models.length ?? 0" :disabled="disabled || !missingModels.length" @remove="removeMissingModels" @closed="restoreCleanupFocus" />
           <ZIconButton ref="refreshButton" :aria-label="t('accounts.modelAccess.refreshModel')" variant="plain" :loading="loading" :disabled="disabled" @click="load(true)">
             <template #loading>
@@ -292,10 +304,20 @@ watch(search, () => {
             <Search class="size-4" aria-hidden="true" />
           </template>
         </ZInput>
-        <ZButton class="shrink-0" :disabled="disabled || !canAdd" @click="addModel">
+        <ZButton class="shrink-0" :disabled="disabled || !canAdd" @click="addModels([newModelId])">
           <Plus class="size-4" aria-hidden="true" />
           {{ t('accounts.modelAccess.addModel') }}
         </ZButton>
+        <ZIconButton
+          v-if="mode === 'allowlist'"
+          variant="plain"
+          :aria-label="t('accounts.modelAccess.addImageModels')"
+          :title="t('accounts.modelAccess.addImageModels')"
+          :disabled="disabled || allImageModelsSelected"
+          @click="addModels(commonImageModels)"
+        >
+          <ImagePlus aria-hidden="true" />
+        </ZIconButton>
       </div>
       <p v-if="inputError" class="m-0 text-z-xs text-z-error-text" role="alert">
         {{ inputError }}

@@ -79,6 +79,8 @@ pub enum CodexAccountFailure {
     Banned,
     /// 账号信用额度已耗尽
     QuotaExhausted,
+    /// 当前凭据被上游支出上限拒绝，其他凭据的归属未知
+    SpendLimitExceeded,
     /// 当前用量窗口已耗尽；到重置时间后可自动恢复
     UsageLimitExhausted {
         /// 上游返回的窗口绝对重置时刻
@@ -619,7 +621,7 @@ impl CodexCredentialSelector {
                 .collect());
         }
         if diagnostic {
-            return Ok(self.repository.list_for_provider().await?);
+            return Ok(self.repository.list_for_provider(false).await?);
         }
         let account_ids: Vec<_> = attempt
             .account_scope()
@@ -900,6 +902,15 @@ impl CodexCredentialSelector {
                     only_account,
                 )
                 .await?;
+            let image_primary = binding
+                .as_ref()
+                .filter(|_| {
+                    matches!(model, CodexSelectionModel::Image(_))
+                        && affinity_mode == AccountAffinity::Strict
+                        && pinned_account.is_none()
+                })
+                .map(ProviderSessionBinding::account_id)
+                .filter(|id| accounts.iter().any(|account| account.id() == *id));
             let mut model_access_rejected = 0_usize;
             let accounts = accounts
                 .into_iter()
@@ -1055,6 +1066,14 @@ impl CodexCredentialSelector {
                 .iter()
                 .map(|account| account.id().clone())
                 .collect::<Vec<_>>();
+            // 主账号在授权池内，但未通过 Images 的模型、套餐或协议筛选时，只为本次图片借号
+            let image_primary_to_keep = image_primary.filter(|id| !account_ids.contains(id));
+            if image_primary_to_keep.is_some() && queued_account.is_some() {
+                // 排队期间主账号的资格可能变化，先恢复完整候选再找可用的生图账号
+                refresh_candidates = true;
+                continue 'capacity;
+            }
+            let follow_only = follow_only && image_primary_to_keep.is_none();
             let rate_limits = if diagnostic {
                 HashMap::new()
             } else {
@@ -1610,7 +1629,7 @@ impl CodexCredentialSelector {
                 {
                     return Err(CredentialSelectionError::SessionAccountLost);
                 }
-                let mut binding_account = account.id();
+                let mut binding_account = image_primary_to_keep.unwrap_or(account.id());
                 if affinity_mode == AccountAffinity::Preferred
                     && let Some(primary) = binding.as_ref()
                     && (primary.account_id() == account.id()
@@ -1809,7 +1828,7 @@ impl CodexCredentialSelector {
         .map(|alias| alias.map(|alias| CodexSessionAffinity::from_turn_alias(turn.clone(), alias)))
     }
 
-    async fn lookup_session_affinity(
+    pub(crate) async fn lookup_session_affinity(
         &self,
         key: &ProviderSessionAffinityKey,
     ) -> Result<Option<ProviderSessionBinding>, CredentialSelectionError> {
@@ -2185,6 +2204,11 @@ impl CodexCredentialSelector {
             CodexAccountFailure::QuotaExhausted => self
                 .quota
                 .record_confirmed_exhaustion(account, QuotaEvidence::PaymentRequired, None, now)
+                .await
+                .map_err(|source| CredentialSelectionError::Store(ErrorSource::new(source))),
+            CodexAccountFailure::SpendLimitExceeded => self
+                .quota
+                .record_confirmed_exhaustion(account, QuotaEvidence::ProviderDenied, None, now)
                 .await
                 .map_err(|source| CredentialSelectionError::Store(ErrorSource::new(source))),
             CodexAccountFailure::UsageLimitExhausted { reset_at } => self

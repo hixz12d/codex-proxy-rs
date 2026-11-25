@@ -305,6 +305,149 @@ fn request_observation_is_stable_across_candidate_order_and_respects_session_own
     }
 }
 
+struct DirectModelProvider {
+    parent: ProviderAccountId,
+}
+
+#[async_trait]
+impl Provider for DirectModelProvider {
+    fn name(&self) -> &'static str {
+        "openai"
+    }
+
+    fn catalog_generation(&self) -> ProviderCatalogGeneration {
+        ProviderCatalogGeneration::default()
+    }
+
+    async fn query_model_capabilities(
+        &self,
+    ) -> Result<Vec<ProviderModelCapabilities>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    fn direct_account_model(
+        &self,
+        _: &PublicModelId,
+        _: &Operation,
+        _: Option<&gateway_core::operation::ProviderSessionState>,
+        _: &gateway_core::settings::SettingsValues,
+    ) -> Option<UpstreamModelId> {
+        Some(UpstreamModelId::new("review").unwrap())
+    }
+
+    async fn allows_direct_model_scope(
+        &self,
+        _: &Operation,
+        _: &ClientApiKeyId,
+        scope: &FrozenAccountScope,
+        _: gateway_core::account::AccountSelectionPolicy,
+    ) -> Result<bool, ProviderError> {
+        Ok(scope.allows(&self.parent))
+    }
+
+    async fn execute(
+        self: Arc<Self>,
+        request: ProviderRequest,
+        _: AttemptContext,
+    ) -> Result<ProviderStream, ProviderError> {
+        let candidate = request.candidate();
+        assert!(candidate.account_scope().allows(&self.parent));
+        let model = candidate.upstream_model().unwrap();
+        let metadata = ProviderCallMetadata::new(
+            candidate.provider().clone(),
+            model.clone(),
+            self.parent.clone(),
+            UpstreamTransport::new("websocket").unwrap(),
+        );
+        let response = ResponseMeta::new("resp_direct_model", model.as_str());
+        Ok(ProviderStream::new(
+            metadata,
+            futures::stream::iter([
+                Ok(GatewayEvent::Started(response.clone()).into()),
+                Ok(GatewayEvent::Completed(response).into()),
+            ]),
+            (),
+        ))
+    }
+}
+
+#[test]
+fn direct_model_uses_the_original_route_when_the_parent_is_outside_its_scope() {
+    block_on(async {
+        let kind = ProviderKind::new("openai").unwrap();
+        let key = ProviderAccountId::new("acct_api_key").unwrap();
+        let oauth = ProviderAccountId::new("acct_oauth").unwrap();
+        let scope = FrozenAccountScope::new(
+            Arc::new(RuntimeAccountDirectory::new(
+                [
+                    (
+                        key.clone(),
+                        RuntimeAccount::new(kind.clone(), BTreeSet::new()),
+                    ),
+                    (
+                        oauth.clone(),
+                        RuntimeAccount::new(kind.clone(), BTreeSet::new())
+                            .with_direct_authentication_kind(Some("oauth".into())),
+                    ),
+                ]
+                .into(),
+            )),
+            ClientRoutingScope::all_accounts(),
+        );
+        let snapshot = RuntimeSnapshot::new(
+            ConfigRevision::new(1).unwrap(),
+            gateway_core::settings::SettingsValues::new(1, "smart", Default::default(), None, None),
+            vec![kind.clone()],
+            ["gpt-start", "review"]
+                .map(|model| {
+                    ProviderModel::new(
+                        kind.clone(),
+                        UpstreamModelId::new(model).unwrap(),
+                        ModelCapabilities::new([OperationKind::Generate].into(), None)
+                            .with_upstream_feature_validation(),
+                    )
+                })
+                .into(),
+            vec![ClientPolicy::new(
+                ClientApiKeyId::new("key_start_test").unwrap(),
+                PlaintextClientApiKey::new("sk_start_test").unwrap(),
+                Arc::new(scope),
+                true,
+                RateLimits::unlimited(),
+            )],
+        )
+        .unwrap();
+        let snapshots = RuntimeSnapshotHandle::new(snapshot);
+        for (parent, expected) in [(key, "gpt-start"), (oauth, "review")] {
+            let store = Arc::new(TrackingExecutionStore::default());
+            let service = DefaultExecutionService::new(
+                snapshots.clone(),
+                store.clone(),
+                ProviderRegistry::new([
+                    Arc::new(DirectModelProvider { parent }) as Arc<dyn Provider>
+                ])
+                .unwrap(),
+                Arc::new(Admissions::default()),
+                Arc::new(UnusedContinuation),
+                Arc::new(RecordingClientApiKeyUsage::default()),
+                Arc::new(crate::RecordingDiagnostics::default()),
+            );
+            let mut started = service
+                .start(request(&service, ClientTransport::WebSocket))
+                .await
+                .unwrap();
+            assert!(started.session.next_event().await.unwrap().is_some());
+            started.session.detach_finalize().await;
+            let attempts = store.attempts.lock().unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(
+                attempts[0].upstream_model_id.as_ref().unwrap().as_str(),
+                expected
+            );
+        }
+    });
+}
+
 struct SessionObservationProvider(&'static str);
 
 #[async_trait]
@@ -5081,10 +5224,20 @@ fn request_settings_recompute_routing_and_admission_without_changing_sibling_or_
 
 #[test]
 fn invalid_request_settings_leave_the_prepared_execution_unchanged() {
+    use gateway_core::routing::request_settings::ExecutionSettings;
+
     let service = service(Arc::new(Admissions::default()), Arc::new(Budget::default()));
     let client = service.authenticate("sk_start_test").unwrap();
     let prepared = service.prepare_verified_execution(client).unwrap();
     let baseline = prepared.request_settings().execution_values().unwrap();
+    for field in [
+        "openai_oauth_guardian_review_model",
+        "openai_request_country",
+    ] {
+        let mut incomplete = serde_json::to_value(&baseline).unwrap();
+        incomplete["runtime"].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<ExecutionSettings>(incomplete).is_err());
+    }
     let mut invalid = serde_json::to_value(&baseline).unwrap();
     invalid["runtime"]["responses_max_decompressed_body_bytes"] = json!(0);
     invalid["fast_mode"] = json!("disabled");

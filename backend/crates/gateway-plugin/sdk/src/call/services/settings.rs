@@ -136,6 +136,8 @@ pub struct PrivacyPreviewResult {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSettings {
+    pub openai_oauth_guardian_review_model: bool,
+    pub openai_request_country: OpenAiRequestCountry,
     pub codex_privacy_policy: CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: RequestLocation,
@@ -164,7 +166,6 @@ pub struct RuntimeSettings {
     pub account_warmup_enabled: bool,
     pub account_warmup_cron: String,
     pub account_warmup_model: Option<String>,
-    #[serde(default)]
     pub reset_credit_on_low_weekly_quota: bool,
     pub reset_credit_lead_minutes: u32,
     pub reset_credit_max_weekly_remaining_percent: Option<u32>,
@@ -177,6 +178,8 @@ pub struct RuntimeSettings {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceRuntimeSettings {
+    pub openai_oauth_guardian_review_model: bool,
+    pub openai_request_country: OpenAiRequestCountry,
     pub codex_privacy_policy: CodexPrivacyPolicy,
     pub request_location_enabled: bool,
     pub request_location: RequestLocation,
@@ -205,7 +208,6 @@ pub struct ReplaceRuntimeSettings {
     pub account_warmup_enabled: bool,
     pub account_warmup_cron: String,
     pub account_warmup_model: Option<String>,
-    #[serde(default)]
     pub reset_credit_on_low_weekly_quota: bool,
     pub reset_credit_lead_minutes: u32,
     pub reset_credit_max_weekly_remaining_percent: Option<u32>,
@@ -248,6 +250,14 @@ pub struct RequestLocation {
     pub region: String,
     pub city: String,
     pub timezone: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenAiRequestCountry {
+    Default {},
+    Passthrough {},
+    FollowLocation {},
+    Custom { country: String },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -391,6 +401,8 @@ impl Operation for PreviewClientProfile {
 impl From<RuntimeSettings> for ReplaceRuntimeSettings {
     fn from(settings: RuntimeSettings) -> Self {
         Self {
+            openai_oauth_guardian_review_model: settings.openai_oauth_guardian_review_model,
+            openai_request_country: settings.openai_request_country,
             codex_privacy_policy: settings.codex_privacy_policy,
             request_location_enabled: settings.request_location_enabled,
             request_location: settings.request_location,
